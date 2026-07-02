@@ -5,7 +5,8 @@
 import { Voice, Beeper } from './voice.js';
 import { PoseTracker, LM, isBackTurned } from './pose.js';
 import {
-  CoverageGrid, torsoFrame, toBack, backToPx, zoneName, ROWS, COLS,
+  CoverageGrid, torsoFrame, toBack, backToPx, zoneName,
+  ROWS, COLS, HEAT_W, HEAT_H,
 } from './coverage.js';
 import { tipFor } from './tips.js';
 
@@ -29,6 +30,13 @@ export class SunCoachEngine {
     this.tracker = new PoseTracker(video);
     this.grid = new CoverageGrid();
 
+    // Heatmap dessinée en basse résolution puis étirée sur le dos via transform.
+    this.heatCanvas = document.createElement('canvas');
+    this.heatCanvas.width = HEAT_W;
+    this.heatCanvas.height = HEAT_H;
+    this.heatCtx = this.heatCanvas.getContext('2d');
+    this.heatImage = this.heatCtx.createImageData(HEAT_W, HEAT_H);
+
     this.state = 'idle';
     this.wakeLock = null;
     this._onVisibility = () => {
@@ -51,7 +59,9 @@ export class SunCoachEngine {
   async start() {
     this.voice.unlock();
     this.beeper.unlock();
+    this.onHud(0, 'TÉLÉCHARGEMENT DU MODÈLE…');
     if (!this.tracker.landmarker) await this.tracker.init();
+    this.onHud(0, 'DÉMARRAGE DE LA CAMÉRA…');
     await this.tracker.startCamera();
 
     this.overlay.width = this.video.videoWidth;
@@ -63,6 +73,9 @@ export class SunCoachEngine {
     this.currentTargetKey = null;
     this.targetAnnounceCount = new Map();
     this.tipSaidForRow = new Set();
+    this.paths = { gauche: [], droite: [] };
+    this.lastPathTs = { gauche: 0, droite: 0 };
+    this.lastHandPos = { gauche: null, droite: null };
 
     this.state = 'placement';
     this.onHud(0, 'PLACEMENT…');
@@ -174,16 +187,30 @@ export class SunCoachEngine {
 
   // ---------------------------------------------------------------- couverture
 
+  /**
+   * Centre de la paume : moyenne index + auriculaire (le poignet est à ~8 cm
+   * de la zone qui étale vraiment la crème). Repli sur le poignet seul si les
+   * doigts ne sont pas visibles.
+   */
   _getHands(P, frame) {
     const hands = [];
     const defs = [
-      { wrist: LM.L_WRIST, index: LM.L_INDEX, name: 'gauche' },
-      { wrist: LM.R_WRIST, index: LM.R_INDEX, name: 'droite' },
+      { wrist: LM.L_WRIST, fingers: [LM.L_INDEX, LM.L_PINKY], name: 'gauche' },
+      { wrist: LM.R_WRIST, fingers: [LM.R_INDEX, LM.R_PINKY], name: 'droite' },
     ];
     for (const d of defs) {
-      const w = P[d.wrist], i = P[d.index];
-      if (w.visibility < 0.4) continue;
-      const px = i.visibility > 0.4 ? { x: (w.x + i.x) / 2, y: (w.y + i.y) / 2 } : w;
+      const w = P[d.wrist];
+      if (w.visibility < 0.45) continue;
+      const seen = d.fingers.map((i) => P[i]).filter((p) => p.visibility > 0.45);
+      let px;
+      if (seen.length) {
+        const fx = seen.reduce((s, p) => s + p.x, 0) / seen.length;
+        const fy = seen.reduce((s, p) => s + p.y, 0) / seen.length;
+        // paume ≈ 2/3 du chemin poignet → doigts
+        px = { x: w.x + (fx - w.x) * 0.66, y: w.y + (fy - w.y) * 0.66 };
+      } else {
+        px = w;
+      }
       hands.push({ name: d.name, ...toBack(px, frame) });
     }
     return hands;
@@ -197,8 +224,26 @@ export class SunCoachEngine {
       return;
     }
 
-    const hands = this._getHands(P, frame);
+    let hands = this._getHands(P, frame);
+
+    // Filtre anti-glitch : un saut > 0.35 unité de dos en une frame est du
+    // bruit de détection, pas un mouvement de main.
+    hands = hands.filter((h) => {
+      const prev = this.lastHandPos[h.name];
+      this.lastHandPos[h.name] = { u: h.u, v: h.v };
+      return !prev || Math.hypot(h.u - prev.u, h.v - prev.v) < 0.35;
+    });
+
     this.grid.update(hands, dt);
+
+    // Trace du parcours (échantillonnée toutes les ~80 ms pour le récap).
+    for (const h of hands) {
+      if (h.u < -0.05 || h.u > 1.05 || h.v < -0.05 || h.v > 1.05) continue;
+      if (ts - this.lastPathTs[h.name] > 80) {
+        this.lastPathTs[h.name] = ts;
+        this.paths[h.name].push({ u: h.u, v: h.v });
+      }
+    }
 
     const pct = this.grid.fraction;
 
@@ -217,7 +262,7 @@ export class SunCoachEngine {
     if (this.grid.done) return this._finish();
 
     const target = this.grid.nextTarget();
-    const center = this.grid.cellCenter(target.row, target.col);
+    const center = this.grid.coldestPoint(target.row, target.col);
     const key = `${target.row}:${target.col}`;
 
     // Bips radar : distance de la main la plus proche à la zone cible.
@@ -276,15 +321,33 @@ export class SunCoachEngine {
       'Bravo ! Ton dos est entièrement couvert. Pense à en remettre dans deux heures, ou après la baignade.',
       { interrupt: true }
     );
-    const fractions = [];
-    for (let r = 0; r < ROWS; r++)
-      for (let c = 0; c < COLS; c++) fractions.push(this.grid.fractionOf(r, c));
     this.tracker.stop();
     this.tracker.stopCamera();
-    this.onDone({ seconds, fractions });
+    this.onDone({
+      seconds,
+      paintedRatio: this.grid.paintedRatio,
+      heat: this.grid.snapshot(),
+      paths: this.paths,
+    });
   }
 
   // ---------------------------------------------------------------- overlay
+
+  /** Recolore le canvas basse résolution à partir de la heatmap. */
+  _renderHeat() {
+    const px = this.heatImage.data;
+    for (let i = 0; i < HEAT_W * HEAT_H; i++) {
+      const f = this.grid.pixelFraction(i);
+      const o = i * 4;
+      if (f >= 1) {
+        px[o] = 0; px[o + 1] = 255; px[o + 2] = 0; px[o + 3] = 165;
+      } else {
+        px[o] = 255; px[o + 1] = Math.round(60 + f * 140); px[o + 2] = 0;
+        px[o + 3] = Math.round(f * 150);
+      }
+    }
+    this.heatCtx.putImageData(this.heatImage, 0, 0);
+  }
 
   _drawOverlay(P, frame) {
     const ctx = this.ctx;
@@ -292,7 +355,24 @@ export class SunCoachEngine {
     ctx.clearRect(0, 0, W, H);
     if (!frame) return;
 
-    // Grille du dos, cellules teintées selon la couverture (palette NERV).
+    // Heatmap fine, étirée sur le quadrilatère du dos.
+    // backToPx est affine : transform (u,v) → pixels directement supporté par canvas.
+    if (this.state === 'coverage') {
+      this._renderHeat();
+      const a = frame.ex.x * frame.width;
+      const b = frame.ex.y * frame.width;
+      const c = frame.ey.x * frame.height;
+      const d = frame.ey.y * frame.height;
+      const e = frame.origin.x - 0.5 * a;
+      const f = frame.origin.y - 0.5 * b;
+      ctx.save();
+      ctx.setTransform(a, b, c, d, e, f);
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(this.heatCanvas, 0, 0, 1, 1);
+      ctx.restore();
+    }
+
+    // Contours des zones de guidage + cible courante.
     const target = this.state === 'coverage' ? this.grid.nextTarget() : null;
     for (let r = 0; r < ROWS; r++) {
       for (let c = 0; c < COLS; c++) {
@@ -306,15 +386,9 @@ export class SunCoachEngine {
         ctx.moveTo(pts[0].x, pts[0].y);
         for (let i = 1; i < 4; i++) ctx.lineTo(pts[i].x, pts[i].y);
         ctx.closePath();
-        const f = this.grid.fractionOf(r, c);
-        // rouge NERV → vert NERV
-        ctx.fillStyle = f >= 1
-          ? 'rgba(0, 255, 0, 0.28)'
-          : `rgba(255, ${Math.round(f * 200)}, 0, ${0.10 + f * 0.15})`;
-        ctx.fill();
         const isTarget = target && target.row === r && target.col === c;
-        ctx.lineWidth = isTarget ? 4 : 1.5;
-        ctx.strokeStyle = isTarget ? '#FF9900' : 'rgba(0, 255, 0, 0.4)';
+        ctx.lineWidth = isTarget ? 4 : 1;
+        ctx.strokeStyle = isTarget ? '#FF9900' : 'rgba(0, 255, 0, 0.35)';
         ctx.stroke();
       }
     }
@@ -336,4 +410,4 @@ export class SunCoachEngine {
   }
 }
 
-export { ROWS, COLS };
+export { ROWS, COLS, HEAT_W, HEAT_H };

@@ -9,11 +9,18 @@ import {
   TerminalDisplay,
 } from '@mdrbx/nerv-ui';
 import { SunCoachEngine, ROWS, COLS } from './lib/engine.js';
+import { preloadPose } from './lib/pose.js';
 
 export default function App() {
   const [screen, setScreen] = useState('home'); // home | session | done
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
+
+  // Télécharge WASM + modèle de pose dès l'accueil : quand l'utilisateur
+  // appuie sur "Commencer", tout est déjà prêt (fini le chargement qui traîne).
+  useEffect(() => {
+    preloadPose().catch(() => { /* sera retenté au lancement de la session */ });
+  }, []);
 
   return (
     <div className="h-full bg-nerv-black">
@@ -155,7 +162,15 @@ function SessionScreen({ onAbort, onError, onDone }) {
         </div>
 
         {!ready && (
-          <StatusStamp text="CHARGEMENT" color="orange" blink bordered visible fullScreen />
+          <StatusStamp
+            text="CHARGEMENT"
+            subtitle={hud.status}
+            color="orange"
+            blink
+            bordered
+            visible
+            fullScreen
+          />
         )}
 
         <div className="pointer-events-none absolute inset-x-0 top-0 bg-gradient-to-b from-black/85 to-transparent px-4 pb-8 pt-3">
@@ -198,20 +213,51 @@ function DoneScreen({ result, onRestart }) {
     const c = canvasRef.current.getContext('2d');
     const W = canvasRef.current.width, H = canvasRef.current.height;
     c.clearRect(0, 0, W, H);
-    const pad = 26, gap = 6;
-    const cw = (W - 2 * pad - (COLS - 1) * gap) / COLS;
-    const ch = (H - 2 * pad - (ROWS - 1) * gap) / ROWS;
-    for (let r = 0; r < ROWS; r++) {
-      for (let col = 0; col < COLS; col++) {
-        const f = result.fractions[r * COLS + col];
-        c.fillStyle = f >= 1 ? 'rgba(0,255,0,0.75)' : `rgba(255,${Math.round(f * 153)},0,0.8)`;
-        c.strokeStyle = '#00FF00';
-        c.lineWidth = 1;
-        const x = pad + col * (cw + gap), y = pad + r * (ch + gap);
-        c.fillRect(x, y, cw, ch);
-        c.strokeRect(x, y, cw, ch);
+    const pad = 26;
+    const mapW = W - 2 * pad, mapH = H - 2 * pad;
+    const toX = (u) => pad + u * mapW;
+    const toY = (v) => pad + v * mapH;
+
+    // Heatmap fine : chaque pixel du dos, du sombre (raté) au vert (couvert).
+    const { w, h, need, data } = result.heat;
+    const cw = mapW / w, ch = mapH / h;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const f = Math.min(1, data[y * w + x] / need);
+        c.fillStyle = f >= 1
+          ? 'rgba(0, 255, 0, 0.85)'
+          : f > 0.02
+            ? `rgba(255, ${Math.round(60 + f * 140)}, 0, ${0.25 + f * 0.6})`
+            : 'rgba(255, 255, 255, 0.06)';
+        c.fillRect(toX(x / w), toY(y / h), cw + 0.5, ch + 0.5);
       }
     }
+
+    // Tracé du parcours des mains (gauche : cyan, droite : magenta).
+    const drawPath = (path, color) => {
+      if (path.length < 2) return;
+      c.beginPath();
+      c.moveTo(toX(path[0].u), toY(path[0].v));
+      for (let i = 1; i < path.length; i++) c.lineTo(toX(path[i].u), toY(path[i].v));
+      c.strokeStyle = color;
+      c.lineWidth = 1.5;
+      c.globalAlpha = 0.7;
+      c.stroke();
+      c.globalAlpha = 1;
+    };
+    drawPath(result.paths.gauche, '#00FFFF');
+    drawPath(result.paths.droite, '#FF00FF');
+
+    // Contour des zones de guidage.
+    c.strokeStyle = 'rgba(0, 255, 0, 0.4)';
+    c.lineWidth = 1;
+    for (let col = 0; col <= COLS; col++) {
+      c.beginPath(); c.moveTo(toX(col / COLS), toY(0)); c.lineTo(toX(col / COLS), toY(1)); c.stroke();
+    }
+    for (let row = 0; row <= ROWS; row++) {
+      c.beginPath(); c.moveTo(toX(0), toY(row / ROWS)); c.lineTo(toX(1), toY(row / ROWS)); c.stroke();
+    }
+
     c.fillStyle = '#00FF00';
     c.font = '12px Fira Code, monospace';
     c.textAlign = 'center';
@@ -221,6 +267,7 @@ function DoneScreen({ result, onRestart }) {
 
   const minutes = result ? Math.floor(result.seconds / 60) : 0;
   const seconds = result ? result.seconds % 60 : 0;
+  const painted = result ? Math.round(result.paintedRatio * 100) : 0;
 
   return (
     <div className="relative min-h-full overflow-hidden">
@@ -228,8 +275,13 @@ function DoneScreen({ result, onRestart }) {
       <div className="relative mx-auto flex min-h-screen max-w-md flex-col items-center justify-center gap-5 px-4 py-8">
         <StatusStamp text="MISSION ACCOMPLIE" subtitle="DOS ENTIÈREMENT COUVERT" color="green" bordered visible rotation={-6} />
         <canvas ref={canvasRef} width={300} height={400} className="rounded border border-nerv-green/40 bg-nerv-panel" />
-        <p className="text-nerv-green text-sm" style={{ fontFamily: 'var(--font-nerv-mono)' }}>
-          {ROWS * COLS} ZONES COUVERTES EN {minutes} MIN {String(seconds).padStart(2, '0')} S
+        <p className="text-nerv-green text-sm text-center" style={{ fontFamily: 'var(--font-nerv-mono)' }}>
+          {ROWS * COLS} ZONES VALIDÉES — {painted} % DE LA SURFACE PEINTE
+          <br />
+          EN {minutes} MIN {String(seconds).padStart(2, '0')} S
+          <br />
+          <span className="text-nerv-cyan">— MAIN GAUCHE</span>{' '}
+          <span className="text-nerv-magenta">— MAIN DROITE</span>
         </p>
         <Button variant="terminal" size="lg" fullWidth onClick={onRestart}>
           NOUVELLE SESSION

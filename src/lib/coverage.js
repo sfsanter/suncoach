@@ -1,17 +1,28 @@
 /**
  * Modélisation du dos : quadrilatère épaules → hanches en coordonnées
- * relatives au torse (u : gauche→droite de la personne, v : épaules→hanches),
- * découpé en grille. Robuste aux déplacements puisque la grille suit le corps.
+ * relatives au torse (u : gauche→droite de la personne, v : épaules→hanches).
+ *
+ * La couverture est suivie sur une heatmap fine (HEAT_W × HEAT_H pixels) :
+ * chaque pixel doit recevoir assez de temps de présence de la paume pour être
+ * considéré couvert. Les 4×3 zones servent au guidage vocal ; une zone n'est
+ * validée que si 75 % de ses pixels sont réellement couverts — plus de
+ * validation "par débordement" sur les zones voisines.
  */
 import { LM } from './pose.js';
 
 export const ROWS = 4;
 export const COLS = 3;
 
-/** Secondes de présence cumulée de la main pour valider une zone. */
-const PAINT_NEEDED = 1.0;
-/** Rayon du "pinceau" gaussien autour de la main, en unités de cellule. */
-const BRUSH_SIGMA = 0.75;
+/** Résolution de la heatmap (multiple de COLS/ROWS pour un découpage exact). */
+export const HEAT_W = 36;
+export const HEAT_H = 48;
+
+/** Secondes de présence cumulée de la paume pour couvrir un pixel. */
+const PIXEL_NEED = 0.3;
+/** Part de pixels couverts pour valider une zone. */
+const ZONE_RATIO = 0.75;
+/** Rayon du "pinceau" gaussien, en coordonnées dos (~ taille d'une paume). */
+const SIGMA = 0.05;
 
 const ROW_NAMES = ['le haut du dos', 'les omoplates', 'le milieu du dos', 'le bas du dos'];
 
@@ -55,7 +66,7 @@ export function toBack(p, f) {
   };
 }
 
-/** Coordonnées dos → pixels (pour dessiner la grille sur la vidéo). */
+/** Coordonnées dos → pixels (pour dessiner sur la vidéo). */
 export function backToPx(u, v, f) {
   const du = (u - 0.5) * f.width;
   const dv = v * f.height;
@@ -67,19 +78,66 @@ export function backToPx(u, v, f) {
 
 export class CoverageGrid {
   constructor() {
-    this.paint = new Float32Array(ROWS * COLS);
+    this.heat = new Float32Array(HEAT_W * HEAT_H);
+    this.need = PIXEL_NEED;
   }
 
-  cellCenter(row, col) {
-    return { u: (col + 0.5) / COLS, v: (row + 0.5) / ROWS };
+  reset() {
+    this.heat.fill(0);
   }
 
+  /** Progression 0..1 d'un pixel de la heatmap. */
+  pixelFraction(i) {
+    return Math.min(1, this.heat[i] / PIXEL_NEED);
+  }
+
+  /**
+   * hands : [{u,v}] positions des paumes sur le dos ; dt en secondes.
+   * Pinceau gaussien étroit : seuls les pixels réellement sous la paume
+   * reçoivent de la "peinture".
+   */
+  update(hands, dt) {
+    const reach = 3 * SIGMA;
+    for (const h of hands) {
+      if (h.u < -0.08 || h.u > 1.08 || h.v < -0.08 || h.v > 1.08) continue;
+      const x0 = Math.max(0, Math.floor((h.u - reach) * HEAT_W));
+      const x1 = Math.min(HEAT_W - 1, Math.ceil((h.u + reach) * HEAT_W));
+      const y0 = Math.max(0, Math.floor((h.v - reach) * HEAT_H));
+      const y1 = Math.min(HEAT_H - 1, Math.ceil((h.v + reach) * HEAT_H));
+      for (let y = y0; y <= y1; y++) {
+        const pv = (y + 0.5) / HEAT_H;
+        for (let x = x0; x <= x1; x++) {
+          const pu = (x + 0.5) / HEAT_W;
+          const du = pu - h.u;
+          const dv = pv - h.v;
+          const w = Math.exp(-(du * du + dv * dv) / (2 * SIGMA * SIGMA));
+          if (w > 0.03) this.heat[y * HEAT_W + x] += dt * w;
+        }
+      }
+    }
+  }
+
+  /** Part de pixels couverts (heat >= need) dans une zone. */
+  zoneRatio(row, col) {
+    const x0 = (col * HEAT_W) / COLS, x1 = ((col + 1) * HEAT_W) / COLS;
+    const y0 = (row * HEAT_H) / ROWS, y1 = ((row + 1) * HEAT_H) / ROWS;
+    let painted = 0, total = 0;
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        total++;
+        if (this.heat[y * HEAT_W + x] >= PIXEL_NEED) painted++;
+      }
+    }
+    return painted / total;
+  }
+
+  /** Progression 0..1 d'une zone (1 quand ZONE_RATIO des pixels sont couverts). */
   fractionOf(row, col) {
-    return Math.min(1, this.paint[row * COLS + col] / PAINT_NEEDED);
+    return Math.min(1, this.zoneRatio(row, col) / ZONE_RATIO);
   }
 
   isCovered(row, col) {
-    return this.fractionOf(row, col) >= 1;
+    return this.zoneRatio(row, col) >= ZONE_RATIO;
   }
 
   get fraction() {
@@ -89,32 +147,19 @@ export class CoverageGrid {
     return sum / (ROWS * COLS);
   }
 
+  /** Part brute de la surface du dos réellement couverte (pour les stats). */
+  get paintedRatio() {
+    let painted = 0;
+    for (let i = 0; i < this.heat.length; i++) {
+      if (this.heat[i] >= PIXEL_NEED) painted++;
+    }
+    return painted / this.heat.length;
+  }
+
   get done() {
     for (let r = 0; r < ROWS; r++)
       for (let c = 0; c < COLS; c++) if (!this.isCovered(r, c)) return false;
     return true;
-  }
-
-  /**
-   * hands : [{u,v}] positions des mains sur le dos ; dt en secondes.
-   * Pinceau gaussien : la cellule sous la main se remplit vite,
-   * les voisines un peu ; il faut vraiment frotter pour valider.
-   */
-  update(hands, dt) {
-    for (const h of hands) {
-      // La main doit être sur le dos (avec une petite marge).
-      if (h.u < -0.12 || h.u > 1.12 || h.v < -0.12 || h.v > 1.12) continue;
-      for (let r = 0; r < ROWS; r++) {
-        for (let c = 0; c < COLS; c++) {
-          const center = this.cellCenter(r, c);
-          const du = (h.u - center.u) * COLS; // distances en unités de cellule
-          const dv = (h.v - center.v) * ROWS;
-          const d2 = du * du + dv * dv;
-          const w = Math.exp(-d2 / (2 * BRUSH_SIGMA * BRUSH_SIGMA));
-          if (w > 0.05) this.paint[r * COLS + c] += dt * w;
-        }
-      }
-    }
   }
 
   /** Prochaine zone à couvrir : de haut en bas (stratégie naturelle). */
@@ -125,7 +170,31 @@ export class CoverageGrid {
     return null;
   }
 
-  reset() {
-    this.paint.fill(0);
+  cellCenter(row, col) {
+    return { u: (col + 0.5) / COLS, v: (row + 0.5) / ROWS };
+  }
+
+  /** Point le moins couvert d'une zone — cible réelle des bips et de la voix. */
+  coldestPoint(row, col) {
+    const x0 = (col * HEAT_W) / COLS, x1 = ((col + 1) * HEAT_W) / COLS;
+    const y0 = (row * HEAT_H) / ROWS, y1 = ((row + 1) * HEAT_H) / ROWS;
+    let best = null;
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        const v = this.heat[y * HEAT_W + x];
+        if (!best || v < best.v) best = { v, x, y };
+      }
+    }
+    return { u: (best.x + 0.5) / HEAT_W, v: (best.y + 0.5) / HEAT_H };
+  }
+
+  /** Copie de l'état pour l'écran de fin. */
+  snapshot() {
+    return {
+      w: HEAT_W,
+      h: HEAT_H,
+      need: PIXEL_NEED,
+      data: Float32Array.from(this.heat),
+    };
   }
 }

@@ -8,13 +8,45 @@ export const LM = {
   L_SHOULDER: 11, R_SHOULDER: 12,
   L_ELBOW: 13, R_ELBOW: 14,
   L_WRIST: 15, R_WRIST: 16,
+  L_PINKY: 17, R_PINKY: 18,
   L_INDEX: 19, R_INDEX: 20,
+  L_THUMB: 21, R_THUMB: 22,
   L_HIP: 23, R_HIP: 24,
 };
 
 const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
 const MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+
+let landmarkerPromise = null;
+
+async function createLandmarker() {
+  const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
+  const options = (delegate) => ({
+    baseOptions: { modelAssetPath: MODEL_URL, delegate },
+    runningMode: 'VIDEO',
+    numPoses: 1,
+  });
+  try {
+    return await PoseLandmarker.createFromOptions(fileset, options('GPU'));
+  } catch {
+    return await PoseLandmarker.createFromOptions(fileset, options('CPU'));
+  }
+}
+
+/**
+ * Télécharge WASM + modèle une seule fois, dès que possible (appelé depuis
+ * l'écran d'accueil pour que tout soit prêt quand on lance le protocole).
+ */
+export function preloadPose() {
+  if (!landmarkerPromise) {
+    landmarkerPromise = createLandmarker().catch((err) => {
+      landmarkerPromise = null; // permet de retenter au prochain appel
+      throw err;
+    });
+  }
+  return landmarkerPromise;
+}
 
 export class PoseTracker {
   constructor(video) {
@@ -28,16 +60,11 @@ export class PoseTracker {
   }
 
   async init() {
-    const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
-    const options = (delegate) => ({
-      baseOptions: { modelAssetPath: MODEL_URL, delegate },
-      runningMode: 'VIDEO',
-      numPoses: 1,
-    });
     try {
-      this.landmarker = await PoseLandmarker.createFromOptions(fileset, options('GPU'));
+      this.landmarker = await preloadPose();
     } catch {
-      this.landmarker = await PoseLandmarker.createFromOptions(fileset, options('CPU'));
+      // un seul retry : les échecs réseau transitoires sont fréquents sur mobile
+      this.landmarker = await preloadPose();
     }
   }
 
