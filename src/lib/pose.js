@@ -1,5 +1,7 @@
 /**
  * Caméra + MediaPipe PoseLandmarker (tout tourne dans le navigateur).
+ * Modèle "full" (plus précis que "lite" sur les poignets/doigts), et sortie
+ * des world landmarks 3D en mètres pour un repère torse invariant à la rotation.
  */
 import { FilesetResolver, PoseLandmarker } from '@mediapipe/tasks-vision';
 
@@ -16,7 +18,7 @@ export const LM = {
 
 const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
 const MODEL_URL =
-  'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+  'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task';
 
 let landmarkerPromise = null;
 
@@ -26,9 +28,7 @@ async function createLandmarker() {
     baseOptions: { modelAssetPath: MODEL_URL, delegate },
     runningMode: 'VIDEO',
     numPoses: 1,
-    // Masque de silhouette : sert à détourer le dos réel (la grille
-    // épaules-hanches seule inclut des coins hors du corps).
-    outputSegmentationMasks: true,
+    minTrackingConfidence: 0.6,
   });
   try {
     return await PoseLandmarker.createFromOptions(fileset, options('GPU'));
@@ -58,6 +58,7 @@ export class PoseTracker {
     this.stream = null;
     this.facing = 'user';
     this.smoothed = null;
+    this.smoothedWorld = null;
     this._raf = 0;
     this._lastVideoTime = -1;
   }
@@ -117,7 +118,10 @@ export class PoseTracker {
     }
   }
 
-  /** Boucle de détection ; onFrame(landmarks|null, timestampMs) à chaque frame vidéo. */
+  /**
+   * Boucle de détection ; onFrame(landmarks2D|null, worldLandmarks3D|null, ts)
+   * à chaque frame vidéo.
+   */
   start(onFrame) {
     const loop = () => {
       this._raf = requestAnimationFrame(loop);
@@ -132,12 +136,12 @@ export class PoseTracker {
         return;
       }
       const raw = result.landmarks && result.landmarks[0];
-      const mask = (result.segmentationMasks && result.segmentationMasks[0]) || null;
-      try {
-        onFrame(raw ? this._smooth(raw) : null, ts, mask);
-      } finally {
-        mask?.close();
-      }
+      const world = result.worldLandmarks && result.worldLandmarks[0];
+      onFrame(
+        raw ? this._smooth(raw) : null,
+        world ? this._smoothWorld(world) : null,
+        ts
+      );
     };
     loop();
   }
@@ -146,10 +150,11 @@ export class PoseTracker {
     cancelAnimationFrame(this._raf);
     this._raf = 0;
     this.smoothed = null;
+    this.smoothedWorld = null;
     this._lastVideoTime = -1;
   }
 
-  /** Lissage exponentiel pour atténuer le bruit des landmarks. */
+  /** Lissage exponentiel pour atténuer le bruit des landmarks 2D. */
   _smooth(raw, alpha = 0.45) {
     if (!this.smoothed || this.smoothed.length !== raw.length) {
       this.smoothed = raw.map((p) => ({ ...p }));
@@ -163,6 +168,22 @@ export class PoseTracker {
     }
     return this.smoothed;
   }
+
+  /** Idem pour les world landmarks 3D (z bruité → lissage plus fort). */
+  _smoothWorld(raw, alpha = 0.35) {
+    if (!this.smoothedWorld || this.smoothedWorld.length !== raw.length) {
+      this.smoothedWorld = raw.map((p) => ({ ...p }));
+      return this.smoothedWorld;
+    }
+    for (let i = 0; i < raw.length; i++) {
+      const s = this.smoothedWorld[i];
+      s.x += alpha * (raw[i].x - s.x);
+      s.y += alpha * (raw[i].y - s.y);
+      s.z += alpha * (raw[i].z - s.z);
+      s.visibility = raw[i].visibility;
+    }
+    return this.smoothedWorld;
+  }
 }
 
 /**
@@ -174,4 +195,47 @@ export function isBackTurned(lm) {
   const rs = lm[LM.R_SHOULDER];
   if (ls.visibility < 0.5 || rs.visibility < 0.5) return false;
   return ls.x < rs.x;
+}
+
+/**
+ * Filtre one-euro (Casiez et al.) : peu de jitter à basse vitesse, peu de
+ * latence à haute vitesse. Recommandé par la littérature pour les landmarks.
+ */
+export class OneEuro {
+  constructor({ minCutoff = 1.2, beta = 0.02, dCutoff = 1.0 } = {}) {
+    this.minCutoff = minCutoff;
+    this.beta = beta;
+    this.dCutoff = dCutoff;
+    this.prev = null;
+    this.prevD = 0;
+    this.prevT = 0;
+  }
+
+  static _alpha(cutoff, dt) {
+    const tau = 1 / (2 * Math.PI * cutoff);
+    return 1 / (1 + tau / dt);
+  }
+
+  filter(x, tMs) {
+    const t = tMs / 1000;
+    if (this.prev === null) {
+      this.prev = x;
+      this.prevT = t;
+      return x;
+    }
+    const dt = Math.max(1e-3, t - this.prevT);
+    this.prevT = t;
+    const dRaw = (x - this.prev) / dt;
+    const aD = OneEuro._alpha(this.dCutoff, dt);
+    this.prevD += aD * (dRaw - this.prevD);
+    const cutoff = this.minCutoff + this.beta * Math.abs(this.prevD);
+    const a = OneEuro._alpha(cutoff, dt);
+    this.prev += a * (x - this.prev);
+    return this.prev;
+  }
+
+  reset() {
+    this.prev = null;
+    this.prevD = 0;
+  }
 }

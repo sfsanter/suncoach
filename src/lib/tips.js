@@ -23,3 +23,31 @@ const SIDE_HINT = [
 export function tipFor(row, col) {
   return TIPS_BY_ROW[row] + (row <= 2 ? SIDE_HINT[col] : '');
 }
+
+/**
+ * Instruction courte main + geste, donnée dès qu'une zone devient la cible.
+ * Beaucoup plus actionnable que « va vers ta droite ».
+ */
+const HAND_FOR_COL = ['main gauche', 'chaque main à son tour', 'main droite'];
+
+export function zoneInstruction(row, col) {
+  const hand = HAND_FOR_COL[col];
+  switch (row) {
+    case 0:
+      return col === 1
+        ? 'Une main par-dessus l’épaule, descends le long de la nuque.'
+        : `${cap(hand)} par-dessus l’épaule, coude au ciel.`;
+    case 1:
+      return col === 1
+        ? 'Bras dans le dos par en dessous, remonte le long de la colonne.'
+        : `${cap(hand)} par en dessous, remonte vers l’omoplate.`;
+    case 2:
+      return `${cap(hand)} par en dessous, paume bien à plat.`;
+    default:
+      return `${cap(hand)} sur les reins, balaie vers le centre.`;
+  }
+}
+
+function cap(s) {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}

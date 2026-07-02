@@ -9,6 +9,7 @@ import {
   TerminalDisplay,
 } from '@mdrbx/nerv-ui';
 import { SunCoachEngine, ROWS, COLS } from './lib/engine.js';
+import { backHalfWidth } from './lib/coverage.js';
 import { preloadPose } from './lib/pose.js';
 
 export default function App() {
@@ -189,9 +190,9 @@ function SessionScreen({ onAbort, onError, onDone }) {
           </div>
         </div>
 
-        {/* Schéma fixe du dos : reste lisible même quand on se retourne. */}
+        {/* Dessin de dos fixe : reste lisible même quand on se retourne. */}
         <div className="pointer-events-none absolute bottom-3 right-3 flex flex-col items-center gap-1">
-          <canvas ref={minimapRef} width={126} height={168} />
+          <canvas ref={minimapRef} width={150} height={210} />
           <span
             className="text-[10px] tracking-[0.25em] text-nerv-green/80"
             style={{ fontFamily: 'var(--font-nerv-mono)' }}
@@ -271,13 +272,36 @@ function DoneScreen({ result, onRestart }) {
     drawPath(result.paths.gauche, '#00FFFF');
     drawPath(result.paths.droite, '#FF00FF');
 
+    // Contour de la silhouette du dos.
+    const halfW = (v) => {
+      let hw = backHalfWidth(v);
+      if (v < 0.06) hw = Math.min(hw, 0.42 + (v / 0.06) * 0.1);
+      return hw;
+    };
+    c.beginPath();
+    const STEPS = 40;
+    for (let i = 0; i <= STEPS; i++) {
+      const v = i / STEPS;
+      const x = toX(0.5 - halfW(v)), y = toY(v);
+      if (i === 0) c.moveTo(x, y);
+      else c.lineTo(x, y);
+    }
+    for (let i = STEPS; i >= 0; i--) {
+      const v = i / STEPS;
+      c.lineTo(toX(0.5 + halfW(v)), toY(v));
+    }
+    c.closePath();
+    c.strokeStyle = 'rgba(0, 255, 0, 0.8)';
+    c.lineWidth = 1.5;
+    c.stroke();
+
     // Contour des zones de guidage.
-    c.strokeStyle = 'rgba(0, 255, 0, 0.4)';
+    c.strokeStyle = 'rgba(0, 255, 0, 0.3)';
     c.lineWidth = 1;
-    for (let col = 0; col <= COLS; col++) {
+    for (let col = 1; col < COLS; col++) {
       c.beginPath(); c.moveTo(toX(col / COLS), toY(0)); c.lineTo(toX(col / COLS), toY(1)); c.stroke();
     }
-    for (let row = 0; row <= ROWS; row++) {
+    for (let row = 1; row < ROWS; row++) {
       c.beginPath(); c.moveTo(toX(0), toY(row / ROWS)); c.lineTo(toX(1), toY(row / ROWS)); c.stroke();
     }
 

@@ -1,21 +1,29 @@
 /**
  * Moteur de session : machine à états placement → couverture → fin.
- * Indépendant de React ; publie son état via les callbacks onHud / onDone.
+ *
+ * La peinture se fait dans le repère torse 3D (world landmarks MediaPipe) :
+ * invariant à la rotation du corps, et la coordonnée w (distance au plan du
+ * dos) garantit qu'on ne peint que quand la paume touche vraiment le dos.
+ * L'overlay vidéo, lui, reste en 2D (repère image lissé).
  */
 import { Voice, Beeper } from './voice.js';
-import { PoseTracker, LM, isBackTurned } from './pose.js';
+import { PoseTracker, LM, isBackTurned, OneEuro } from './pose.js';
 import {
-  CoverageGrid, torsoFrame, toBack, backToPx, zoneName,
+  CoverageGrid, torsoFrame, backToPx, zoneName, backHalfWidth,
+  torsoFrame3D, toBack3D,
   ROWS, COLS, HEAT_W, HEAT_H,
 } from './coverage.js';
-import { tipFor } from './tips.js';
+import { tipFor, zoneInstruction } from './tips.js';
+
+/** Distance max paume ↔ plan du dos pour peindre (mètres, z bruité → marge). */
+const TOUCH_DIST = 0.16;
 
 export class SunCoachEngine {
   /**
    * @param {object} p
    * @param {HTMLVideoElement} p.video
    * @param {HTMLCanvasElement} p.overlay
-   * @param {HTMLCanvasElement} [p.minimap] schéma fixe du dos, toujours visible
+   * @param {HTMLCanvasElement} [p.minimap] dessin de dos fixe, toujours visible
    * @param {(pct: number, status: string) => void} p.onHud
    * @param {(result: object) => void} p.onDone
    */
@@ -40,7 +48,7 @@ export class SunCoachEngine {
     this.heatCtx = this.heatCanvas.getContext('2d');
     this.heatImage = this.heatCtx.createImageData(HEAT_W, HEAT_H);
 
-    // Même principe pour le schéma fixe du dos (silhouette + heatmap).
+    // Même principe pour le remplissage du dessin de dos.
     this.miniCanvas = document.createElement('canvas');
     this.miniCanvas.width = HEAT_W;
     this.miniCanvas.height = HEAT_H;
@@ -81,14 +89,17 @@ export class SunCoachEngine {
     this.placementOkSince = 0;
     this.lastMilestone = 0;
     this.currentTargetKey = null;
-    this.targetAnnounceCount = new Map();
     this.tipSaidForRow = new Set();
+    this.coveredZones = new Set();
     this.paths = { gauche: [], droite: [] };
     this.lastPathTs = { gauche: 0, droite: 0 };
-    this.lastHandPos = { gauche: null, droite: null };
     this.smFrame = null;
-    this.refShoulderW = 0;
-    this.lastMaskTs = 0;
+    this.lastPaintTs = { new: 0, old: 0 };
+    this.lastCaptureHintTs = 0;
+    this.filters = {
+      gauche: { u: new OneEuro(), v: new OneEuro() },
+      droite: { u: new OneEuro(), v: new OneEuro() },
+    };
 
     this.state = 'placement';
     this.onHud(0, 'PLACEMENT…');
@@ -98,7 +109,7 @@ export class SunCoachEngine {
       'Bienvenue ! Pose le téléphone, puis mets-toi dos à la caméra, à environ deux mètres.',
       { interrupt: true }
     );
-    this.tracker.start((lm, ts, mask) => this._onFrame(lm, ts, mask));
+    this.tracker.start((lm, world, ts) => this._onFrame(lm, world, ts));
   }
 
   /**
@@ -111,7 +122,7 @@ export class SunCoachEngine {
     this.tracker.stop();
     this.tracker.stopCamera();
     if (silence) this.voice.stop();
-    this.beeper.setProximity(null);
+    this.beeper.setPaintActivity('off');
     this.wakeLock?.release().catch(() => {});
     this.wakeLock = null;
     document.removeEventListener('visibilitychange', this._onVisibility);
@@ -132,33 +143,25 @@ export class SunCoachEngine {
 
   // ---------------------------------------------------------------- boucle
 
-  _onFrame(lm, ts, mask) {
+  _onFrame(lm, world, ts) {
     const dt = this.lastTs ? Math.min((ts - this.lastTs) / 1000, 0.1) : 0;
     this.lastTs = ts;
 
-    // Landmarks normalisés → pixels (la géométrie doit tenir compte du ratio d'image).
+    // Landmarks normalisés → pixels (pour l'affichage uniquement).
     const W = this.overlay.width, H = this.overlay.height;
     const P = lm
       ? lm.map((p) => ({ x: p.x * W, y: p.y * H, visibility: p.visibility }))
       : null;
-    // Lissage du repère du torse : la grille ne tremble plus à chaque
-    // micro-variation d'orientation du dos.
     const frame = this._smoothTorso(P ? torsoFrame(P) : null);
-
-    // Détourage : projette le masque de silhouette dans l'espace dos (~7 fps suffit).
-    if (mask && frame && ts - this.lastMaskTs > 150) {
-      this.lastMaskTs = ts;
-      this._sampleBodyMask(mask, frame);
-    }
 
     this._drawOverlay(P, frame);
     this._drawMinimap();
 
     if (this.state === 'placement') this._placementTick(P, ts);
-    else if (this.state === 'coverage') this._coverageTick(P, frame, ts, dt);
+    else if (this.state === 'coverage') this._coverageTick(P, world, frame, ts, dt);
   }
 
-  /** Moyenne mobile sur origine/axes/dimensions du repère torse. */
+  /** Moyenne mobile sur origine/axes/dimensions du repère torse 2D (affichage). */
   _smoothTorso(frame) {
     if (!frame) {
       this.smFrame = null;
@@ -188,31 +191,6 @@ export class SunCoachEngine {
       s[axis].y /= n;
     }
     return s;
-  }
-
-  /** Échantillonne le masque de segmentation aux positions des pixels de la heatmap. */
-  _sampleBodyMask(mask, frame) {
-    let data;
-    try {
-      data = mask.getAsFloat32Array();
-    } catch {
-      return; // segmentation indisponible sur ce device : on garde le masque plein
-    }
-    const mw = mask.width, mh = mask.height;
-    const sx = mw / this.overlay.width, sy = mh / this.overlay.height;
-    const body = this.grid.bodyMask;
-    for (let y = 0; y < HEAT_H; y++) {
-      for (let x = 0; x < HEAT_W; x++) {
-        const p = backToPx((x + 0.5) / HEAT_W, (y + 0.5) / HEAT_H, frame);
-        const mx = Math.round(p.x * sx), my = Math.round(p.y * sy);
-        let v = 0;
-        if (mx >= 0 && mx < mw && my >= 0 && my < mh) {
-          v = data[my * mw + mx] > 0.5 ? 1 : 0;
-        }
-        const i = y * HEAT_W + x;
-        body[i] += 0.4 * (v - body[i]); // moyenne mobile : tolère le bruit du masque
-      }
-    }
   }
 
   // ---------------------------------------------------------------- placement
@@ -261,11 +239,13 @@ export class SunCoachEngine {
   _startCoverage() {
     this.state = 'coverage';
     this.coverageStartedAt = performance.now();
+    // Période de grâce avant l'alerte « je ne capte pas ta paume ».
+    this.lastCaptureHintTs = this.coverageStartedAt + 6000;
     this.onHud(0, 'CRÈME DANS LES MAINS !');
     this.voice.say(
       "C'est parti ! Mets une bonne dose de crème dans tes mains. " +
-        'Commence par le haut du dos : passe tes mains par-dessus tes épaules. ' +
-        'Je te dis au fur et à mesure où il en manque.',
+        'Quand ça cliquette, c’est que ta main est bien détectée sur le dos. ' +
+        'On commence en haut : main gauche par-dessus l’épaule gauche.',
       { interrupt: true }
     );
   }
@@ -273,71 +253,106 @@ export class SunCoachEngine {
   // ---------------------------------------------------------------- couverture
 
   /**
-   * Centre de la paume : moyenne index + auriculaire (le poignet est à ~8 cm
-   * de la zone qui étale vraiment la crème). Repli sur le poignet seul si les
-   * doigts ne sont pas visibles.
+   * Paumes en coordonnées dos 3D : (u, v) position sur le dos, w distance au
+   * plan du dos en mètres. Centre paume = poignet décalé vers index/auriculaire.
    */
-  _getHands(P, frame) {
+  _getHands3D(world, f3) {
     const hands = [];
     const defs = [
       { wrist: LM.L_WRIST, fingers: [LM.L_INDEX, LM.L_PINKY], name: 'gauche' },
       { wrist: LM.R_WRIST, fingers: [LM.R_INDEX, LM.R_PINKY], name: 'droite' },
     ];
     for (const d of defs) {
-      const w = P[d.wrist];
+      const w = world[d.wrist];
       if (w.visibility < 0.45) continue;
-      const seen = d.fingers.map((i) => P[i]).filter((p) => p.visibility > 0.45);
-      let px;
+      const seen = d.fingers.map((i) => world[i]).filter((p) => p.visibility > 0.45);
+      let palm;
       if (seen.length) {
         const fx = seen.reduce((s, p) => s + p.x, 0) / seen.length;
         const fy = seen.reduce((s, p) => s + p.y, 0) / seen.length;
-        // paume ≈ 2/3 du chemin poignet → doigts
-        px = { x: w.x + (fx - w.x) * 0.66, y: w.y + (fy - w.y) * 0.66 };
+        const fz = seen.reduce((s, p) => s + p.z, 0) / seen.length;
+        palm = {
+          x: w.x + (fx - w.x) * 0.66,
+          y: w.y + (fy - w.y) * 0.66,
+          z: w.z + (fz - w.z) * 0.66,
+        };
       } else {
-        px = w;
+        palm = w;
       }
-      hands.push({ name: d.name, ...toBack(px, frame) });
+      hands.push({ name: d.name, ...toBack3D(palm, f3) });
     }
     return hands;
   }
 
-  _coverageTick(P, frame, ts, dt) {
-    if (!P || !frame || !isBackTurned(P)) {
-      this.beeper.setProximity(null);
+  _coverageTick(P, world, frame, ts, dt) {
+    if (!P || !world || !isBackTurned(P)) {
+      this.beeper.setPaintActivity('off');
       this.onHud(this.grid.fraction, 'RESTE DOS À LA CAMÉRA');
       this.voice.say('Reste bien dos à la caméra.', { id: 'stayback', cooldown: 7000 });
       return;
     }
 
-    // Pause peinture quand le buste pivote : la projection écrase la largeur
-    // d'épaules et le placement de la grille devient faux — on ne peint pas
-    // avec une grille fausse.
+    const f3 = torsoFrame3D(world);
+    if (!f3) {
+      this.beeper.setPaintActivity('off');
+      this.onHud(this.grid.fraction, 'RECHERCHE DU TORSE…');
+      return;
+    }
+
+    // Garde uniquement contre le quasi-profil (landmarks trop peu fiables) :
+    // les rotations modérées sont maintenant absorbées par le repère 3D.
     const ls = P[LM.L_SHOULDER], rs = P[LM.R_SHOULDER];
-    const shoulderW = Math.hypot(rs.x - ls.x, rs.y - ls.y);
-    this.refShoulderW = Math.max(this.refShoulderW * 0.999, shoulderW);
-    if (shoulderW < 0.72 * this.refShoulderW) {
-      this.beeper.setProximity(null);
-      this.onHud(this.grid.fraction, 'ORIENTATION INSTABLE — REMETS-TOI À PLAT');
-      this.voice.say('Remets tes épaules bien face au mur, sans pivoter.', {
-        id: 'square', cooldown: 6000,
+    const shoulderPx = Math.hypot(rs.x - ls.x, rs.y - ls.y);
+    const hipPx = Math.hypot(P[LM.R_HIP].x - P[LM.L_HIP].x, P[LM.R_HIP].y - P[LM.L_HIP].y);
+    const torsoPx = Math.hypot(
+      (ls.x + rs.x) / 2 - (P[LM.L_HIP].x + P[LM.R_HIP].x) / 2,
+      (ls.y + rs.y) / 2 - (P[LM.L_HIP].y + P[LM.R_HIP].y) / 2
+    );
+    if (Math.max(shoulderPx, hipPx) < torsoPx * 0.28) {
+      this.beeper.setPaintActivity('off');
+      this.onHud(this.grid.fraction, 'TROP DE PROFIL — TOURNE-TOI DOS À LA CAMÉRA');
+      this.voice.say('Je te vois trop de profil. Remets-toi bien dos à la caméra.', {
+        id: 'profile', cooldown: 6000,
       });
       return;
     }
 
-    let hands = this._getHands(P, frame);
+    // Paumes en 3D, lissées par filtre one-euro, gardées si elles touchent le dos.
+    const rawHands = this._getHands3D(world, f3);
+    const hands = [];
+    for (const h of rawHands) {
+      const f = this.filters[h.name];
+      const u = f.u.filter(h.u, ts);
+      const v = f.v.filter(h.v, ts);
+      hands.push({ name: h.name, u, v, w: h.w });
+    }
+    const touching = hands.filter((h) => Math.abs(h.w) < TOUCH_DIST);
 
-    // Filtre anti-glitch : un saut > 0.35 unité de dos en une frame est du
-    // bruit de détection, pas un mouvement de main.
-    hands = hands.filter((h) => {
-      const prev = this.lastHandPos[h.name];
-      this.lastHandPos[h.name] = { u: h.u, v: h.v };
-      return !prev || Math.hypot(h.u - prev.u, h.v - prev.v) < 0.35;
-    });
+    const { added, crossed } = this.grid.update(touching, dt);
 
-    this.grid.update(hands, dt);
+    // Feedback Geiger : neuf = cliquetis rapide, déjà-couvert = lent, rien = silence.
+    if (crossed > 0 || added > dt * 0.25) this.lastPaintTs.new = ts;
+    else if (touching.length > 0) this.lastPaintTs.old = ts;
+    if (ts - this.lastPaintTs.new < 350) this.beeper.setPaintActivity('new');
+    else if (ts - this.lastPaintTs.old < 350) this.beeper.setPaintActivity('old');
+    else this.beeper.setPaintActivity('off');
+    this.beeper.tick(ts);
 
-    // Trace du parcours (échantillonnée toutes les ~80 ms pour le récap).
-    for (const h of hands) {
+    // « Ça capte pas » : des mains sont vues mais rien ne se peint depuis 8 s.
+    if (
+      hands.length > 0 &&
+      (this.lastPaintTs.new === 0 || ts - this.lastPaintTs.new > 8000) &&
+      ts - this.lastCaptureHintTs > 12000
+    ) {
+      this.lastCaptureHintTs = ts;
+      this.voice.say(
+        'Je ne capte pas ta paume sur le dos. Colle bien la main à plat et frotte lentement.',
+        { queue: true }
+      );
+    }
+
+    // Trace du parcours (échantillonnée toutes les ~80 ms).
+    for (const h of touching) {
       if (h.u < -0.05 || h.u > 1.05 || h.v < -0.05 || h.v > 1.05) continue;
       if (ts - this.lastPathTs[h.name] > 80) {
         this.lastPathTs[h.name] = ts;
@@ -345,12 +360,22 @@ export class SunCoachEngine {
       }
     }
 
+    // Confirmation sonore + vocale à chaque zone validée.
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        const key = `${r}:${c}`;
+        if (!this.coveredZones.has(key) && this.grid.isCovered(r, c)) {
+          this.coveredZones.add(key);
+          this.beeper.zoneDone();
+          this.voice.say(`${capitalize(zoneName(r, c))} : c’est fait !`, { interrupt: true });
+        }
+      }
+    }
+
     const pct = this.grid.fraction;
 
     const milestones = [
-      [0.25, 'Un quart de fait, continue !'],
-      [0.5, 'La moitié du dos est couverte !'],
-      [0.75, 'Trois quarts ! Plus que quelques zones.'],
+      [0.5, 'La moitié du dos est couverte, continue !'],
     ];
     for (const [th, msg] of milestones) {
       if (pct >= th && this.lastMilestone < th) {
@@ -362,52 +387,28 @@ export class SunCoachEngine {
     if (this.grid.done) return this._finish();
 
     const target = this.grid.nextTarget();
-    const center = this.grid.coldestPoint(target.row, target.col);
     const key = `${target.row}:${target.col}`;
-
-    // Bips radar : distance de la main la plus proche à la zone cible.
-    let best = null;
-    for (const h of hands) {
-      const d = Math.hypot(h.u - center.u, (h.v - center.v) * (ROWS / COLS));
-      if (best === null || d < best.d) best = { d, hand: h };
-    }
-    this.beeper.setProximity(best ? Math.min(1, best.d / 0.8) : null);
-    this.beeper.tick(ts);
-
     this.onHud(pct, 'CIBLE : ' + zoneName(target.row, target.col).toUpperCase());
 
-    // Annonce vocale de la cible (nouvelle cible, ou rappel périodique).
+    // Annonce de la cible : zone + main + geste. Rappel périodique espacé.
     if (!this.voice.busy) {
-      const count = this.targetAnnounceCount.get(key) || 0;
       const isNew = key !== this.currentTargetKey;
-      const spoke = this.voice.say(this._buildGuidance(target, center, best), {
+      const msg = isNew
+        ? `Zone suivante : ${zoneName(target.row, target.col)}. ${zoneInstruction(target.row, target.col)}`
+        : `Toujours ${zoneName(target.row, target.col)}. ${zoneInstruction(target.row, target.col)}`;
+      const spoke = this.voice.say(msg, {
         id: 'target:' + key,
-        cooldown: isNew ? 2500 : 6500,
+        cooldown: isNew ? 2000 : 9000,
       });
       if (spoke) {
-        this.currentTargetKey = key;
-        this.targetAnnounceCount.set(key, count + 1);
-        // Zone annoncée 2 fois sans succès → conseil de mouvement.
-        if (count + 1 >= 2 && !this.tipSaidForRow.has(target.row)) {
+        if (!isNew && !this.tipSaidForRow.has(target.row)) {
+          // La zone traîne : conseil de mouvement complet une fois par rangée.
           this.tipSaidForRow.add(target.row);
           this.voice.say(tipFor(target.row, target.col), { queue: true });
         }
+        this.currentTargetKey = key;
       }
     }
-  }
-
-  _buildGuidance(target, center, best) {
-    const zone = zoneName(target.row, target.col);
-    if (!best) return `Il reste ${zone}.`;
-    if (best.d < 0.14) return `Tu y es presque ! Frotte bien là, sur ${zone}.`;
-    const du = center.u - best.hand.u;
-    const dv = center.v - best.hand.v;
-    // Vue de dos, la gauche de l'image est la gauche de la personne.
-    const dir =
-      Math.abs(du) > Math.abs(dv * 0.75)
-        ? du > 0 ? 'vers ta droite' : 'vers ta gauche'
-        : dv > 0 ? 'plus bas' : 'plus haut';
-    return `Il reste ${zone}. Va ${dir} avec ta main ${best.hand.name}.`;
   }
 
   // ---------------------------------------------------------------- fin
@@ -450,15 +451,15 @@ export class SunCoachEngine {
     this.onDone(result);
   }
 
-  // ---------------------------------------------------------------- overlay
+  // ---------------------------------------------------------------- rendu
 
-  /** Recolore le canvas basse résolution à partir de la heatmap, détourée au corps. */
+  /** Recolore le canvas basse résolution à partir de la heatmap (détouré au dos). */
   _renderHeat() {
     const px = this.heatImage.data;
     for (let i = 0; i < HEAT_W * HEAT_H; i++) {
       const o = i * 4;
       if (!this.grid.isBody(i)) {
-        px[o + 3] = 0; // hors du corps : rien à afficher
+        px[o + 3] = 0;
         continue;
       }
       const f = this.grid.pixelFraction(i);
@@ -472,24 +473,53 @@ export class SunCoachEngine {
     this.heatCtx.putImageData(this.heatImage, 0, 0);
   }
 
+  /** Tracé du contour du dos (silhouette dessinée) dans un contexte 2D. */
+  _traceBackPath(c, toX, toY) {
+    const STEPS = 28;
+    c.beginPath();
+    for (let i = 0; i <= STEPS; i++) {
+      const v = i / STEPS;
+      const x = toX(0.5 - effectiveHalfWidth(v));
+      const y = toY(v);
+      if (i === 0) c.moveTo(x, y);
+      else c.lineTo(x, y);
+    }
+    for (let i = STEPS; i >= 0; i--) {
+      const v = i / STEPS;
+      c.lineTo(toX(0.5 + effectiveHalfWidth(v)), toY(v));
+    }
+    c.closePath();
+  }
+
   /**
-   * Schéma fixe du dos : silhouette + heatmap + parcours récent + zone cible.
-   * Toujours lisible, même quand on se retourne et que l'overlay vidéo disparaît.
+   * Dessin de dos fixe : silhouette (tête + nuque décoratives), remplie au fur
+   * et à mesure par la heatmap, avec parcours des mains et zone cible.
+   * Toujours lisible, même quand on se retourne.
    */
   _drawMinimap() {
     if (!this.minimapCtx) return;
     const c = this.minimapCtx;
     const W = this.minimap.width, H = this.minimap.height;
     c.clearRect(0, 0, W, H);
-    c.fillStyle = 'rgba(0, 0, 0, 0.72)';
+    c.fillStyle = 'rgba(0, 0, 0, 0.78)';
     c.fillRect(0, 0, W, H);
 
-    const pad = 8;
-    const mapW = W - 2 * pad, mapH = H - 2 * pad;
+    // Zone du dos : sous la tête décorative.
+    const headH = H * 0.16;
+    const pad = 7;
+    const mapW = W - 2 * pad, mapH = H - headH - pad;
     const toX = (u) => pad + u * mapW;
-    const toY = (v) => pad + v * mapH;
+    const toY = (v) => headH + v * mapH;
 
-    // Silhouette + couverture.
+    // Tête + nuque décoratives.
+    const cx = W / 2;
+    c.beginPath();
+    c.arc(cx, headH * 0.45, headH * 0.34, 0, Math.PI * 2);
+    c.fillStyle = 'rgba(120, 130, 120, 0.9)';
+    c.fill();
+    c.fillRect(cx - headH * 0.13, headH * 0.7, headH * 0.26, headH * 0.35);
+
+    // Remplissage : heatmap détourée à la silhouette.
     const px = this.miniImage.data;
     for (let i = 0; i < HEAT_W * HEAT_H; i++) {
       const o = i * 4;
@@ -499,20 +529,23 @@ export class SunCoachEngine {
       }
       const f = this.grid.pixelFraction(i);
       if (f >= 1) {
-        px[o] = 0; px[o + 1] = 230; px[o + 2] = 0; px[o + 3] = 235;
+        px[o] = 0; px[o + 1] = 230; px[o + 2] = 0; px[o + 3] = 245;
       } else {
-        // base sombre (dos non couvert) qui chauffe vers l'orange
-        px[o] = Math.round(70 + f * 185);
-        px[o + 1] = Math.round(80 + f * 73);
-        px[o + 2] = 60;
-        px[o + 3] = 235;
+        px[o] = Math.round(72 + f * 183);
+        px[o + 1] = Math.round(82 + f * 71);
+        px[o + 2] = 62;
+        px[o + 3] = 245;
       }
     }
     this.miniCtx.putImageData(this.miniImage, 0, 0);
-    c.imageSmoothingEnabled = true;
-    c.drawImage(this.miniCanvas, pad, pad, mapW, mapH);
 
-    // Parcours récent des mains (gauche cyan, droite magenta).
+    c.save();
+    this._traceBackPath(c, toX, toY);
+    c.clip();
+    c.imageSmoothingEnabled = true;
+    c.drawImage(this.miniCanvas, pad, headH, mapW, mapH);
+
+    // Parcours récent des mains (gauche cyan, droite magenta), sous le clip.
     const trail = (path, color) => {
       const pts = path.slice(-45);
       if (pts.length < 2) return;
@@ -521,7 +554,7 @@ export class SunCoachEngine {
       for (let i = 1; i < pts.length; i++) c.lineTo(toX(pts[i].u), toY(pts[i].v));
       c.strokeStyle = color;
       c.lineWidth = 1.5;
-      c.globalAlpha = 0.85;
+      c.globalAlpha = 0.9;
       c.stroke();
       c.globalAlpha = 1;
     };
@@ -530,23 +563,37 @@ export class SunCoachEngine {
       trail(this.paths.droite, '#FF00FF');
     }
 
-    // Zone cible.
+    // Colonne vertébrale.
+    c.beginPath();
+    c.moveTo(toX(0.5), toY(0));
+    c.lineTo(toX(0.5), toY(1));
+    c.strokeStyle = 'rgba(0, 0, 0, 0.35)';
+    c.lineWidth = 1;
+    c.stroke();
+    c.restore();
+
+    // Contour de la silhouette.
+    this._traceBackPath(c, toX, toY);
+    c.strokeStyle = 'rgba(0, 255, 0, 0.75)';
+    c.lineWidth = 1.5;
+    c.stroke();
+
+    // Zone cible : rectangle orange clippé à la silhouette.
     if (this.state === 'coverage') {
       const t = this.grid.nextTarget();
       if (t) {
+        c.save();
+        this._traceBackPath(c, toX, toY);
+        c.clip();
         c.strokeStyle = '#FF9900';
         c.lineWidth = 2;
         c.strokeRect(
           toX(t.col / COLS), toY(t.row / ROWS),
           mapW / COLS, mapH / ROWS
         );
+        c.restore();
       }
     }
-
-    // Cadre.
-    c.strokeStyle = 'rgba(0, 255, 0, 0.5)';
-    c.lineWidth = 1;
-    c.strokeRect(0.5, 0.5, W - 1, H - 1);
   }
 
   _drawOverlay(P, frame) {
@@ -556,7 +603,6 @@ export class SunCoachEngine {
     if (!frame) return;
 
     // Heatmap fine, étirée sur le quadrilatère du dos.
-    // backToPx est affine : transform (u,v) → pixels directement supporté par canvas.
     if (this.state === 'coverage') {
       this._renderHeat();
       const a = frame.ex.x * frame.width;
@@ -608,6 +654,20 @@ export class SunCoachEngine {
       }
     }
   }
+}
+
+/** Demi-largeur avec les épaules arrondies (cohérente avec le masque). */
+function effectiveHalfWidth(v) {
+  let hw = backHalfWidth(v);
+  if (v < 0.06) {
+    const t = v / 0.06;
+    hw = Math.min(hw, 0.42 + t * 0.1);
+  }
+  return hw;
+}
+
+function capitalize(s) {
+  return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
 export { ROWS, COLS, HEAT_W, HEAT_H };

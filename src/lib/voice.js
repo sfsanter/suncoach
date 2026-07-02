@@ -71,8 +71,8 @@ export class Beeper {
   constructor() {
     this.ctx = null;
     this.muted = false;
-    this.period = Infinity; // ms entre deux bips
-    this.nextBeepAt = 0;
+    this.period = Infinity; // ms entre deux clics
+    this.nextClickAt = 0;
   }
 
   /** À appeler depuis un geste utilisateur. */
@@ -84,12 +84,12 @@ export class Beeper {
     if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
   }
 
-  beep(freq = 740, dur = 0.06, vol = 0.12) {
+  beep(freq = 740, dur = 0.06, vol = 0.12, type = 'sine') {
     if (!this.ctx || this.muted) return;
     const t = this.ctx.currentTime;
     const osc = this.ctx.createOscillator();
     const gain = this.ctx.createGain();
-    osc.type = 'sine';
+    osc.type = type;
     osc.frequency.value = freq;
     gain.gain.setValueAtTime(vol, t);
     gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
@@ -99,25 +99,31 @@ export class Beeper {
   }
 
   /**
-   * d : distance normalisée main → zone cible (0 = dessus, 1 = loin), null = pas de cible.
-   * Plus la main est proche, plus les bips sont rapprochés et aigus.
+   * Feedback "compteur Geiger" : cliquetis rapide quand la paume peint de la
+   * nouvelle surface, lent quand elle repasse sur du déjà couvert, silence
+   * quand rien ne s'enregistre. C'est LE signal "ça capte / ça capte pas".
+   *   mode : 'new' | 'old' | 'off'
    */
-  setProximity(d) {
-    if (d == null) {
-      this.period = Infinity;
-      return;
-    }
-    const clamped = Math.max(0, Math.min(1, d));
-    this.period = 140 + clamped * 860;
-    this.freq = 950 - clamped * 350;
+  setPaintActivity(mode) {
+    if (mode === 'new') this.period = 85;
+    else if (mode === 'old') this.period = 420;
+    else this.period = Infinity;
   }
 
   tick(now) {
     if (this.period === Infinity) return;
-    if (now >= this.nextBeepAt) {
-      this.beep(this.freq || 740);
-      this.nextBeepAt = now + this.period;
+    if (now >= this.nextClickAt) {
+      // clic bref et sec, plus aigu quand on peint du neuf
+      this.beep(this.period < 200 ? 1250 : 850, 0.025, 0.1, 'square');
+      this.nextClickAt = now + this.period;
     }
+  }
+
+  /** Petit carillon à chaque zone validée. */
+  zoneDone() {
+    if (!this.ctx || this.muted) return;
+    this.beep(880, 0.1, 0.14);
+    setTimeout(() => this.beep(1175, 0.14, 0.14), 110);
   }
 
   success() {
