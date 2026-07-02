@@ -21,7 +21,8 @@ mouvements pour les zones difficiles (omoplates, milieu du dos…).
 - Détection de pose : MediaPipe Tasks Vision (`PoseLandmarker`, modèle lite) en
   WebAssembly/GPU, directement dans le navigateur.
 - Voix : Web Speech API (`speechSynthesis`, fr-FR). Sons : WebAudio.
-- Déploiement : GitHub Actions → GitHub Pages à chaque push sur `main`.
+- Déploiement : GitHub Actions pousse `dist/` sur la branche `gh-pages` à chaque push sur `main`.
+  Dans **Settings → Pages**, source = branche `gh-pages` / dossier racine.
 - Confidentialité : la vidéo est analysée localement, **rien n'est envoyé sur internet**.
 
 ## Développement local
