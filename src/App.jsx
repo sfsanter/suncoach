@@ -82,6 +82,13 @@ function HomeScreen({ error, onStart }) {
           />
         )}
 
+        <EmergencyBanner
+          text="VERSION LIVE — MODE LIBRE"
+          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · Frotte tout le dos · la voix dit seulement ce qui MANQUE'}
+          severity="info"
+          visible
+        />
+
         <Card
           eyebrow="NERV // BRIEFING DE MISSION"
           title="Crème solaire dans le dos, zéro zone oubliée"
