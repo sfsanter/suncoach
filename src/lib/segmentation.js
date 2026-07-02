@@ -1,67 +1,111 @@
 /**
- * Segmentation MediaPipe → silhouette dorsale live + contour.
+ * Segmentation MediaPipe → silhouette dorsale live + couverture lissée (sans grille).
  */
 import { LM } from './pose.js';
+import { backHalfWidth, nearBackShape, toBack } from './coverage.js';
 
-const MASK_THRESH = 0.38;
-const BLEND = 0.42;
+const MASK_THRESH = 0.28;
+const BLEND = 0.38;
 
 function inTorsoClip(x, y, P) {
   const ls = P[LM.L_SHOULDER], rs = P[LM.R_SHOULDER];
   const lh = P[LM.L_HIP], rh = P[LM.R_HIP];
-  const top = Math.min(ls.y, rs.y) - Math.hypot(rs.x - ls.x, rs.y - ls.y) * 0.12;
-  const bot = Math.max(lh.y, rh.y) + Math.hypot(rh.x - lh.x, rh.y - lh.y) * 0.08;
+  const top = Math.min(ls.y, rs.y) - Math.hypot(rs.x - ls.x, rs.y - ls.y) * 0.15;
+  const bot = Math.max(lh.y, rh.y) + Math.hypot(rh.x - lh.x, rh.y - lh.y) * 0.12;
   if (y < top || y > bot) return false;
 
   const mx = (ls.x + rs.x + lh.x + rh.x) / 4;
   const my = (ls.y + rs.y + lh.y + rh.y) / 4;
   const shoulderW = Math.hypot(rs.x - ls.x, rs.y - ls.y);
-  const halfW = shoulderW * 0.72;
+  const halfW = shoulderW * 0.78;
   const dx = x - mx;
   const dy = y - my;
   const ex = { x: rs.x - ls.x, y: rs.y - ls.y };
-  const ey = { x: (lh.x + rh.x) / 2 - (ls.x + rs.x) / 2, y: (lh.y + rh.y) / 2 - (ls.y + rs.y) / 2 };
+  const ey = {
+    x: (lh.x + rh.x) / 2 - (ls.x + rs.x) / 2,
+    y: (lh.y + rh.y) / 2 - (ls.y + rs.y) / 2,
+  };
   const el = Math.hypot(ex.x, ex.y) || 1;
   const ew = Math.hypot(ey.x, ey.y) || 1;
   ex.x /= el; ex.y /= el;
   ey.x /= ew; ey.y /= ew;
   const lx = dx * ex.x + dy * ex.y;
   const ly = dx * ey.x + dy * ey.y;
-  return Math.abs(lx) <= halfW && ly >= -shoulderW * 0.15 && ly <= shoulderW * 1.05;
+  return Math.abs(lx) <= halfW && ly >= -shoulderW * 0.2 && ly <= shoulderW * 1.1;
+}
+
+/** Silhouette de repli depuis les landmarks si le masque MediaPipe est faible. */
+export function buildFallbackSilhouette(P, W, H, prev = null) {
+  if (!P) return prev;
+  const ls = P[LM.L_SHOULDER], rs = P[LM.R_SHOULDER];
+  const lh = P[LM.L_HIP], rh = P[LM.R_HIP];
+  if ([ls, rs, lh, rh].some((p) => p.visibility < 0.35)) return prev;
+
+  const n = W * H;
+  const out = prev && prev.length === n ? prev : new Uint8ClampedArray(n);
+  const top = Math.min(ls.y, rs.y);
+  const bot = Math.max(lh.y, rh.y);
+  const torsoH = Math.max(1, bot - top);
+
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      const v = (y - top) / torsoH;
+      let a = 0;
+      if (v >= -0.05 && v <= 1.05) {
+        const cx = (ls.x + rs.x) / 2 + ((lh.x + rh.x) / 2 - (ls.x + rs.x) / 2) * Math.max(0, v);
+        const hw = backHalfWidth(Math.max(0, Math.min(1, v))) * Math.hypot(rs.x - ls.x, rs.y - ls.y) * 1.05;
+        if (Math.abs(x - cx) <= hw) a = 255;
+      }
+      if (prev) a = Math.round(prev[i] * (1 - BLEND) + a * BLEND);
+      out[i] = a;
+    }
+  }
+  return out;
 }
 
 /**
  * Masque dorsal lissé (W×H), valeurs 0–255.
  */
 export function buildBackSilhouette(mask, P, W, H, prev = null) {
-  if (!mask || !P) return prev;
+  if (!P) return prev;
 
-  let raw;
-  try {
-    raw = mask.getAsFloat32Array();
-  } catch {
-    return prev;
+  let raw = null;
+  if (mask) {
+    try {
+      raw = mask.getAsFloat32Array();
+    } catch {
+      raw = null;
+    }
   }
 
-  const mw = mask.width;
-  const mh = mask.height;
   const n = W * H;
   const out = prev && prev.length === n ? prev : new Uint8ClampedArray(n);
+  let hits = 0;
 
-  for (let y = 0; y < H; y++) {
-    const sy = Math.min(mh - 1, Math.round((y / H) * mh));
-    for (let x = 0; x < W; x++) {
-      const i = y * W + x;
-      const sx = Math.min(mw - 1, Math.round((x / W) * mw));
-      let v = raw[sy * mw + sx] > MASK_THRESH && inTorsoClip(x, y, P) ? 255 : 0;
-      if (prev) v = Math.round(prev[i] * (1 - BLEND) + v * BLEND);
-      out[i] = v;
+  if (raw) {
+    const mw = mask.width;
+    const mh = mask.height;
+    for (let y = 0; y < H; y++) {
+      const sy = Math.min(mh - 1, Math.round((y / H) * mh));
+      for (let x = 0; x < W; x++) {
+        const i = y * W + x;
+        const sx = Math.min(mw - 1, Math.round((x / W) * mw));
+        let v = raw[sy * mw + sx] > MASK_THRESH && inTorsoClip(x, y, P) ? 255 : 0;
+        if (v) hits++;
+        if (prev) v = Math.round(prev[i] * (1 - BLEND) + v * BLEND);
+        out[i] = v;
+      }
     }
+  }
+
+  if (!raw || hits < n * 0.002) {
+    return buildFallbackSilhouette(P, W, H, out);
   }
   return out;
 }
 
-function isEdge(alpha, W, H, x, y, t = 96) {
+function isEdge(alpha, W, H, x, y, t = 80) {
   const i = y * W + x;
   if (alpha[i] < t) return false;
   if (x === 0 || y === 0 || x === W - 1 || y === H - 1) return true;
@@ -71,27 +115,24 @@ function isEdge(alpha, W, H, x, y, t = 96) {
   );
 }
 
-/** Contour angulaire autour du centroïde (silhouette lissée). */
 export function traceBackContour(alpha, W, H) {
   if (!alpha) return null;
   const edges = [];
-  const step = Math.max(2, Math.round(Math.min(W, H) / 240));
+  const step = Math.max(2, Math.round(Math.min(W, H) / 200));
   for (let y = 0; y < H; y += step) {
     for (let x = 0; x < W; x += step) {
       if (isEdge(alpha, W, H, x, y)) edges.push({ x, y });
     }
   }
-  if (edges.length < 8) return null;
+  if (edges.length < 6) return null;
 
   let cx = 0, cy = 0;
   for (const p of edges) { cx += p.x; cy += p.y; }
   cx /= edges.length;
   cy /= edges.length;
-
   edges.sort((a, b) => Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx));
 
-  // Lissage léger : sous-échantillonner pour éviter les zigzags.
-  const maxPts = 72;
+  const maxPts = 80;
   if (edges.length > maxPts) {
     const slim = [];
     const stride = edges.length / maxPts;
@@ -110,52 +151,82 @@ export function pathFromContour(contour) {
   return path;
 }
 
+function heatColor(f) {
+  if (f >= 0.95) return [0, 255, 80, Math.round(140 + f * 80)];
+  if (f > 0.08) return [255, Math.round(80 + f * 120), 0, Math.round(90 + f * 100)];
+  return [255, 40, 40, Math.round(50 + (1 - f) * 40)];
+}
+
 /**
- * Overlay : remplissage léger + contour vert + heatmap éventuelle clipée au dos.
+ * Peint la couverture pixel par pixel sur la silhouette (pas de grille 36×48 upscalée).
  */
-export function drawBackSegmentationOverlay(ctx, alpha, W, H, { contour, heatCanvas, frame } = {}) {
+function paintCoverageOnSilhouette(ctx, alpha, W, H, grid, frame) {
+  if (!grid || !frame) return;
+  const img = ctx.createImageData(W, H);
+  const d = img.data;
+  const step = 3;
+
+  for (let y = 0; y < H; y += step) {
+    for (let x = 0; x < W; x += step) {
+      const i = y * W + x;
+      if (alpha[i] < 70) continue;
+      const { u, v } = toBack({ x, y }, frame);
+      if (!nearBackShape(u, v, 0.08)) continue;
+      const f = grid.sample(u, v);
+      const [r, g, b, a] = heatColor(f);
+      for (let dy = 0; dy < step && y + dy < H; dy++) {
+        for (let dx = 0; dx < step && x + dx < W; dx++) {
+          const j = (y + dy) * W + (x + dx);
+          if (alpha[j] < 50) continue;
+          const o = j * 4;
+          d[o] = r;
+          d[o + 1] = g;
+          d[o + 2] = b;
+          d[o + 3] = a;
+        }
+      }
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+/**
+ * Overlay : contour vert + couverture lissée clipée au dos segmenté.
+ */
+export function drawBackSegmentationOverlay(ctx, alpha, W, H, { contour, grid, frame, showCoverage } = {}) {
   if (!alpha) return;
 
   const path = contour ? pathFromContour(contour) : null;
 
-  // Remplissage de la silhouette
-  const fillImg = ctx.createImageData(W, H);
-  const d = fillImg.data;
-  for (let i = 0; i < W * H; i++) {
-    if (alpha[i] < 80) continue;
-    const o = i * 4;
-    d[o] = 0;
-    d[o + 1] = 255;
-    d[o + 2] = 120;
-    d[o + 3] = Math.min(55, Math.round(alpha[i] * 0.22));
-  }
-  ctx.putImageData(fillImg, 0, 0);
-
-  // Heatmap projetée sur le dos réel (pas de grille)
-  if (heatCanvas && frame && path) {
-    const a = frame.ex.x * frame.width;
-    const b = frame.ex.y * frame.width;
-    const c = frame.ey.x * frame.height;
-    const d2 = frame.ey.y * frame.height;
-    const e = frame.origin.x - 0.5 * a;
-    const f = frame.origin.y - 0.5 * b;
+  if (showCoverage && grid && frame && path) {
     ctx.save();
     ctx.clip(path);
-    ctx.setTransform(a, b, c, d2, e, f);
-    ctx.globalAlpha = 0.72;
-    ctx.imageSmoothingEnabled = true;
-    ctx.drawImage(heatCanvas, 0, 0, 1, 1);
+    paintCoverageOnSilhouette(ctx, alpha, W, H, grid, frame);
+    ctx.restore();
+  } else if (path) {
+    const fillImg = ctx.createImageData(W, H);
+    const d = fillImg.data;
+    for (let i = 0; i < W * H; i++) {
+      if (alpha[i] < 70) continue;
+      const o = i * 4;
+      d[o] = 0;
+      d[o + 1] = 255;
+      d[o + 2] = 100;
+      d[o + 3] = 35;
+    }
+    ctx.save();
+    ctx.clip(path);
+    ctx.putImageData(fillImg, 0, 0);
     ctx.restore();
   }
 
-  // Contour du dos
   if (path) {
     ctx.save();
-    ctx.strokeStyle = 'rgba(0, 255, 120, 0.95)';
-    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = 'rgba(0, 255, 130, 1)';
+    ctx.lineWidth = 3;
     ctx.lineJoin = 'round';
-    ctx.shadowColor = 'rgba(0, 255, 0, 0.55)';
-    ctx.shadowBlur = 6;
+    ctx.shadowColor = 'rgba(0, 255, 0, 0.7)';
+    ctx.shadowBlur = 8;
     ctx.stroke(path);
     ctx.restore();
   }

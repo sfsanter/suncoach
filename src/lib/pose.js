@@ -134,7 +134,7 @@ export class PoseTracker {
     this.video = video;
     this.landmarker = null;
     this.stream = null;
-    this.facing = 'user';
+    this.facing = 'environment';
     this.smoothed = null;
     this.smoothedWorld = null;
     this._raf = 0;

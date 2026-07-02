@@ -12,10 +12,11 @@ export const COLS = 3;
 export const HEAT_W = 36;
 export const HEAT_H = 48;
 
-const PIXEL_NEED = 0.18;
-const ZONE_RATIO = 0.55;
+const PIXEL_NEED = 0.16;
+const ZONE_RATIO = 0.50;
 /** Pinceau plus large : une paume couvre une zone visible sur la minimap. */
-const SIGMA = 0.085;
+const SIGMA = 0.10;
+export const DONE_PAINTED_RATIO = 0.82;
 
 let shapeScale = 1.0;
 let bodyMask = new Uint8Array(HEAT_W * HEAT_H);
@@ -108,15 +109,29 @@ export function torsoFrame(P) {
 export function toBack(p, f) {
   const dx = p.x - f.origin.x;
   const dy = p.y - f.origin.y;
-  return {
+  const raw = {
     u: (dx * f.ex.x + dy * f.ex.y) / f.width + 0.5,
     v: (dx * f.ey.x + dy * f.ey.y) / f.height,
   };
+  return mapBackUV(raw.u, raw.v);
+}
+
+/**
+ * Corrige l'inversion miroir caméra → schéma dos.
+ * Sans ce flip, frotter en haut-gauche peignait en bas-droite sur la minimap.
+ */
+export function mapBackUV(u, v) {
+  return { u: 1 - u, v: 1 - v };
+}
+
+export function mapBackPoint(p, f) {
+  return toBack(p, f);
 }
 
 export function backToPx(u, v, f) {
-  const du = (u - 0.5) * f.width;
-  const dv = v * f.height;
+  const m = mapBackUV(u, v);
+  const du = (m.u - 0.5) * f.width;
+  const dv = m.v * f.height;
   return {
     x: f.origin.x + f.ex.x * du + f.ey.x * dv,
     y: f.origin.y + f.ex.y * du + f.ey.y * dv,
@@ -190,6 +205,41 @@ export class CoverageGrid {
 
   pixelFraction(i) {
     return Math.min(1, this.heat[i] / PIXEL_NEED);
+  }
+
+  /** Interpolation bilinéaire de la couverture en (u, v). */
+  sample(u, v) {
+    if (u < 0 || u > 1 || v < 0 || v > 1) return 0;
+    const x = u * (HEAT_W - 1);
+    const y = v * (HEAT_H - 1);
+    const x0 = Math.floor(x), y0 = Math.floor(y);
+    const x1 = Math.min(HEAT_W - 1, x0 + 1);
+    const y1 = Math.min(HEAT_H - 1, y0 + 1);
+    const tx = x - x0, ty = y - y0;
+    const s = (ix, iy) => {
+      const i = iy * HEAT_W + ix;
+      return bodyMask[i] ? this.pixelFraction(i) : 0;
+    };
+    return (
+      s(x0, y0) * (1 - tx) * (1 - ty) +
+      s(x1, y0) * tx * (1 - ty) +
+      s(x0, y1) * (1 - tx) * ty +
+      s(x1, y1) * tx * ty
+    );
+  }
+
+  missingZones() {
+    return ANATOMICAL_ZONES.map((zone, idx) => ({
+      idx,
+      zone,
+      ratio: this.zoneRatio(idx),
+    }))
+      .filter((z) => z.ratio < ZONE_RATIO)
+      .sort((a, b) => a.ratio - b.ratio);
+  }
+
+  biggestGap() {
+    return this.missingZones()[0] ?? null;
   }
 
   update(hands, dt) {
@@ -267,8 +317,8 @@ export class CoverageGrid {
   }
 
   get done() {
-    for (let i = 0; i < ZONE_COUNT; i++) if (!this.isCovered(i)) return false;
-    return true;
+    if (this.paintedRatio >= DONE_PAINTED_RATIO) return true;
+    return this.missingZones().length === 0;
   }
 
   nextTarget() {

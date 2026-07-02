@@ -12,10 +12,9 @@ import {
 import {
   estimateSubjectDistance, touchDistanceForRange, formatDistance,
 } from './calibration.js';
-import { strokeZoneOutline } from './zones.js';
-import { tipFor, zoneInstruction } from './tips.js';
+import { gapMessage, gapShort } from './tips.js';
 import {
-  buildBackSilhouette, traceBackContour, drawBackSegmentationOverlay,
+  buildBackSilhouette, buildFallbackSilhouette, traceBackContour, drawBackSegmentationOverlay,
 } from './segmentation.js';
 
 export class SunCoachEngine {
@@ -32,12 +31,6 @@ export class SunCoachEngine {
     this.beeper = new Beeper();
     this.tracker = new PoseTracker(video);
     this.grid = new CoverageGrid();
-
-    this.heatCanvas = document.createElement('canvas');
-    this.heatCanvas.width = HEAT_W;
-    this.heatCanvas.height = HEAT_H;
-    this.heatCtx = this.heatCanvas.getContext('2d');
-    this.heatImage = this.heatCtx.createImageData(HEAT_W, HEAT_H);
 
     this.miniCanvas = document.createElement('canvas');
     this.miniCanvas.width = HEAT_W;
@@ -94,6 +87,8 @@ export class SunCoachEngine {
     this.smFrame = null;
     this.lastPaintTs = { new: 0, old: 0 };
     this.lastCaptureHintTs = 0;
+    this.lastGapVoiceTs = 0;
+    this.freePaintSince = 0;
     this.distSamples = [];
     this.shapeSamples = [];
     this.touchDist = 0.16;
@@ -130,6 +125,8 @@ export class SunCoachEngine {
     await this.tracker.switchCamera();
     this.overlay.width = this.video.videoWidth;
     this.overlay.height = this.video.videoHeight;
+    this.smoothMask = null;
+    this.backContour = null;
   }
 
   async _acquireWakeLock() {
@@ -149,12 +146,16 @@ export class SunCoachEngine {
     const P = lm ? lm.map((p) => ({ x: p.x * W, y: p.y * H, visibility: p.visibility })) : null;
     const frame = this._smoothTorso(P ? torsoFrame(P) : null);
 
-    if (track.segmentationMask && P) {
-      this.smoothMask = buildBackSilhouette(track.segmentationMask, P, W, H, this.smoothMask);
+    if (P) {
+      if (track.segmentationMask) {
+        this.smoothMask = buildBackSilhouette(track.segmentationMask, P, W, H, this.smoothMask);
+      } else {
+        this.smoothMask = buildFallbackSilhouette(P, W, H, this.smoothMask);
+      }
       this.backContour = this.smoothMask
         ? traceBackContour(this.smoothMask, W, H)
         : null;
-      if (this.state === 'placement') {
+      if (this.state === 'placement' && track.segmentationMask && frame) {
         this._sampleShapeFromMask(track.segmentationMask, P, frame, W, H);
       }
     }
@@ -297,9 +298,11 @@ export class SunCoachEngine {
     this.coverageStartedAt = performance.now();
     this.lastCaptureHintTs = this.coverageStartedAt + 6000;
     this.onHud(0, 'CRÈME DANS LES MAINS !');
+    this.lastGapVoiceTs = 0;
+    this.freePaintSince = performance.now();
     this.voice.say(
-      "C'est parti ! Mets une bonne dose de crème. Quand ça cliquette, ta main est détectée. " +
-        'On commence par la nuque : main par-dessus l’épaule.',
+      "C'est parti ! Frotte librement tout ton dos. Quand ça cliquette, ta main est détectée. " +
+        'Le schéma vert montre ce qui est couvert ; le rouge, ce qui manque encore.',
       { interrupt: true }
     );
   }
@@ -364,14 +367,14 @@ export class SunCoachEngine {
 
     if (!P || !frame) {
       this.beeper.setPaintActivity('off');
-      this.onHud(this.grid.fraction, 'RECHERCHE DU TORSE…');
+      this.onHud(this.grid.paintedRatio, 'RECHERCHE DU TORSE…');
       return;
     }
 
     const backOk = this.backOrient.update(P, W);
     if (!backOk && ts - this.orientWarnTs > 15000) {
       this.orientWarnTs = ts;
-      this.onHud(this.grid.fraction, 'ORIENTATION : VÉRIFIE LE DOS');
+      this.onHud(this.grid.paintedRatio, 'ORIENTATION : VÉRIFIE LE DOS');
       this.voice.say('Reste bien dos à la caméra.', { id: 'stayback', cooldown: 15000 });
     }
 
@@ -407,15 +410,10 @@ export class SunCoachEngine {
       }
     }
 
-    for (let zi = 0; zi < ZONE_COUNT; zi++) {
-      if (!this.coveredZones.has(zi) && this.grid.isCovered(zi)) {
-        this.coveredZones.add(zi);
-        this.beeper.zoneDone();
-        this.voice.say(`${capitalize(zoneName(zi))} : c’est fait !`, { interrupt: true });
-      }
-    }
+    const painted = this.grid.paintedRatio;
+    const pct = Math.round(painted * 100);
+    const gap = this.grid.biggestGap();
 
-    const pct = this.grid.fraction;
     if (pct >= 0.5 && this.lastMilestone < 0.5) {
       this.lastMilestone = 0.5;
       this.voice.say('La moitié du dos est couverte, continue !', { queue: true });
@@ -423,26 +421,17 @@ export class SunCoachEngine {
 
     if (this.grid.done) return this._finish();
 
-    const targetIdx = this.grid.nextTarget();
-    const zone = ANATOMICAL_ZONES[targetIdx];
-    this.onHud(pct, 'CIBLE : ' + zone.short);
+    this.onHud(painted, gap ? gapShort(gap) : `${pct} % COUVERT`);
 
-    if (!this.voice.busy) {
-      const isNew = targetIdx !== this.currentTargetIdx;
-      const msg = isNew
-        ? `Zone suivante : ${zone.name}. ${zoneInstruction(targetIdx)}`
-        : `Toujours ${zone.name}. ${zoneInstruction(targetIdx)}`;
-      const spoke = this.voice.say(msg, {
-        id: 'target:' + zone.id,
-        cooldown: isNew ? 2000 : 9000,
-      });
-      if (spoke) {
-        if (!isNew && !this.tipSaidForZone.has(targetIdx)) {
-          this.tipSaidForZone.add(targetIdx);
-          this.voice.say(tipFor(targetIdx), { queue: true });
-        }
-        this.currentTargetIdx = targetIdx;
-      }
+    const elapsed = ts - this.freePaintSince;
+    if (
+      gap &&
+      elapsed > 10000 &&
+      ts - this.lastGapVoiceTs > 14000 &&
+      !this.voice.busy
+    ) {
+      this.lastGapVoiceTs = ts;
+      this.voice.say(gapMessage(gap), { id: 'gap:' + gap.zone.id, cooldown: 14000 });
     }
   }
 
@@ -476,7 +465,7 @@ export class SunCoachEngine {
     this.beeper.success();
     this.stop({ silence: false });
     this.voice.say(
-      'Bravo ! Ton dos est entièrement couvert. Pense à en remettre dans deux heures, ou après la baignade.',
+      'Bravo ! Ton dos est bien couvert. Pense à en remettre dans deux heures, ou après la baignade.',
       { interrupt: true }
     );
     this.onDone(result);
@@ -484,8 +473,8 @@ export class SunCoachEngine {
 
   // ---------------------------------------------------------------- rendu
 
-  _renderHeat() {
-    const px = this.heatImage.data;
+  _renderMiniHeat() {
+    const px = this.miniImage.data;
     for (let i = 0; i < HEAT_W * HEAT_H; i++) {
       const o = i * 4;
       if (!this.grid.isBody(i)) {
@@ -493,14 +482,17 @@ export class SunCoachEngine {
         continue;
       }
       const f = this.grid.pixelFraction(i);
-      if (f >= 1) {
-        px[o] = 0; px[o + 1] = 255; px[o + 2] = 0; px[o + 3] = 165;
+      if (f >= 0.95) {
+        px[o] = 0; px[o + 1] = 230; px[o + 2] = 60; px[o + 3] = 255;
+      } else if (f > 0.06) {
+        px[o] = 255; px[o + 1] = Math.round(70 + f * 130); px[o + 2] = 0;
+        px[o + 3] = 230;
       } else {
-        px[o] = 255; px[o + 1] = Math.round(60 + f * 140); px[o + 2] = 0;
-        px[o + 3] = Math.round(f * 150);
+        px[o] = 255; px[o + 1] = 35; px[o + 2] = 35;
+        px[o + 3] = 220;
       }
     }
-    this.heatCtx.putImageData(this.heatImage, 0, 0);
+    this.miniCtx.putImageData(this.miniImage, 0, 0);
   }
 
   _traceBackPath(c, toX, toY) {
@@ -540,24 +532,7 @@ export class SunCoachEngine {
     c.fill();
     c.fillRect(cx - headH * 0.13, headH * 0.7, headH * 0.26, headH * 0.35);
 
-    const px = this.miniImage.data;
-    for (let i = 0; i < HEAT_W * HEAT_H; i++) {
-      const o = i * 4;
-      if (!this.grid.isBody(i)) {
-        px[o + 3] = 0;
-        continue;
-      }
-      const f = this.grid.pixelFraction(i);
-      if (f >= 1) {
-        px[o] = 0; px[o + 1] = 230; px[o + 2] = 0; px[o + 3] = 245;
-      } else {
-        px[o] = Math.round(72 + f * 183);
-        px[o + 1] = Math.round(82 + f * 71);
-        px[o + 2] = 62;
-        px[o + 3] = 245;
-      }
-    }
-    this.miniCtx.putImageData(this.miniImage, 0, 0);
+    this._renderMiniHeat();
 
     c.save();
     this._traceBackPath(c, toX, toY);
@@ -585,22 +560,36 @@ export class SunCoachEngine {
     c.restore();
 
     this._traceBackPath(c, toX, toY);
-    c.strokeStyle = 'rgba(0, 255, 0, 0.8)';
+    c.strokeStyle = 'rgba(0, 255, 0, 0.85)';
     c.lineWidth = 2;
     c.stroke();
 
+    c.font = '9px Fira Code, monospace';
+    c.fillStyle = 'rgba(0, 255, 0, 0.7)';
+    c.textAlign = 'left';
+    c.fillText('G', pad + 2, headH + 10);
+    c.textAlign = 'right';
+    c.fillText('D', W - pad - 2, headH + 10);
+
     if (this.state === 'coverage') {
-      const tIdx = this.grid.nextTarget();
-      if (tIdx != null) {
-        const zone = ANATOMICAL_ZONES[tIdx];
-        strokeZoneOutline(c, zone, toX, toY, '#FF9900', 2);
+      const gap = this.grid.biggestGap();
+      if (gap) {
+        const z = gap.zone;
+        c.save();
+        c.strokeStyle = 'rgba(255, 50, 50, 0.95)';
+        c.lineWidth = 2.5;
+        c.setLineDash([4, 3]);
+        c.beginPath();
+        c.rect(toX(z.u0), toY(z.v0), toX(z.u1) - toX(z.u0), toY(z.v1) - toY(z.v0));
+        c.stroke();
+        c.restore();
       }
 
-      const pct = Math.round(this.grid.fraction * 100);
-      c.font = 'bold 22px Fira Code, monospace';
+      const pct = Math.round(this.grid.paintedRatio * 100);
+      c.font = 'bold 20px Fira Code, monospace';
       c.textAlign = 'center';
       c.fillStyle = '#00FF00';
-      c.strokeStyle = 'rgba(0, 0, 0, 0.85)';
+      c.strokeStyle = 'rgba(0, 0, 0, 0.9)';
       c.lineWidth = 3;
       c.strokeText(pct + '%', cx, H - 6);
       c.fillText(pct + '%', cx, H - 6);
@@ -610,16 +599,14 @@ export class SunCoachEngine {
   _drawOverlay(P, frame, track, W, H) {
     const ctx = this.ctx;
     ctx.clearRect(0, 0, W, H);
-    if (!frame) return;
+    if (!frame && !this.smoothMask) return;
 
-    if (this.state === 'coverage') this._renderHeat();
-
-    // Silhouette dorsale segmentée (contour live, pas de grille)
     if (this.smoothMask) {
       drawBackSegmentationOverlay(ctx, this.smoothMask, W, H, {
         contour: this.backContour,
-        heatCanvas: this.state === 'coverage' ? this.heatCanvas : null,
+        grid: this.state === 'coverage' ? this.grid : null,
         frame,
+        showCoverage: this.state === 'coverage',
       });
     }
 
@@ -669,10 +656,6 @@ function effectiveHalfWidth(v) {
     hw = Math.min(hw, 0.42 + t * 0.1);
   }
   return hw;
-}
-
-function capitalize(s) {
-  return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
 export { ZONE_COUNT, HEAT_W, HEAT_H, ANATOMICAL_ZONES };
