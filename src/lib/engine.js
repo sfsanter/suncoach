@@ -3,16 +3,16 @@
  * silhouette morphologique, zones anatomiques avec gestes animés.
  */
 import { Voice, Beeper } from './voice.js';
-import { PoseTracker, LM, isBackTurned, OneEuro, palmFromHand } from './pose.js';
+import { PoseTracker, LM, isBackTurned, OneEuro, BackOrientation, contactPointsFromHand, palmFromHand } from './pose.js';
 import {
   CoverageGrid, torsoFrame, backToPx, zoneName, backHalfWidth,
-  torsoFrame3D, toBack3D, setShapeScale,
+  toBack, nearBackShape, setShapeScale,
   HEAT_W, HEAT_H, ZONE_COUNT, ANATOMICAL_ZONES,
 } from './coverage.js';
 import {
   estimateSubjectDistance, touchDistanceForRange, formatDistance,
 } from './calibration.js';
-import { drawZoneGesture, strokeZoneOutline } from './zones.js';
+import { strokeZoneOutline } from './zones.js';
 import { tipFor, zoneInstruction } from './tips.js';
 
 export class SunCoachEngine {
@@ -45,6 +45,9 @@ export class SunCoachEngine {
     this.state = 'idle';
     this.wakeLock = null;
     this.touchDist = 0.16;
+    this.backOrient = new BackOrientation();
+    this.orientWarnTs = 0;
+
     this._onVisibility = () => {
       if (document.visibilityState === 'visible' && this.state !== 'idle') {
         this._acquireWakeLock();
@@ -260,7 +263,7 @@ export class SunCoachEngine {
     if (shoulderW < 0.08 * W) {
       return fail('Tu es un peu loin. Approche-toi.', 'toofar', 'DISTANCE : TROP LOIN');
     }
-    if (!isBackTurned(P)) {
+    if (!isBackTurned(P, W)) {
       return fail('Tourne-toi, dos à la caméra.', 'turn', 'ORIENTATION : FACE — TOURNE-TOI');
     }
 
@@ -275,6 +278,8 @@ export class SunCoachEngine {
 
   _startCoverage() {
     this._finalizeCalibration();
+    this.backOrient.reset();
+    this.orientWarnTs = 0;
     this.state = 'coverage';
     this.coverageStartedAt = performance.now();
     this.lastCaptureHintTs = this.coverageStartedAt + 6000;
@@ -288,84 +293,90 @@ export class SunCoachEngine {
 
   // ---------------------------------------------------------------- couverture
 
+  /** La main doit être dans la zone torse élargie (bras par-dessus l'épaule). */
+  _pointNearTorso(p, frame) {
+    const dx = p.x - frame.origin.x;
+    const dy = p.y - frame.origin.y;
+    const localX = dx * frame.ex.x + dy * frame.ex.y;
+    const localY = dx * frame.ey.x + dy * frame.ey.y;
+    return (
+      Math.abs(localX) <= frame.width * 0.58 &&
+      localY >= -frame.height * 0.18 &&
+      localY <= frame.height * 1.06
+    );
+  }
+
   /**
-   * Mains via HolisticLandmarker (priorité) ; repli sur poignets pose si absent.
+   * Projection 2D image → repère torse (u, v). Plus fiable que le monde 3D
+   * quand on frotte le dos dos à la caméra.
    */
-  _getHands3D(track, world, f3) {
-    const hands = [];
+  _getContactPoints2D(track, P, frame, W, H, ts) {
+    const out = [];
     const defs = [
-      { hand: track.leftHandWorld, poseWrist: LM.L_WRIST, name: 'gauche' },
-      { hand: track.rightHandWorld, poseWrist: LM.R_WRIST, name: 'droite' },
+      { hand: track.leftHand2D, poseWrist: LM.L_WRIST, name: 'gauche' },
+      { hand: track.rightHand2D, poseWrist: LM.R_WRIST, name: 'droite' },
     ];
 
     for (const d of defs) {
-      let palm = d.hand ? palmFromHand(d.hand) : null;
-      if (!palm && world) {
-        const w = world[d.poseWrist];
-        if (w && (w.visibility ?? 1) >= 0.45) palm = w;
+      let points = [];
+      if (d.hand?.length >= 21) {
+        const handPx = d.hand.map((p) => ({
+          x: p.x * W,
+          y: p.y * H,
+          visibility: p.visibility ?? p.presence ?? 0,
+        }));
+        points = contactPointsFromHand(handPx);
       }
-      if (!palm) continue;
-      hands.push({ name: d.name, ...toBack3D(palm, f3) });
+      if (!points.length && P) {
+        const w = P[d.poseWrist];
+        if (w && w.visibility >= 0.45) points = [w];
+      }
+
+      const f = this.filters[d.name];
+      for (const p of points) {
+        if (!this._pointNearTorso(p, frame)) continue;
+        const raw = toBack(p, frame);
+        out.push({
+          name: d.name,
+          u: f.u.filter(raw.u, ts),
+          v: f.v.filter(raw.v, ts),
+        });
+      }
     }
-    return hands;
+    return out;
   }
 
   _coverageTick(P, track, frame, ts, dt) {
-    const world = track.poseWorld;
-    if (!P || !world || !isBackTurned(P)) {
-      this.beeper.setPaintActivity('off');
-      this.onHud(this.grid.fraction, 'RESTE DOS À LA CAMÉRA');
-      this.voice.say('Reste bien dos à la caméra.', { id: 'stayback', cooldown: 7000 });
-      return;
-    }
+    const W = this.overlay.width;
 
-    const f3 = torsoFrame3D(world);
-    if (!f3) {
+    if (!P || !frame) {
       this.beeper.setPaintActivity('off');
       this.onHud(this.grid.fraction, 'RECHERCHE DU TORSE…');
       return;
     }
 
-    const ls = P[LM.L_SHOULDER], rs = P[LM.R_SHOULDER];
-    const shoulderPx = Math.hypot(rs.x - ls.x, rs.y - ls.y);
-    const hipPx = Math.hypot(P[LM.R_HIP].x - P[LM.L_HIP].x, P[LM.R_HIP].y - P[LM.L_HIP].y);
-    const torsoPx = Math.hypot(
-      (ls.x + rs.x) / 2 - (P[LM.L_HIP].x + P[LM.R_HIP].x) / 2,
-      (ls.y + rs.y) / 2 - (P[LM.L_HIP].y + P[LM.R_HIP].y) / 2
-    );
-    if (Math.max(shoulderPx, hipPx) < torsoPx * 0.28) {
-      this.beeper.setPaintActivity('off');
-      this.onHud(this.grid.fraction, 'TROP DE PROFIL — TOURNE-TOI DOS À LA CAMÉRA');
-      this.voice.say('Je te vois trop de profil. Remets-toi bien dos à la caméra.', {
-        id: 'profile', cooldown: 6000,
-      });
-      return;
+    const backOk = this.backOrient.update(P, W);
+    if (!backOk && ts - this.orientWarnTs > 15000) {
+      this.orientWarnTs = ts;
+      this.onHud(this.grid.fraction, 'ORIENTATION : VÉRIFIE LE DOS');
+      this.voice.say('Reste bien dos à la caméra.', { id: 'stayback', cooldown: 15000 });
     }
 
-    const rawHands = this._getHands3D(track, world, f3);
-    const hands = [];
-    for (const h of rawHands) {
-      const f = this.filters[h.name];
-      hands.push({
-        name: h.name,
-        u: f.u.filter(h.u, ts),
-        v: f.v.filter(h.v, ts),
-        w: h.w,
-      });
-    }
-    const touching = hands.filter((h) => Math.abs(h.w) < this.touchDist);
+    const contacts = this._getContactPoints2D(track, P, frame, W, this.overlay.height, ts);
+    const painting = contacts.filter((h) => nearBackShape(h.u, h.v));
 
-    const { added, crossed } = this.grid.update(touching, dt);
+    const { added, crossed } = this.grid.update(painting, dt);
 
     if (crossed > 0 || added > dt * 0.25) this.lastPaintTs.new = ts;
-    else if (touching.length > 0) this.lastPaintTs.old = ts;
+    else if (painting.length > 0) this.lastPaintTs.old = ts;
     if (ts - this.lastPaintTs.new < 350) this.beeper.setPaintActivity('new');
     else if (ts - this.lastPaintTs.old < 350) this.beeper.setPaintActivity('old');
     else this.beeper.setPaintActivity('off');
     this.beeper.tick(ts);
 
     if (
-      hands.length > 0 &&
+      contacts.length > 0 &&
+      painting.length === 0 &&
       (this.lastPaintTs.new === 0 || ts - this.lastPaintTs.new > 8000) &&
       ts - this.lastCaptureHintTs > 12000
     ) {
@@ -376,8 +387,7 @@ export class SunCoachEngine {
       );
     }
 
-    for (const h of touching) {
-      if (h.u < -0.05 || h.u > 1.05 || h.v < -0.05 || h.v > 1.05) continue;
+    for (const h of painting) {
       if (ts - this.lastPathTs[h.name] > 80) {
         this.lastPathTs[h.name] = ts;
         this.paths[h.name].push({ u: h.u, v: h.v });
@@ -542,56 +552,45 @@ export class SunCoachEngine {
     c.imageSmoothingEnabled = true;
     c.drawImage(this.miniCanvas, pad, headH, mapW, mapH);
 
-    const trail = (path, color) => {
-      const pts = path.slice(-45);
-      if (pts.length < 2) return;
-      c.beginPath();
-      c.moveTo(toX(pts[0].u), toY(pts[0].v));
-      for (let i = 1; i < pts.length; i++) c.lineTo(toX(pts[i].u), toY(pts[i].v));
-      c.strokeStyle = color;
-      c.lineWidth = 1.5;
-      c.globalAlpha = 0.9;
-      c.stroke();
-      c.globalAlpha = 1;
-    };
     if (this.paths) {
+      const trail = (path, color) => {
+        const pts = path.slice(-50);
+        if (pts.length < 2) return;
+        c.beginPath();
+        c.moveTo(toX(pts[0].u), toY(pts[0].v));
+        for (let i = 1; i < pts.length; i++) c.lineTo(toX(pts[i].u), toY(pts[i].v));
+        c.strokeStyle = color;
+        c.lineWidth = 2;
+        c.globalAlpha = 0.85;
+        c.stroke();
+        c.globalAlpha = 1;
+      };
       trail(this.paths.gauche, '#00FFFF');
       trail(this.paths.droite, '#FF00FF');
     }
 
-    c.beginPath();
-    c.moveTo(toX(0.5), toY(0));
-    c.lineTo(toX(0.5), toY(1));
-    c.strokeStyle = 'rgba(0, 0, 0, 0.35)';
-    c.lineWidth = 1;
-    c.stroke();
     c.restore();
 
     this._traceBackPath(c, toX, toY);
-    c.strokeStyle = 'rgba(0, 255, 0, 0.75)';
-    c.lineWidth = 1.5;
+    c.strokeStyle = 'rgba(0, 255, 0, 0.8)';
+    c.lineWidth = 2;
     c.stroke();
-
-    // Labels zones anatomiques (discrètes).
-    c.font = '7px Fira Code, monospace';
-    c.fillStyle = 'rgba(0, 255, 0, 0.55)';
-    c.textAlign = 'center';
-    for (const z of ANATOMICAL_ZONES) {
-      c.fillText(z.short, toX((z.u0 + z.u1) / 2), toY(z.v0) + 8);
-    }
 
     if (this.state === 'coverage') {
       const tIdx = this.grid.nextTarget();
       if (tIdx != null) {
         const zone = ANATOMICAL_ZONES[tIdx];
-        c.save();
-        this._traceBackPath(c, toX, toY);
-        c.clip();
-        strokeZoneOutline(c, zone, toX, toY, '#FF9900', 2.5);
-        const phase = (ts % 2000) / 2000;
-        drawZoneGesture(c, zone, toX, toY, phase);
-        c.restore();
+        strokeZoneOutline(c, zone, toX, toY, '#FF9900', 2);
       }
+
+      const pct = Math.round(this.grid.fraction * 100);
+      c.font = 'bold 22px Fira Code, monospace';
+      c.textAlign = 'center';
+      c.fillStyle = '#00FF00';
+      c.strokeStyle = 'rgba(0, 0, 0, 0.85)';
+      c.lineWidth = 3;
+      c.strokeText(pct + '%', cx, H - 6);
+      c.fillText(pct + '%', cx, H - 6);
     }
   }
 

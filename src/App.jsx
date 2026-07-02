@@ -193,7 +193,7 @@ function SessionScreen({ onAbort, onError, onDone }) {
 
         {/* Dessin de dos fixe : reste lisible même quand on se retourne. */}
         <div className="pointer-events-none absolute bottom-3 right-3 flex flex-col items-center gap-1">
-          <canvas ref={minimapRef} width={150} height={210} />
+          <canvas ref={minimapRef} width={180} height={250} />
           <span
             className="text-[10px] tracking-[0.25em] text-nerv-green/80"
             style={{ fontFamily: 'var(--font-nerv-mono)' }}

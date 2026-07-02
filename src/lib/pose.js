@@ -63,21 +63,70 @@ function lmScore(p) {
 export function palmFromHand(hand) {
   if (!hand || hand.length < 21) return null;
   const w = hand[HM.WRIST];
-  if (lmScore(w) < 0.4) return null;
-  const refs = [hand[HM.INDEX_TIP], hand[HM.PINKY_TIP], hand[HM.INDEX_MCP], hand[HM.PINKY_MCP]]
-    .filter((p) => lmScore(p) > 0.4);
-  if (refs.length >= 2) {
+  if (lmScore(w) < 0.35) return null;
+  const refs = [hand[HM.INDEX_TIP], hand[HM.PINKY_TIP], hand[HM.MIDDLE_TIP], hand[HM.INDEX_MCP]]
+    .filter((p) => lmScore(p) > 0.35);
+  if (refs.length >= 1) {
     const cx = refs.reduce((s, p) => s + p.x, 0) / refs.length;
     const cy = refs.reduce((s, p) => s + p.y, 0) / refs.length;
-    const cz = refs.reduce((s, p) => s + p.z, 0) / refs.length;
     return {
-      x: w.x + (cx - w.x) * 0.58,
-      y: w.y + (cy - w.y) * 0.58,
-      z: w.z + (cz - w.z) * 0.58,
+      x: w.x + (cx - w.x) * 0.62,
+      y: w.y + (cy - w.y) * 0.62,
       visibility: Math.min(1, lmScore(w)),
     };
   }
-  return { ...w, visibility: lmScore(w) };
+  return { x: w.x, y: w.y, visibility: lmScore(w) };
+}
+
+/** Paume + doigt index pour peindre plusieurs points de contact. */
+export function contactPointsFromHand(hand) {
+  if (!hand || hand.length < 21) return [];
+  const pts = [];
+  const palm = palmFromHand(hand);
+  if (palm) pts.push(palm);
+  for (const idx of [HM.INDEX_TIP, HM.MIDDLE_TIP]) {
+    const p = hand[idx];
+    if (lmScore(p) > 0.4) pts.push({ x: p.x, y: p.y, visibility: lmScore(p) });
+  }
+  return pts;
+}
+
+/**
+ * Dos à la caméra : épaules visibles et assez écartées.
+ * On évite les faux positifs « tourne-toi » quand les bras bougent.
+ */
+export function isBackTurned(P, imageWidth = 1) {
+  const ls = P[LM.L_SHOULDER], rs = P[LM.R_SHOULDER];
+  const lh = P[LM.L_HIP], rh = P[LM.R_HIP];
+  if ([ls, rs, lh, rh].some((p) => p.visibility < 0.35)) return false;
+
+  const shoulderW = Math.abs(rs.x - ls.x);
+  const minW = imageWidth > 100 ? 0.06 * imageWidth : 0.06;
+  if (shoulderW < minW) return false;
+
+  // De dos : épaule gauche de la personne à gauche de l'image (x plus petit).
+  return ls.x < rs.x;
+}
+
+/** Moyenne glissante pour ne pas couper la peinture sur une frame bruitée. */
+export class BackOrientation {
+  constructor(size = 12) {
+    this.size = size;
+    this.buf = [];
+  }
+
+  reset() {
+    this.buf = [];
+  }
+
+  /** true = assez de frames récentes indiquent dos à la caméra. */
+  update(P, imageWidth) {
+    const ok = P ? isBackTurned(P, imageWidth) : false;
+    this.buf.push(ok);
+    if (this.buf.length > this.size) this.buf.shift();
+    const n = this.buf.filter(Boolean).length;
+    return n >= Math.ceil(this.size * 0.34);
+  }
 }
 
 export class PoseTracker {
@@ -213,13 +262,6 @@ export class PoseTracker {
     }
     return this.smoothedWorld;
   }
-}
-
-export function isBackTurned(lm) {
-  const ls = lm[LM.L_SHOULDER];
-  const rs = lm[LM.R_SHOULDER];
-  if (ls.visibility < 0.5 || rs.visibility < 0.5) return false;
-  return ls.x < rs.x;
 }
 
 export class OneEuro {

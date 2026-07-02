@@ -12,9 +12,10 @@ export const COLS = 3;
 export const HEAT_W = 36;
 export const HEAT_H = 48;
 
-const PIXEL_NEED = 0.25;
-const ZONE_RATIO = 0.7;
-const SIGMA = 0.055;
+const PIXEL_NEED = 0.18;
+const ZONE_RATIO = 0.55;
+/** Pinceau plus large : une paume couvre une zone visible sur la minimap. */
+const SIGMA = 0.085;
 
 let shapeScale = 1.0;
 let bodyMask = new Uint8Array(HEAT_W * HEAT_H);
@@ -51,6 +52,13 @@ function effectiveHalfWidth(v) {
 export function insideBackShape(u, v) {
   if (v < 0 || v > 1) return false;
   return Math.abs(u - 0.5) <= effectiveHalfWidth(v);
+}
+
+/** Marge élargie pour accepter une main légèrement hors silhouette. */
+export function nearBackShape(u, v, margin = 0.06) {
+  if (v < -0.05 || v > 1.05) return false;
+  const vClamped = Math.max(0, Math.min(1, v));
+  return Math.abs(u - 0.5) <= effectiveHalfWidth(vClamped) + margin;
 }
 
 function rebuildBodyMask() {
