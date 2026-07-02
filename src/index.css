@@ -1,0 +1,24 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-nerv-display: 'Oswald', 'Arial Narrow', system-ui, sans-serif;
+  --font-nerv-mono: 'Fira Code', 'Courier New', monospace;
+  --font-nerv-body: 'Barlow Condensed', 'Arial Narrow', system-ui, sans-serif;
+  --font-nerv-title: 'Noto Serif JP', Georgia, serif;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  background: #000;
+  color: #e0e0e0;
+  font-family: var(--font-nerv-body);
+}
+
+/* Utilitaires "glow" utilisés par les composants nerv-ui (absents du preset). */
+.nerv-text-shadow-red    { text-shadow: 0 0 6px rgba(255, 0, 0, 0.8); }
+.nerv-text-shadow-orange { text-shadow: 0 0 6px rgba(255, 153, 0, 0.8); }
+.nerv-text-shadow-green  { text-shadow: 0 0 6px rgba(0, 255, 0, 0.8); }
+.nerv-text-shadow-cyan   { text-shadow: 0 0 6px rgba(0, 255, 255, 0.8); }
