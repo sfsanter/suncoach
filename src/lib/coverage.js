@@ -1,85 +1,81 @@
 /**
- * Modélisation du dos en coordonnées torse (u : gauche→droite de la personne,
- * v : épaules→hanches). La couverture est suivie sur une heatmap fine
- * (HEAT_W × HEAT_H), limitée à une silhouette de dos dessinée (déterministe,
- * contrairement à la segmentation vidéo qui était trop bruitée).
+ * Modélisation du dos en coordonnées torse (u, v). Heatmap fine limitée à une
+ * silhouette ajustable (scale morphologique via segmentation légère).
  */
 import { LM } from './pose.js';
+import { ANATOMICAL_ZONES, ZONE_COUNT } from './zones.js';
 
+export { ANATOMICAL_ZONES, ZONE_COUNT };
 export const ROWS = 4;
 export const COLS = 3;
 
-/** Résolution de la heatmap (multiple de COLS/ROWS pour un découpage exact). */
 export const HEAT_W = 36;
 export const HEAT_H = 48;
 
-/** Secondes de présence cumulée de la paume pour couvrir un pixel. */
 const PIXEL_NEED = 0.25;
-/** Part de pixels couverts pour valider une zone. */
 const ZONE_RATIO = 0.7;
-/** Rayon du "pinceau" gaussien, en coordonnées dos (~ taille d'une paume). */
 const SIGMA = 0.055;
 
-const ROW_NAMES = ['le haut du dos', 'les omoplates', 'le milieu du dos', 'le bas du dos'];
-
-export function zoneName(row, col) {
-  if (row === 1 && col === 1) return 'entre les omoplates';
-  const side = col === 0 ? ', côté gauche' : col === 2 ? ', côté droit' : '';
-  return ROW_NAMES[row] + side;
-}
-
-/* ------------------------------------------------------------------ *
- * Silhouette du dos : profil de demi-largeur en fonction de v.
- * Sert à la fois de masque de validation et de dessin dans l'UI.
- * ------------------------------------------------------------------ */
+let shapeScale = 1.0;
+let bodyMask = new Uint8Array(HEAT_W * HEAT_H);
 
 const SHAPE_KNOTS = [
-  // [v, demi-largeur]
-  [0.00, 0.42], // ligne des épaules (épaules arrondies via le cap plus bas)
-  [0.06, 0.50], // deltoïdes, point le plus large
+  [0.00, 0.42],
+  [0.06, 0.50],
   [0.22, 0.45],
-  [0.50, 0.36], // taille
+  [0.50, 0.36],
   [0.78, 0.42],
-  [0.92, 0.46], // hanches
+  [0.92, 0.46],
   [1.00, 0.43],
 ];
 
-/** Demi-largeur du dos à la hauteur v (interpolation linéaire entre nœuds). */
 export function backHalfWidth(v) {
-  if (v <= SHAPE_KNOTS[0][0]) return SHAPE_KNOTS[0][1];
+  if (v <= SHAPE_KNOTS[0][0]) return SHAPE_KNOTS[0][1] * shapeScale;
   for (let i = 1; i < SHAPE_KNOTS.length; i++) {
     const [v1, w1] = SHAPE_KNOTS[i];
     const [v0, w0] = SHAPE_KNOTS[i - 1];
-    if (v <= v1) return w0 + ((v - v0) / (v1 - v0)) * (w1 - w0);
+    if (v <= v1) return (w0 + ((v - v0) / (v1 - v0)) * (w1 - w0)) * shapeScale;
   }
-  return SHAPE_KNOTS[SHAPE_KNOTS.length - 1][1];
+  return SHAPE_KNOTS[SHAPE_KNOTS.length - 1][1] * shapeScale;
+}
+
+function effectiveHalfWidth(v) {
+  let hw = backHalfWidth(v);
+  if (v < 0.06) {
+    const t = v / 0.06;
+    hw = Math.min(hw, (0.42 + t * 0.1) * shapeScale);
+  }
+  return hw;
 }
 
 export function insideBackShape(u, v) {
   if (v < 0 || v > 1) return false;
-  let hw = backHalfWidth(v);
-  // Épaules arrondies : on rabote les coins supérieurs.
-  if (v < 0.06) {
-    const t = v / 0.06;
-    hw = Math.min(hw, 0.42 + t * 0.1);
-  }
-  return Math.abs(u - 0.5) <= hw;
+  return Math.abs(u - 0.5) <= effectiveHalfWidth(v);
 }
 
-/** Masque précalculé sur la grille heatmap. */
-const SHAPE_MASK = (() => {
-  const m = new Uint8Array(HEAT_W * HEAT_H);
+function rebuildBodyMask() {
   for (let y = 0; y < HEAT_H; y++) {
     for (let x = 0; x < HEAT_W; x++) {
-      m[y * HEAT_W + x] = insideBackShape((x + 0.5) / HEAT_W, (y + 0.5) / HEAT_H) ? 1 : 0;
+      const i = y * HEAT_W + x;
+      bodyMask[i] = insideBackShape((x + 0.5) / HEAT_W, (y + 0.5) / HEAT_H) ? 1 : 0;
     }
   }
-  return m;
-})();
+}
 
-/* ------------------------------------------------------------------ *
- * Repère torse 2D (pixels image) — pour l'overlay vidéo.
- * ------------------------------------------------------------------ */
+export function setShapeScale(scale) {
+  shapeScale = Math.max(0.75, Math.min(1.25, scale));
+  rebuildBodyMask();
+}
+
+export function getShapeScale() {
+  return shapeScale;
+}
+
+rebuildBodyMask();
+
+export function zoneName(zoneIdx) {
+  return ANATOMICAL_ZONES[zoneIdx]?.name ?? '';
+}
 
 export function torsoFrame(P) {
   const ls = P[LM.L_SHOULDER], rs = P[LM.R_SHOULDER];
@@ -89,7 +85,7 @@ export function torsoFrame(P) {
   const origin = { x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2 };
   const hipMid = { x: (lh.x + rh.x) / 2, y: (lh.y + rh.y) / 2 };
 
-  let ex = { x: rs.x - ls.x, y: rs.y - ls.y }; // gauche → droite de la personne (vue de dos)
+  let ex = { x: rs.x - ls.x, y: rs.y - ls.y };
   const width = Math.hypot(ex.x, ex.y) * 1.1;
   let ey = { x: hipMid.x - origin.x, y: hipMid.y - origin.y };
   const height = Math.hypot(ey.x, ey.y) * 1.08;
@@ -118,13 +114,6 @@ export function backToPx(u, v, f) {
     y: f.origin.y + f.ex.y * du + f.ey.y * dv,
   };
 }
-
-/* ------------------------------------------------------------------ *
- * Repère torse 3D (world landmarks, mètres) — pour la peinture.
- * Invariant à la rotation : le repère tourne avec le corps, et la
- * coordonnée w (distance au plan du dos) permet de ne peindre que
- * quand la paume touche vraiment le dos.
- * ------------------------------------------------------------------ */
 
 const v3 = {
   sub: (a, b) => ({ x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }),
@@ -156,14 +145,13 @@ export function torsoFrame3D(W) {
   const height = v3.len(downVec) * 1.08;
   if (width < 0.05 || height < 0.05) return null;
 
-  const ex = v3.norm(shoulderVec); // gauche → droite de la personne
-  const ey = v3.norm(downVec); // épaules → hanches
-  const ez = v3.norm(v3.cross(ex, ey)); // normale au plan du dos
+  const ex = v3.norm(shoulderVec);
+  const ey = v3.norm(downVec);
+  const ez = v3.norm(v3.cross(ex, ey));
 
   return { origin, ex, ey, ez, width, height };
 }
 
-/** Point 3D → (u, v, w) : position sur le dos + distance au plan (mètres). */
 export function toBack3D(p, f) {
   const d = v3.sub(p, f.origin);
   return {
@@ -173,9 +161,9 @@ export function toBack3D(p, f) {
   };
 }
 
-/* ------------------------------------------------------------------ *
- * Grille de couverture.
- * ------------------------------------------------------------------ */
+function inZone(u, v, z) {
+  return u >= z.u0 && u <= z.u1 && v >= z.v0 && v <= z.v1;
+}
 
 export class CoverageGrid {
   constructor() {
@@ -185,22 +173,17 @@ export class CoverageGrid {
 
   reset() {
     this.heat.fill(0);
+    setShapeScale(1.0);
   }
 
   isBody(i) {
-    return SHAPE_MASK[i] === 1;
+    return bodyMask[i] === 1;
   }
 
   pixelFraction(i) {
     return Math.min(1, this.heat[i] / PIXEL_NEED);
   }
 
-  /**
-   * hands : [{u,v}] positions des paumes sur le dos ; dt en secondes.
-   * Renvoie l'activité de peinture pour le feedback sonore :
-   *   added   — quantité de peinture déposée sur des pixels non finis
-   *   crossed — nombre de pixels qui viennent d'être validés
-   */
   update(hands, dt) {
     const reach = 3 * SIGMA;
     let added = 0, crossed = 0;
@@ -214,7 +197,7 @@ export class CoverageGrid {
         const pv = (y + 0.5) / HEAT_H;
         for (let x = x0; x <= x1; x++) {
           const i = y * HEAT_W + x;
-          if (SHAPE_MASK[i] === 0) continue;
+          if (bodyMask[i] === 0) continue;
           const pu = (x + 0.5) / HEAT_W;
           const du = pu - h.u;
           const dv = pv - h.v;
@@ -232,15 +215,17 @@ export class CoverageGrid {
     return { added, crossed };
   }
 
-  /** Part de pixels du dos couverts (heat >= need) dans une zone. */
-  zoneRatio(row, col) {
-    const x0 = (col * HEAT_W) / COLS, x1 = ((col + 1) * HEAT_W) / COLS;
-    const y0 = (row * HEAT_H) / ROWS, y1 = ((row + 1) * HEAT_H) / ROWS;
+  zoneRatio(zoneIdx) {
+    const z = ANATOMICAL_ZONES[zoneIdx];
+    if (!z) return 1;
     let painted = 0, body = 0;
-    for (let y = y0; y < y1; y++) {
-      for (let x = x0; x < x1; x++) {
+    for (let y = 0; y < HEAT_H; y++) {
+      const v = (y + 0.5) / HEAT_H;
+      for (let x = 0; x < HEAT_W; x++) {
+        const u = (x + 0.5) / HEAT_W;
+        if (!inZone(u, v, z)) continue;
         const i = y * HEAT_W + x;
-        if (SHAPE_MASK[i] === 0) continue;
+        if (bodyMask[i] === 0) continue;
         body++;
         if (this.heat[i] >= PIXEL_NEED) painted++;
       }
@@ -249,26 +234,24 @@ export class CoverageGrid {
     return painted / body;
   }
 
-  fractionOf(row, col) {
-    return Math.min(1, this.zoneRatio(row, col) / ZONE_RATIO);
+  fractionOf(zoneIdx) {
+    return Math.min(1, this.zoneRatio(zoneIdx) / ZONE_RATIO);
   }
 
-  isCovered(row, col) {
-    return this.zoneRatio(row, col) >= ZONE_RATIO;
+  isCovered(zoneIdx) {
+    return this.zoneRatio(zoneIdx) >= ZONE_RATIO;
   }
 
   get fraction() {
     let sum = 0;
-    for (let r = 0; r < ROWS; r++)
-      for (let c = 0; c < COLS; c++) sum += this.fractionOf(r, c);
-    return sum / (ROWS * COLS);
+    for (let i = 0; i < ZONE_COUNT; i++) sum += this.fractionOf(i);
+    return sum / ZONE_COUNT;
   }
 
-  /** Part brute de la surface du dos réellement couverte (pour les stats). */
   get paintedRatio() {
     let painted = 0, body = 0;
     for (let i = 0; i < this.heat.length; i++) {
-      if (SHAPE_MASK[i] === 0) continue;
+      if (bodyMask[i] === 0) continue;
       body++;
       if (this.heat[i] >= PIXEL_NEED) painted++;
     }
@@ -276,48 +259,42 @@ export class CoverageGrid {
   }
 
   get done() {
-    for (let r = 0; r < ROWS; r++)
-      for (let c = 0; c < COLS; c++) if (!this.isCovered(r, c)) return false;
+    for (let i = 0; i < ZONE_COUNT; i++) if (!this.isCovered(i)) return false;
     return true;
   }
 
-  /** Prochaine zone à couvrir : de haut en bas (stratégie naturelle). */
   nextTarget() {
-    for (let r = 0; r < ROWS; r++)
-      for (let c = 0; c < COLS; c++)
-        if (!this.isCovered(r, c)) return { row: r, col: c };
+    for (let i = 0; i < ZONE_COUNT; i++) if (!this.isCovered(i)) return i;
     return null;
   }
 
-  cellCenter(row, col) {
-    return { u: (col + 0.5) / COLS, v: (row + 0.5) / ROWS };
-  }
-
-  /** Point du dos le moins couvert d'une zone — cible de la voix. */
-  coldestPoint(row, col) {
-    const x0 = (col * HEAT_W) / COLS, x1 = ((col + 1) * HEAT_W) / COLS;
-    const y0 = (row * HEAT_H) / ROWS, y1 = ((row + 1) * HEAT_H) / ROWS;
+  coldestPoint(zoneIdx) {
+    const z = ANATOMICAL_ZONES[zoneIdx];
+    if (!z) return { u: 0.5, v: 0.5 };
     let best = null;
-    for (let y = y0; y < y1; y++) {
-      for (let x = x0; x < x1; x++) {
+    for (let y = 0; y < HEAT_H; y++) {
+      const v = (y + 0.5) / HEAT_H;
+      for (let x = 0; x < HEAT_W; x++) {
+        const u = (x + 0.5) / HEAT_W;
+        if (!inZone(u, v, z)) continue;
         const i = y * HEAT_W + x;
-        if (SHAPE_MASK[i] === 0) continue;
+        if (bodyMask[i] === 0) continue;
         const val = this.heat[i];
         if (!best || val < best.val) best = { val, x, y };
       }
     }
-    if (!best) return this.cellCenter(row, col);
+    if (!best) return { u: (z.u0 + z.u1) / 2, v: (z.v0 + z.v1) / 2 };
     return { u: (best.x + 0.5) / HEAT_W, v: (best.y + 0.5) / HEAT_H };
   }
 
-  /** Copie de l'état pour l'écran de fin. */
   snapshot() {
     return {
       w: HEAT_W,
       h: HEAT_H,
       need: PIXEL_NEED,
       data: Float32Array.from(this.heat),
-      body: Uint8Array.from(SHAPE_MASK),
+      body: Uint8Array.from(bodyMask),
+      shapeScale,
     };
   }
 }

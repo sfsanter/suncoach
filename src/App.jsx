@@ -8,8 +8,9 @@ import {
   SyncProgressBar,
   TerminalDisplay,
 } from '@mdrbx/nerv-ui';
-import { SunCoachEngine, ROWS, COLS } from './lib/engine.js';
+import { SunCoachEngine, ZONE_COUNT, ANATOMICAL_ZONES } from './lib/engine.js';
 import { backHalfWidth } from './lib/coverage.js';
+import { strokeZoneOutline } from './lib/zones.js';
 import { preloadPose } from './lib/pose.js';
 
 export default function App() {
@@ -45,11 +46,11 @@ export default function App() {
 // ---------------------------------------------------------------- accueil
 
 const BRIEFING = [
-  '01. CALE TON TÉLÉPHONE À HAUTEUR DE POITRINE.',
+  '01. CALE LE TÉLÉPHONE SUR UN SUPPORT (PAS EN MAIN).',
   '02. MONTE LE VOLUME AU MAXIMUM.',
   '03. RECULE À ENVIRON 2 MÈTRES, DOS À LA CAMÉRA.',
-  '04. SUIS LE GUIDAGE VOCAL, ZONE PAR ZONE.',
-  '05. JINGLE FINAL = DOS ENTIÈREMENT PROTÉGÉ.',
+  '04. SUIS LE GUIDAGE VOCAL — 7 ZONES ANATOMIQUES.',
+  '05. CLIQUETIS = MAIN DÉTECTÉE. JINGLE = ZONE VALIDÉE.',
 ];
 
 function HomeScreen({ error, onStart }) {
@@ -295,20 +296,15 @@ function DoneScreen({ result, onRestart }) {
     c.lineWidth = 1.5;
     c.stroke();
 
-    // Contour des zones de guidage.
-    c.strokeStyle = 'rgba(0, 255, 0, 0.3)';
-    c.lineWidth = 1;
-    for (let col = 1; col < COLS; col++) {
-      c.beginPath(); c.moveTo(toX(col / COLS), toY(0)); c.lineTo(toX(col / COLS), toY(1)); c.stroke();
-    }
-    for (let row = 1; row < ROWS; row++) {
-      c.beginPath(); c.moveTo(toX(0), toY(row / ROWS)); c.lineTo(toX(1), toY(row / ROWS)); c.stroke();
+    // Contours des zones anatomiques.
+    for (const z of ANATOMICAL_ZONES) {
+      strokeZoneOutline(c, z, toX, toY, 'rgba(0, 255, 0, 0.35)', 1);
     }
 
     c.fillStyle = '#00FF00';
-    c.font = '12px Fira Code, monospace';
+    c.font = '11px Fira Code, monospace';
     c.textAlign = 'center';
-    c.fillText('ÉPAULES', W / 2, 16);
+    c.fillText('NUQUE', W / 2, 18);
     c.fillText('BAS DU DOS', W / 2, H - 8);
   }, [result]);
 
@@ -335,7 +331,7 @@ function DoneScreen({ result, onRestart }) {
           className={`text-sm text-center ${aborted ? 'text-nerv-orange' : 'text-nerv-green'}`}
           style={{ fontFamily: 'var(--font-nerv-mono)' }}
         >
-          ZONES VALIDÉES : {result?.zonesCovered ?? 0} / {result?.zonesTotal ?? ROWS * COLS}
+          ZONES VALIDÉES : {result?.zonesCovered ?? 0} / {result?.zonesTotal ?? ZONE_COUNT}
           <br />
           SURFACE RÉELLEMENT PEINTE : {painted} %
           <br />

@@ -1,9 +1,8 @@
 /**
- * Caméra + MediaPipe PoseLandmarker (tout tourne dans le navigateur).
- * Modèle "full" (plus précis que "lite" sur les poignets/doigts), et sortie
- * des world landmarks 3D en mètres pour un repère torse invariant à la rotation.
+ * Caméra + MediaPipe HolisticLandmarker : pose + mains dédiées (21 pts/main)
+ * + masque de segmentation léger pour ajuster la morphologie du dos.
  */
-import { FilesetResolver, PoseLandmarker } from '@mediapipe/tasks-vision';
+import { FilesetResolver, HolisticLandmarker } from '@mediapipe/tasks-vision';
 
 export const LM = {
   NOSE: 0,
@@ -16,9 +15,18 @@ export const LM = {
   L_HIP: 23, R_HIP: 24,
 };
 
+export const HM = {
+  WRIST: 0,
+  INDEX_MCP: 5,
+  PINKY_MCP: 17,
+  INDEX_TIP: 8,
+  PINKY_TIP: 20,
+  MIDDLE_TIP: 12,
+};
+
 const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
 const MODEL_URL =
-  'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task';
+  'https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/1/holistic_landmarker.task';
 
 let landmarkerPromise = null;
 
@@ -27,28 +35,49 @@ async function createLandmarker() {
   const options = (delegate) => ({
     baseOptions: { modelAssetPath: MODEL_URL, delegate },
     runningMode: 'VIDEO',
-    numPoses: 1,
-    minTrackingConfidence: 0.6,
+    minPosePresenceConfidence: 0.6,
+    minHandLandmarksConfidence: 0.5,
+    outputPoseSegmentationMasks: true,
   });
   try {
-    return await PoseLandmarker.createFromOptions(fileset, options('GPU'));
+    return await HolisticLandmarker.createFromOptions(fileset, options('GPU'));
   } catch {
-    return await PoseLandmarker.createFromOptions(fileset, options('CPU'));
+    return await HolisticLandmarker.createFromOptions(fileset, options('CPU'));
   }
 }
 
-/**
- * Télécharge WASM + modèle une seule fois, dès que possible (appelé depuis
- * l'écran d'accueil pour que tout soit prêt quand on lance le protocole).
- */
 export function preloadPose() {
   if (!landmarkerPromise) {
     landmarkerPromise = createLandmarker().catch((err) => {
-      landmarkerPromise = null; // permet de retenter au prochain appel
+      landmarkerPromise = null;
       throw err;
     });
   }
   return landmarkerPromise;
+}
+
+function lmScore(p) {
+  return p.visibility ?? p.presence ?? 0;
+}
+
+export function palmFromHand(hand) {
+  if (!hand || hand.length < 21) return null;
+  const w = hand[HM.WRIST];
+  if (lmScore(w) < 0.4) return null;
+  const refs = [hand[HM.INDEX_TIP], hand[HM.PINKY_TIP], hand[HM.INDEX_MCP], hand[HM.PINKY_MCP]]
+    .filter((p) => lmScore(p) > 0.4);
+  if (refs.length >= 2) {
+    const cx = refs.reduce((s, p) => s + p.x, 0) / refs.length;
+    const cy = refs.reduce((s, p) => s + p.y, 0) / refs.length;
+    const cz = refs.reduce((s, p) => s + p.z, 0) / refs.length;
+    return {
+      x: w.x + (cx - w.x) * 0.58,
+      y: w.y + (cy - w.y) * 0.58,
+      z: w.z + (cz - w.z) * 0.58,
+      visibility: Math.min(1, lmScore(w)),
+    };
+  }
+  return { ...w, visibility: lmScore(w) };
 }
 
 export class PoseTracker {
@@ -67,7 +96,6 @@ export class PoseTracker {
     try {
       this.landmarker = await preloadPose();
     } catch {
-      // un seul retry : les échecs réseau transitoires sont fréquents sur mobile
       this.landmarker = await preloadPose();
     }
   }
@@ -75,14 +103,9 @@ export class PoseTracker {
   async startCamera(facing = this.facing) {
     this.stopCamera();
     const request = navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: facing,
-        width: { ideal: 960 },
-        height: { ideal: 720 },
-      },
+      video: { facingMode: facing, width: { ideal: 960 }, height: { ideal: 720 } },
       audio: false,
     });
-    // Certains navigateurs sans caméra laissent getUserMedia suspendu indéfiniment.
     const timeout = new Promise((_, reject) =>
       setTimeout(() => {
         const e = new Error('camera timeout');
@@ -107,7 +130,7 @@ export class PoseTracker {
     try {
       await this.startCamera(next);
     } catch {
-      await this.startCamera(this.facing); // l'appareil n'a peut-être qu'une caméra
+      await this.startCamera(this.facing);
     }
   }
 
@@ -118,10 +141,6 @@ export class PoseTracker {
     }
   }
 
-  /**
-   * Boucle de détection ; onFrame(landmarks2D|null, worldLandmarks3D|null, ts)
-   * à chaque frame vidéo.
-   */
   start(onFrame) {
     const loop = () => {
       this._raf = requestAnimationFrame(loop);
@@ -135,13 +154,25 @@ export class PoseTracker {
       } catch {
         return;
       }
-      const raw = result.landmarks && result.landmarks[0];
-      const world = result.worldLandmarks && result.worldLandmarks[0];
+
+      const raw = result.poseLandmarks?.[0];
+      const world = result.poseWorldLandmarks?.[0];
+      const mask = result.poseSegmentationMasks?.[0] ?? null;
+
       onFrame(
-        raw ? this._smooth(raw) : null,
-        world ? this._smoothWorld(world) : null,
+        {
+          pose2D: raw ? this._smooth(raw) : null,
+          poseWorld: world ? this._smoothWorld(world) : null,
+          leftHandWorld: result.leftHandWorldLandmarks?.[0] ?? null,
+          rightHandWorld: result.rightHandWorldLandmarks?.[0] ?? null,
+          leftHand2D: result.leftHandLandmarks?.[0] ?? null,
+          rightHand2D: result.rightHandLandmarks?.[0] ?? null,
+          segmentationMask: mask,
+        },
         ts
       );
+
+      mask?.close();
     };
     loop();
   }
@@ -154,7 +185,6 @@ export class PoseTracker {
     this._lastVideoTime = -1;
   }
 
-  /** Lissage exponentiel pour atténuer le bruit des landmarks 2D. */
   _smooth(raw, alpha = 0.45) {
     if (!this.smoothed || this.smoothed.length !== raw.length) {
       this.smoothed = raw.map((p) => ({ ...p }));
@@ -169,7 +199,6 @@ export class PoseTracker {
     return this.smoothed;
   }
 
-  /** Idem pour les world landmarks 3D (z bruité → lissage plus fort). */
   _smoothWorld(raw, alpha = 0.35) {
     if (!this.smoothedWorld || this.smoothedWorld.length !== raw.length) {
       this.smoothedWorld = raw.map((p) => ({ ...p }));
@@ -186,10 +215,6 @@ export class PoseTracker {
   }
 }
 
-/**
- * De dos, l'épaule gauche (landmark 11) apparaît à gauche de l'image
- * (les frames ne sont pas en miroir) ; de face c'est l'inverse.
- */
 export function isBackTurned(lm) {
   const ls = lm[LM.L_SHOULDER];
   const rs = lm[LM.R_SHOULDER];
@@ -197,10 +222,6 @@ export function isBackTurned(lm) {
   return ls.x < rs.x;
 }
 
-/**
- * Filtre one-euro (Casiez et al.) : peu de jitter à basse vitesse, peu de
- * latence à haute vitesse. Recommandé par la littérature pour les landmarks.
- */
 export class OneEuro {
   constructor({ minCutoff = 1.2, beta = 0.02, dCutoff = 1.0 } = {}) {
     this.minCutoff = minCutoff;
