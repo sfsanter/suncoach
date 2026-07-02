@@ -113,6 +113,7 @@ function HomeScreen({ error, onStart }) {
 function SessionScreen({ onAbort, onError, onDone }) {
   const videoRef = useRef(null);
   const overlayRef = useRef(null);
+  const minimapRef = useRef(null);
   const engineRef = useRef(null);
   const [hud, setHud] = useState({ pct: 0, status: 'INITIALISATION…' });
   const [muted, setMuted] = useState(false);
@@ -122,6 +123,7 @@ function SessionScreen({ onAbort, onError, onDone }) {
     const engine = new SunCoachEngine({
       video: videoRef.current,
       overlay: overlayRef.current,
+      minimap: minimapRef.current,
       onHud: (pct, status) => setHud({ pct, status }),
       onDone,
     });
@@ -186,6 +188,17 @@ function SessionScreen({ onAbort, onError, onDone }) {
             {hud.status}
           </div>
         </div>
+
+        {/* Schéma fixe du dos : reste lisible même quand on se retourne. */}
+        <div className="pointer-events-none absolute bottom-3 right-3 flex flex-col items-center gap-1">
+          <canvas ref={minimapRef} width={126} height={168} />
+          <span
+            className="text-[10px] tracking-[0.25em] text-nerv-green/80"
+            style={{ fontFamily: 'var(--font-nerv-mono)' }}
+          >
+            SCHÉMA DOS
+          </span>
+        </div>
       </div>
 
       <div className="flex justify-center gap-3 border-t border-nerv-orange/30 bg-nerv-panel px-4 py-3">
@@ -195,8 +208,15 @@ function SessionScreen({ onAbort, onError, onDone }) {
         <Button variant="ghost" onClick={toggleMute}>
           {muted ? 'SON : OFF' : 'SON : ON'}
         </Button>
-        <Button variant="danger" onClick={onAbort}>
-          ABANDON
+        <Button
+          variant="danger"
+          onClick={() => {
+            const res = engineRef.current?.stopEarly();
+            if (res) onDone(res);
+            else onAbort();
+          }}
+        >
+          STOP
         </Button>
       </div>
     </div>
@@ -218,17 +238,20 @@ function DoneScreen({ result, onRestart }) {
     const toX = (u) => pad + u * mapW;
     const toY = (v) => pad + v * mapH;
 
-    // Heatmap fine : chaque pixel du dos, du sombre (raté) au vert (couvert).
-    const { w, h, need, data } = result.heat;
+    // Heatmap fine détourée à la silhouette : hors du corps, rien ;
+    // sur le corps, du sombre (raté) au vert (couvert).
+    const { w, h, need, data, body } = result.heat;
     const cw = mapW / w, ch = mapH / h;
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
-        const f = Math.min(1, data[y * w + x] / need);
+        const i = y * w + x;
+        if (body && body[i] < 0.5) continue;
+        const f = Math.min(1, data[i] / need);
         c.fillStyle = f >= 1
           ? 'rgba(0, 255, 0, 0.85)'
           : f > 0.02
             ? `rgba(255, ${Math.round(60 + f * 140)}, 0, ${0.25 + f * 0.6})`
-            : 'rgba(255, 255, 255, 0.06)';
+            : 'rgba(255, 255, 255, 0.10)';
         c.fillRect(toX(x / w), toY(y / h), cw + 0.5, ch + 0.5);
       }
     }
@@ -268,26 +291,42 @@ function DoneScreen({ result, onRestart }) {
   const minutes = result ? Math.floor(result.seconds / 60) : 0;
   const seconds = result ? result.seconds % 60 : 0;
   const painted = result ? Math.round(result.paintedRatio * 100) : 0;
+  const aborted = result?.aborted;
+  const accent = aborted ? 'orange' : 'green';
 
   return (
     <div className="relative min-h-full overflow-hidden">
-      <HexGridBackground color="#00FF00" opacity={0.07} />
+      <HexGridBackground color={aborted ? '#FF9900' : '#00FF00'} opacity={0.07} />
       <div className="relative mx-auto flex min-h-screen max-w-md flex-col items-center justify-center gap-5 px-4 py-8">
-        <StatusStamp text="MISSION ACCOMPLIE" subtitle="DOS ENTIÈREMENT COUVERT" color="green" bordered visible rotation={-6} />
+        <StatusStamp
+          text={aborted ? 'SESSION INTERROMPUE' : 'MISSION ACCOMPLIE'}
+          subtitle={aborted ? 'BILAN PARTIEL' : 'DOS ENTIÈREMENT COUVERT'}
+          color={accent}
+          bordered
+          visible
+          rotation={-6}
+        />
         <canvas ref={canvasRef} width={300} height={400} className="rounded border border-nerv-green/40 bg-nerv-panel" />
-        <p className="text-nerv-green text-sm text-center" style={{ fontFamily: 'var(--font-nerv-mono)' }}>
-          {ROWS * COLS} ZONES VALIDÉES — {painted} % DE LA SURFACE PEINTE
+        <div
+          className={`text-sm text-center ${aborted ? 'text-nerv-orange' : 'text-nerv-green'}`}
+          style={{ fontFamily: 'var(--font-nerv-mono)' }}
+        >
+          ZONES VALIDÉES : {result?.zonesCovered ?? 0} / {result?.zonesTotal ?? ROWS * COLS}
           <br />
-          EN {minutes} MIN {String(seconds).padStart(2, '0')} S
+          SURFACE RÉELLEMENT PEINTE : {painted} %
+          <br />
+          DURÉE : {minutes} MIN {String(seconds).padStart(2, '0')} S
           <br />
           <span className="text-nerv-cyan">— MAIN GAUCHE</span>{' '}
           <span className="text-nerv-magenta">— MAIN DROITE</span>
-        </p>
+        </div>
         <Button variant="terminal" size="lg" fullWidth onClick={onRestart}>
           NOUVELLE SESSION
         </Button>
         <p className="text-center text-xs text-nerv-white/50" style={{ fontFamily: 'var(--font-nerv-mono)' }}>
-          RAPPEL : REMETS DE LA CRÈME DANS 2 H, OU APRÈS BAIGNADE
+          {aborted
+            ? 'LES ZONES SOMBRES DU SCHÉMA N’ONT PAS REÇU DE CRÈME'
+            : 'RAPPEL : REMETS DE LA CRÈME DANS 2 H, OU APRÈS BAIGNADE'}
         </p>
       </div>
     </div>

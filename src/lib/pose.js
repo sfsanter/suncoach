@@ -26,6 +26,9 @@ async function createLandmarker() {
     baseOptions: { modelAssetPath: MODEL_URL, delegate },
     runningMode: 'VIDEO',
     numPoses: 1,
+    // Masque de silhouette : sert à détourer le dos réel (la grille
+    // épaules-hanches seule inclut des coins hors du corps).
+    outputSegmentationMasks: true,
   });
   try {
     return await PoseLandmarker.createFromOptions(fileset, options('GPU'));
@@ -129,7 +132,12 @@ export class PoseTracker {
         return;
       }
       const raw = result.landmarks && result.landmarks[0];
-      onFrame(raw ? this._smooth(raw) : null, ts);
+      const mask = (result.segmentationMasks && result.segmentationMasks[0]) || null;
+      try {
+        onFrame(raw ? this._smooth(raw) : null, ts, mask);
+      } finally {
+        mask?.close();
+      }
     };
     loop();
   }

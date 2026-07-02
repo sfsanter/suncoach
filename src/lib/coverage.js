@@ -79,11 +79,19 @@ export function backToPx(u, v, f) {
 export class CoverageGrid {
   constructor() {
     this.heat = new Float32Array(HEAT_W * HEAT_H);
+    // Masque corporel en espace dos (1 = ce pixel est vraiment sur le corps),
+    // alimenté par la segmentation MediaPipe. Par défaut tout compte.
+    this.bodyMask = new Float32Array(HEAT_W * HEAT_H).fill(1);
     this.need = PIXEL_NEED;
   }
 
   reset() {
     this.heat.fill(0);
+    this.bodyMask.fill(1);
+  }
+
+  isBody(i) {
+    return this.bodyMask[i] >= 0.5;
   }
 
   /** Progression 0..1 d'un pixel de la heatmap. */
@@ -117,18 +125,23 @@ export class CoverageGrid {
     }
   }
 
-  /** Part de pixels couverts (heat >= need) dans une zone. */
+  /** Part de pixels du corps couverts (heat >= need) dans une zone. */
   zoneRatio(row, col) {
     const x0 = (col * HEAT_W) / COLS, x1 = ((col + 1) * HEAT_W) / COLS;
     const y0 = (row * HEAT_H) / ROWS, y1 = ((row + 1) * HEAT_H) / ROWS;
-    let painted = 0, total = 0;
+    let painted = 0, body = 0, total = 0;
     for (let y = y0; y < y1; y++) {
       for (let x = x0; x < x1; x++) {
+        const i = y * HEAT_W + x;
         total++;
-        if (this.heat[y * HEAT_W + x] >= PIXEL_NEED) painted++;
+        if (!this.isBody(i)) continue;
+        body++;
+        if (this.heat[i] >= PIXEL_NEED) painted++;
       }
     }
-    return painted / total;
+    // Zone quasiment hors du corps (coins au-delà des épaules…) : rien à couvrir.
+    if (body < total * 0.1) return 1;
+    return painted / body;
   }
 
   /** Progression 0..1 d'une zone (1 quand ZONE_RATIO des pixels sont couverts). */
@@ -149,11 +162,13 @@ export class CoverageGrid {
 
   /** Part brute de la surface du dos réellement couverte (pour les stats). */
   get paintedRatio() {
-    let painted = 0;
+    let painted = 0, body = 0;
     for (let i = 0; i < this.heat.length; i++) {
+      if (!this.isBody(i)) continue;
+      body++;
       if (this.heat[i] >= PIXEL_NEED) painted++;
     }
-    return painted / this.heat.length;
+    return body ? painted / body : 0;
   }
 
   get done() {
@@ -174,17 +189,20 @@ export class CoverageGrid {
     return { u: (col + 0.5) / COLS, v: (row + 0.5) / ROWS };
   }
 
-  /** Point le moins couvert d'une zone — cible réelle des bips et de la voix. */
+  /** Point du corps le moins couvert d'une zone — cible des bips et de la voix. */
   coldestPoint(row, col) {
     const x0 = (col * HEAT_W) / COLS, x1 = ((col + 1) * HEAT_W) / COLS;
     const y0 = (row * HEAT_H) / ROWS, y1 = ((row + 1) * HEAT_H) / ROWS;
     let best = null;
     for (let y = y0; y < y1; y++) {
       for (let x = x0; x < x1; x++) {
-        const v = this.heat[y * HEAT_W + x];
+        const i = y * HEAT_W + x;
+        if (!this.isBody(i)) continue;
+        const v = this.heat[i];
         if (!best || v < best.v) best = { v, x, y };
       }
     }
+    if (!best) return this.cellCenter(row, col);
     return { u: (best.x + 0.5) / HEAT_W, v: (best.y + 0.5) / HEAT_H };
   }
 
@@ -195,6 +213,7 @@ export class CoverageGrid {
       h: HEAT_H,
       need: PIXEL_NEED,
       data: Float32Array.from(this.heat),
+      body: Float32Array.from(this.bodyMask),
     };
   }
 }

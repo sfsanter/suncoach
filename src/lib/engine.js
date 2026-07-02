@@ -15,13 +15,16 @@ export class SunCoachEngine {
    * @param {object} p
    * @param {HTMLVideoElement} p.video
    * @param {HTMLCanvasElement} p.overlay
+   * @param {HTMLCanvasElement} [p.minimap] schéma fixe du dos, toujours visible
    * @param {(pct: number, status: string) => void} p.onHud
-   * @param {(result: {seconds: number, fractions: number[]}) => void} p.onDone
+   * @param {(result: object) => void} p.onDone
    */
-  constructor({ video, overlay, onHud, onDone }) {
+  constructor({ video, overlay, minimap, onHud, onDone }) {
     this.video = video;
     this.overlay = overlay;
     this.ctx = overlay.getContext('2d');
+    this.minimap = minimap || null;
+    this.minimapCtx = minimap ? minimap.getContext('2d') : null;
     this.onHud = onHud;
     this.onDone = onDone;
 
@@ -36,6 +39,13 @@ export class SunCoachEngine {
     this.heatCanvas.height = HEAT_H;
     this.heatCtx = this.heatCanvas.getContext('2d');
     this.heatImage = this.heatCtx.createImageData(HEAT_W, HEAT_H);
+
+    // Même principe pour le schéma fixe du dos (silhouette + heatmap).
+    this.miniCanvas = document.createElement('canvas');
+    this.miniCanvas.width = HEAT_W;
+    this.miniCanvas.height = HEAT_H;
+    this.miniCtx = this.miniCanvas.getContext('2d');
+    this.miniImage = this.miniCtx.createImageData(HEAT_W, HEAT_H);
 
     this.state = 'idle';
     this.wakeLock = null;
@@ -76,6 +86,9 @@ export class SunCoachEngine {
     this.paths = { gauche: [], droite: [] };
     this.lastPathTs = { gauche: 0, droite: 0 };
     this.lastHandPos = { gauche: null, droite: null };
+    this.smFrame = null;
+    this.refShoulderW = 0;
+    this.lastMaskTs = 0;
 
     this.state = 'placement';
     this.onHud(0, 'PLACEMENT…');
@@ -85,13 +98,19 @@ export class SunCoachEngine {
       'Bienvenue ! Pose le téléphone, puis mets-toi dos à la caméra, à environ deux mètres.',
       { interrupt: true }
     );
-    this.tracker.start((lm, ts) => this._onFrame(lm, ts));
+    this.tracker.start((lm, ts, mask) => this._onFrame(lm, ts, mask));
   }
 
-  stop() {
+  /**
+   * silence=false permet de laisser finir la phrase de bilan quand la session
+   * se termine (le démontage React rappelle stop(), qui devient alors no-op).
+   */
+  stop({ silence = true } = {}) {
+    if (this._released) return;
+    this._released = true;
     this.tracker.stop();
     this.tracker.stopCamera();
-    this.voice.stop();
+    if (silence) this.voice.stop();
     this.beeper.setProximity(null);
     this.wakeLock?.release().catch(() => {});
     this.wakeLock = null;
@@ -113,7 +132,7 @@ export class SunCoachEngine {
 
   // ---------------------------------------------------------------- boucle
 
-  _onFrame(lm, ts) {
+  _onFrame(lm, ts, mask) {
     const dt = this.lastTs ? Math.min((ts - this.lastTs) / 1000, 0.1) : 0;
     this.lastTs = ts;
 
@@ -122,12 +141,78 @@ export class SunCoachEngine {
     const P = lm
       ? lm.map((p) => ({ x: p.x * W, y: p.y * H, visibility: p.visibility }))
       : null;
-    const frame = P ? torsoFrame(P) : null;
+    // Lissage du repère du torse : la grille ne tremble plus à chaque
+    // micro-variation d'orientation du dos.
+    const frame = this._smoothTorso(P ? torsoFrame(P) : null);
+
+    // Détourage : projette le masque de silhouette dans l'espace dos (~7 fps suffit).
+    if (mask && frame && ts - this.lastMaskTs > 150) {
+      this.lastMaskTs = ts;
+      this._sampleBodyMask(mask, frame);
+    }
 
     this._drawOverlay(P, frame);
+    this._drawMinimap();
 
     if (this.state === 'placement') this._placementTick(P, ts);
     else if (this.state === 'coverage') this._coverageTick(P, frame, ts, dt);
+  }
+
+  /** Moyenne mobile sur origine/axes/dimensions du repère torse. */
+  _smoothTorso(frame) {
+    if (!frame) {
+      this.smFrame = null;
+      return null;
+    }
+    if (!this.smFrame) {
+      this.smFrame = {
+        origin: { ...frame.origin },
+        ex: { ...frame.ex },
+        ey: { ...frame.ey },
+        width: frame.width,
+        height: frame.height,
+      };
+      return this.smFrame;
+    }
+    const a = 0.3;
+    const s = this.smFrame;
+    s.origin.x += a * (frame.origin.x - s.origin.x);
+    s.origin.y += a * (frame.origin.y - s.origin.y);
+    s.width += a * (frame.width - s.width);
+    s.height += a * (frame.height - s.height);
+    for (const axis of ['ex', 'ey']) {
+      s[axis].x += a * (frame[axis].x - s[axis].x);
+      s[axis].y += a * (frame[axis].y - s[axis].y);
+      const n = Math.hypot(s[axis].x, s[axis].y) || 1;
+      s[axis].x /= n;
+      s[axis].y /= n;
+    }
+    return s;
+  }
+
+  /** Échantillonne le masque de segmentation aux positions des pixels de la heatmap. */
+  _sampleBodyMask(mask, frame) {
+    let data;
+    try {
+      data = mask.getAsFloat32Array();
+    } catch {
+      return; // segmentation indisponible sur ce device : on garde le masque plein
+    }
+    const mw = mask.width, mh = mask.height;
+    const sx = mw / this.overlay.width, sy = mh / this.overlay.height;
+    const body = this.grid.bodyMask;
+    for (let y = 0; y < HEAT_H; y++) {
+      for (let x = 0; x < HEAT_W; x++) {
+        const p = backToPx((x + 0.5) / HEAT_W, (y + 0.5) / HEAT_H, frame);
+        const mx = Math.round(p.x * sx), my = Math.round(p.y * sy);
+        let v = 0;
+        if (mx >= 0 && mx < mw && my >= 0 && my < mh) {
+          v = data[my * mw + mx] > 0.5 ? 1 : 0;
+        }
+        const i = y * HEAT_W + x;
+        body[i] += 0.4 * (v - body[i]); // moyenne mobile : tolère le bruit du masque
+      }
+    }
   }
 
   // ---------------------------------------------------------------- placement
@@ -224,6 +309,21 @@ export class SunCoachEngine {
       return;
     }
 
+    // Pause peinture quand le buste pivote : la projection écrase la largeur
+    // d'épaules et le placement de la grille devient faux — on ne peint pas
+    // avec une grille fausse.
+    const ls = P[LM.L_SHOULDER], rs = P[LM.R_SHOULDER];
+    const shoulderW = Math.hypot(rs.x - ls.x, rs.y - ls.y);
+    this.refShoulderW = Math.max(this.refShoulderW * 0.999, shoulderW);
+    if (shoulderW < 0.72 * this.refShoulderW) {
+      this.beeper.setProximity(null);
+      this.onHud(this.grid.fraction, 'ORIENTATION INSTABLE — REMETS-TOI À PLAT');
+      this.voice.say('Remets tes épaules bien face au mur, sans pivoter.', {
+        id: 'square', cooldown: 6000,
+      });
+      return;
+    }
+
     let hands = this._getHands(P, frame);
 
     // Filtre anti-glitch : un saut > 0.35 unité de dos en une frame est du
@@ -312,33 +412,56 @@ export class SunCoachEngine {
 
   // ---------------------------------------------------------------- fin
 
+  _buildResult(aborted) {
+    let zonesCovered = 0;
+    for (let r = 0; r < ROWS; r++)
+      for (let c = 0; c < COLS; c++) if (this.grid.isCovered(r, c)) zonesCovered++;
+    return {
+      aborted,
+      seconds: Math.round((performance.now() - this.coverageStartedAt) / 1000),
+      paintedRatio: this.grid.paintedRatio,
+      zonesCovered,
+      zonesTotal: ROWS * COLS,
+      heat: this.grid.snapshot(),
+      paths: this.paths,
+    };
+  }
+
+  /** STOP en cours de session : renvoie le récap (null si rien à récapituler). */
+  stopEarly() {
+    if (this.state !== 'coverage') {
+      this.stop();
+      return null;
+    }
+    const result = this._buildResult(true);
+    this.stop({ silence: false });
+    this.voice.say('Session interrompue. Voici le bilan.', { interrupt: true });
+    return result;
+  }
+
   _finish() {
-    const seconds = Math.round((performance.now() - this.coverageStartedAt) / 1000);
-    this.state = 'done';
-    this.beeper.setProximity(null);
+    const result = this._buildResult(false);
     this.beeper.success();
+    this.stop({ silence: false });
     this.voice.say(
       'Bravo ! Ton dos est entièrement couvert. Pense à en remettre dans deux heures, ou après la baignade.',
       { interrupt: true }
     );
-    this.tracker.stop();
-    this.tracker.stopCamera();
-    this.onDone({
-      seconds,
-      paintedRatio: this.grid.paintedRatio,
-      heat: this.grid.snapshot(),
-      paths: this.paths,
-    });
+    this.onDone(result);
   }
 
   // ---------------------------------------------------------------- overlay
 
-  /** Recolore le canvas basse résolution à partir de la heatmap. */
+  /** Recolore le canvas basse résolution à partir de la heatmap, détourée au corps. */
   _renderHeat() {
     const px = this.heatImage.data;
     for (let i = 0; i < HEAT_W * HEAT_H; i++) {
-      const f = this.grid.pixelFraction(i);
       const o = i * 4;
+      if (!this.grid.isBody(i)) {
+        px[o + 3] = 0; // hors du corps : rien à afficher
+        continue;
+      }
+      const f = this.grid.pixelFraction(i);
       if (f >= 1) {
         px[o] = 0; px[o + 1] = 255; px[o + 2] = 0; px[o + 3] = 165;
       } else {
@@ -347,6 +470,83 @@ export class SunCoachEngine {
       }
     }
     this.heatCtx.putImageData(this.heatImage, 0, 0);
+  }
+
+  /**
+   * Schéma fixe du dos : silhouette + heatmap + parcours récent + zone cible.
+   * Toujours lisible, même quand on se retourne et que l'overlay vidéo disparaît.
+   */
+  _drawMinimap() {
+    if (!this.minimapCtx) return;
+    const c = this.minimapCtx;
+    const W = this.minimap.width, H = this.minimap.height;
+    c.clearRect(0, 0, W, H);
+    c.fillStyle = 'rgba(0, 0, 0, 0.72)';
+    c.fillRect(0, 0, W, H);
+
+    const pad = 8;
+    const mapW = W - 2 * pad, mapH = H - 2 * pad;
+    const toX = (u) => pad + u * mapW;
+    const toY = (v) => pad + v * mapH;
+
+    // Silhouette + couverture.
+    const px = this.miniImage.data;
+    for (let i = 0; i < HEAT_W * HEAT_H; i++) {
+      const o = i * 4;
+      if (!this.grid.isBody(i)) {
+        px[o + 3] = 0;
+        continue;
+      }
+      const f = this.grid.pixelFraction(i);
+      if (f >= 1) {
+        px[o] = 0; px[o + 1] = 230; px[o + 2] = 0; px[o + 3] = 235;
+      } else {
+        // base sombre (dos non couvert) qui chauffe vers l'orange
+        px[o] = Math.round(70 + f * 185);
+        px[o + 1] = Math.round(80 + f * 73);
+        px[o + 2] = 60;
+        px[o + 3] = 235;
+      }
+    }
+    this.miniCtx.putImageData(this.miniImage, 0, 0);
+    c.imageSmoothingEnabled = true;
+    c.drawImage(this.miniCanvas, pad, pad, mapW, mapH);
+
+    // Parcours récent des mains (gauche cyan, droite magenta).
+    const trail = (path, color) => {
+      const pts = path.slice(-45);
+      if (pts.length < 2) return;
+      c.beginPath();
+      c.moveTo(toX(pts[0].u), toY(pts[0].v));
+      for (let i = 1; i < pts.length; i++) c.lineTo(toX(pts[i].u), toY(pts[i].v));
+      c.strokeStyle = color;
+      c.lineWidth = 1.5;
+      c.globalAlpha = 0.85;
+      c.stroke();
+      c.globalAlpha = 1;
+    };
+    if (this.paths) {
+      trail(this.paths.gauche, '#00FFFF');
+      trail(this.paths.droite, '#FF00FF');
+    }
+
+    // Zone cible.
+    if (this.state === 'coverage') {
+      const t = this.grid.nextTarget();
+      if (t) {
+        c.strokeStyle = '#FF9900';
+        c.lineWidth = 2;
+        c.strokeRect(
+          toX(t.col / COLS), toY(t.row / ROWS),
+          mapW / COLS, mapH / ROWS
+        );
+      }
+    }
+
+    // Cadre.
+    c.strokeStyle = 'rgba(0, 255, 0, 0.5)';
+    c.lineWidth = 1;
+    c.strokeRect(0.5, 0.5, W - 1, H - 1);
   }
 
   _drawOverlay(P, frame) {
