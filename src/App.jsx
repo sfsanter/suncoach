@@ -104,6 +104,8 @@ function HomeScreen({ error, onStart }) {
           style={{ fontFamily: 'var(--font-nerv-mono)' }}
         >
           100 % LOCAL — LA VIDÉO NE QUITTE JAMAIS TON APPAREIL
+          <br />
+          BUILD {typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?'} — MODE LIBRE
         </p>
       </div>
     </div>
