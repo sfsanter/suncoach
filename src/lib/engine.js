@@ -5,7 +5,7 @@
 import { Voice, Beeper } from './voice.js';
 import { PoseTracker, LM, isBackTurned, OneEuro, BackOrientation, contactPointsFromHand, palmFromHand } from './pose.js';
 import {
-  CoverageGrid, torsoFrame, backToPx, zoneName, backHalfWidth,
+  CoverageGrid, torsoFrame, zoneName, backHalfWidth,
   toBack, nearBackShape, setShapeScale,
   HEAT_W, HEAT_H, ZONE_COUNT, ANATOMICAL_ZONES,
 } from './coverage.js';
@@ -14,6 +14,9 @@ import {
 } from './calibration.js';
 import { strokeZoneOutline } from './zones.js';
 import { tipFor, zoneInstruction } from './tips.js';
+import {
+  buildBackSilhouette, traceBackContour, drawBackSegmentationOverlay,
+} from './segmentation.js';
 
 export class SunCoachEngine {
   constructor({ video, overlay, minimap, onHud, onDone }) {
@@ -47,6 +50,8 @@ export class SunCoachEngine {
     this.touchDist = 0.16;
     this.backOrient = new BackOrientation();
     this.orientWarnTs = 0;
+    this.smoothMask = null;
+    this.backContour = null;
 
     this._onVisibility = () => {
       if (document.visibilityState === 'visible' && this.state !== 'idle') {
@@ -76,6 +81,8 @@ export class SunCoachEngine {
     this.overlay.width = this.video.videoWidth;
     this.overlay.height = this.video.videoHeight;
     this.grid.reset();
+    this.smoothMask = null;
+    this.backContour = null;
     this.lastTs = 0;
     this.placementOkSince = 0;
     this.lastMilestone = 0;
@@ -142,11 +149,17 @@ export class SunCoachEngine {
     const P = lm ? lm.map((p) => ({ x: p.x * W, y: p.y * H, visibility: p.visibility })) : null;
     const frame = this._smoothTorso(P ? torsoFrame(P) : null);
 
-    if (track.segmentationMask && frame && P && this.state === 'placement') {
-      this._sampleShapeFromMask(track.segmentationMask, P, frame, W, H);
+    if (track.segmentationMask && P) {
+      this.smoothMask = buildBackSilhouette(track.segmentationMask, P, W, H, this.smoothMask);
+      this.backContour = this.smoothMask
+        ? traceBackContour(this.smoothMask, W, H)
+        : null;
+      if (this.state === 'placement') {
+        this._sampleShapeFromMask(track.segmentationMask, P, frame, W, H);
+      }
     }
 
-    this._drawOverlay(P, frame, track);
+    this._drawOverlay(P, frame, track, W, H);
     this._drawMinimap(ts);
 
     if (this.state === 'placement') this._placementTick(P, ts);
@@ -594,43 +607,20 @@ export class SunCoachEngine {
     }
   }
 
-  _drawOverlay(P, frame, track) {
+  _drawOverlay(P, frame, track, W, H) {
     const ctx = this.ctx;
-    const W = this.overlay.width, H = this.overlay.height;
     ctx.clearRect(0, 0, W, H);
     if (!frame) return;
 
-    if (this.state === 'coverage') {
-      this._renderHeat();
-      const a = frame.ex.x * frame.width;
-      const b = frame.ex.y * frame.width;
-      const c = frame.ey.x * frame.height;
-      const d = frame.ey.y * frame.height;
-      const e = frame.origin.x - 0.5 * a;
-      const f = frame.origin.y - 0.5 * b;
-      ctx.save();
-      ctx.setTransform(a, b, c, d, e, f);
-      ctx.imageSmoothingEnabled = true;
-      ctx.drawImage(this.heatCanvas, 0, 0, 1, 1);
-      ctx.restore();
-    }
+    if (this.state === 'coverage') this._renderHeat();
 
-    const targetIdx = this.state === 'coverage' ? this.grid.nextTarget() : null;
-    for (let zi = 0; zi < ANATOMICAL_ZONES.length; zi++) {
-      const z = ANATOMICAL_ZONES[zi];
-      const u0 = z.u0, u1 = z.u1, v0 = z.v0, v1 = z.v1;
-      const pts = [
-        backToPx(u0, v0, frame), backToPx(u1, v0, frame),
-        backToPx(u1, v1, frame), backToPx(u0, v1, frame),
-      ];
-      ctx.beginPath();
-      ctx.moveTo(pts[0].x, pts[0].y);
-      for (let i = 1; i < 4; i++) ctx.lineTo(pts[i].x, pts[i].y);
-      ctx.closePath();
-      const isTarget = targetIdx === zi;
-      ctx.lineWidth = isTarget ? 3 : 1;
-      ctx.strokeStyle = isTarget ? '#FF9900' : 'rgba(0, 255, 0, 0.25)';
-      ctx.stroke();
+    // Silhouette dorsale segmentée (contour live, pas de grille)
+    if (this.smoothMask) {
+      drawBackSegmentationOverlay(ctx, this.smoothMask, W, H, {
+        contour: this.backContour,
+        heatCanvas: this.state === 'coverage' ? this.heatCanvas : null,
+        frame,
+      });
     }
 
     if (P) {
