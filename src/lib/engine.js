@@ -16,8 +16,8 @@ import {
 import { gapMessage, gapShort, calibrationVoice } from './tips.js';
 import {
   CALIBRATION_STEPS, CALIBRATION_STEP_COUNT,
-  getCalibrationTargetUV, targetScreenPos, trackCalibrationHold, handNearTarget,
-  drawCalibrationTarget, drawCalibrationAnchors,
+  evaluateCalibrationStep,
+  drawCalibrationAnchors, drawCalibrationFeedback,
 } from './backCalibration.js';
 import {
   buildBackSilhouette, buildFallbackSilhouette, traceBackContour, drawBackSegmentationOverlay,
@@ -87,6 +87,7 @@ export class SunCoachEngine {
     this.calAnchors = {};
     this.calStableSince = 0;
     this.calProgress = 0;
+    this.calLastUv = null;
     this.lastCalVoiceStep = -1;
     this.lastCalNoHandTs = 0;
     this.lastTs = 0;
@@ -314,6 +315,7 @@ export class SunCoachEngine {
     this.calAnchors = {};
     this.calStableSince = 0;
     this.calProgress = 0;
+    this.calLastUv = null;
     this.lastCalVoiceStep = -1;
     this.calibrationFrame = frame ? {
       origin: { ...frame.origin },
@@ -341,47 +343,55 @@ export class SunCoachEngine {
     const step = CALIBRATION_STEPS[this.calStep];
 
     if (!P || !frame || !step) {
+      this.beeper.setPaintActivity('off');
       this.onHud(0, 'CALIBRAGE… RESTE DANS LE CADRE');
       return;
     }
 
-    this.onHud(0, `CALIBRAGE ${this.calStep + 1}/${CALIBRATION_STEP_COUNT} — ${step.label}`);
+    const ev = evaluateCalibrationStep(this.calStep, track, P, frame, W, H, ts, {
+      stableSince: this.calStableSince,
+      lastUv: this.calLastUv,
+    });
 
-    const contacts = this._getContactPoints2D(track, P, frame, W, H, ts, { forCalibration: true });
-    const hand = contacts[0] ?? null;
-    const targetUv = getCalibrationTargetUV(this.calStep, this.calAnchors);
+    this.calStableSince = ev.stableSince || 0;
+    this.calLastUv = ev.lastUv || null;
+    this.calProgress = ev.progress;
 
-    if (!hand && ts - (this.lastCalNoHandTs ?? 0) > 8000) {
-      this.lastCalNoHandTs = ts;
-      this.voice.say(calibrationVoice('nohand'), { id: 'cal:nohand', cooldown: 8000 });
-    }
-
-    if (hand) {
-      const hold = trackCalibrationHold(hand, targetUv, ts, { stableSince: this.calStableSince });
-      if (this.calStableSince === 0 && hold.stableSince) this.calStableSince = hold.stableSince;
-      if (!handNearTarget(hand, targetUv)) this.calStableSince = 0;
-      this.calProgress = hold.progress;
-
-      if (hold.done && hold.anchor) {
-        this.calAnchors[step.id] = hold.anchor;
-        this.beeper.zoneDone();
-        this.calStep++;
-        this.calStableSince = 0;
-        this.calProgress = 0;
-        this.lastCalVoiceStep = -1;
-
-        if (this.calStep >= CALIBRATION_STEP_COUNT) {
-          setCustomBackAnchors(this.calAnchors);
-          this.voice.say(calibrationVoice('done'), { interrupt: true });
-          this._startCoverage();
-          return;
-        }
-        this.voice.say(calibrationVoice('next'), { queue: true });
-        this._sayCalibrationStep(this.calStep);
+    if (ev.gesture) {
+      this.beeper.setPaintActivity('cal');
+      if (ev.progress > 0.15 && ev.progress < 0.5 && ts - (this.lastCalGestureVoiceTs ?? 0) > 12000) {
+        this.lastCalGestureVoiceTs = ts;
+        this.voice.say(calibrationVoice('gesture_ok'), { id: 'cal:gest', cooldown: 12000, queue: true });
       }
     } else {
+      this.beeper.setPaintActivity('off');
+      const hintId = step.id === 'nuque' ? 'nuque_hint' : 'no_gesture';
+      if (ts - (this.lastCalNoHandTs ?? 0) > 10000) {
+        this.lastCalNoHandTs = ts;
+        this.voice.say(calibrationVoice(hintId), { id: 'cal:' + hintId, cooldown: 10000 });
+      }
+    }
+    this.beeper.tick(ts);
+
+    this.onHud(0, `CALIBRAGE ${this.calStep + 1}/${CALIBRATION_STEP_COUNT} — ${step.label}`);
+
+    if (ev.done && ev.anchor) {
+      this.calAnchors[step.id] = ev.anchor;
+      this.beeper.zoneDone();
+      this.calStep++;
       this.calStableSince = 0;
+      this.calLastUv = null;
       this.calProgress = 0;
+      this.lastCalVoiceStep = -1;
+
+      if (this.calStep >= CALIBRATION_STEP_COUNT) {
+        setCustomBackAnchors(this.calAnchors);
+        this.voice.say(calibrationVoice('done'), { interrupt: true });
+        this._startCoverage();
+        return;
+      }
+      this.voice.say(calibrationVoice('next'), { queue: true });
+      this._sayCalibrationStep(this.calStep);
     }
   }
 
@@ -717,12 +727,14 @@ export class SunCoachEngine {
     if (this.state === 'calibrating' && this.calibrationFrame) {
       const calFrame = this.calibrationFrame;
       drawCalibrationAnchors(ctx, this.calAnchors, calFrame);
-      const targetUv = getCalibrationTargetUV(this.calStep, this.calAnchors);
-      const pos = targetScreenPos(targetUv, calFrame);
-      const contacts = this._getContactPoints2D(track, P, calFrame, W, H, ts, { forCalibration: true });
-      const hand = contacts[0] ?? null;
-      const near = hand && handNearTarget(hand, targetUv);
-      if (pos) drawCalibrationTarget(ctx, pos.x, pos.y, ts, { near, progress: this.calProgress });
+      const ev = evaluateCalibrationStep(
+        this.calStep, track, P, calFrame, W, H, performance.now(),
+        { stableSince: this.calStableSince, lastUv: this.calLastUv },
+      );
+      drawCalibrationFeedback(ctx, ev.screen, ts, {
+        gesture: ev.gesture,
+        progress: ev.progress,
+      });
       return;
     }
 

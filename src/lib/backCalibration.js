@@ -1,137 +1,220 @@
 /**
- * Calibrage manuel du dos : 8 repères à la main (dont rein G/D en 7 et 8).
- * Cible orange pulsante ; repères validés = position réelle de la main.
+ * Calibrage par GESTE (dos à la caméra, sans viser un point à l'écran).
+ * Cascade : poignet pose → paume Holistic → estimation coude.
+ * 8 repères dont reins en 7 et 8.
  */
-import { backToPx } from './coverage.js';
+import { LM, contactPointsFromHand, palmFromHand } from './pose.js';
+import { toBack, backToPx } from './coverage.js';
 
 export const CALIBRATION_STEP_COUNT = 8;
 
 export const CALIBRATION_STEPS = [
-  { id: 'nuque', label: 'NUQUE', nominal: { u: 0.5, v: 0.05 } },
-  { id: 'epaule_g', label: 'ÉPAULE G.', nominal: { u: 0.1, v: 0.14 } },
-  { id: 'epaule_d', label: 'ÉPAULE D.', nominal: { u: 0.9, v: 0.14 } },
-  { id: 'milieu_g', label: 'MILIEU G.', nominal: { u: 0.08, v: 0.4 } },
-  { id: 'milieu_d', label: 'MILIEU D.', nominal: { u: 0.92, v: 0.4 } },
-  { id: 'bas', label: 'BAS DOS', nominal: { u: 0.5, v: 0.9 } },
-  { id: 'rein_g', label: 'REIN G.', nominal: { u: 0.07, v: 0.58 } },
-  { id: 'rein_d', label: 'REIN D.', nominal: { u: 0.93, v: 0.58 } },
+  { id: 'nuque', label: 'NUQUE', side: 'droite', gesture: 'over_shoulder' },
+  { id: 'epaule_g', label: 'ÉPAULE G.', side: 'gauche', gesture: 'under_arm_side' },
+  { id: 'epaule_d', label: 'ÉPAULE D.', side: 'droite', gesture: 'under_arm_side' },
+  { id: 'milieu_g', label: 'MILIEU G.', side: 'gauche', gesture: 'lateral_mid' },
+  { id: 'milieu_d', label: 'MILIEU D.', side: 'droite', gesture: 'lateral_mid' },
+  { id: 'bas', label: 'BAS DOS', side: 'either', gesture: 'center_low' },
+  { id: 'rein_g', label: 'REIN G.', side: 'gauche', gesture: 'lateral_waist' },
+  { id: 'rein_d', label: 'REIN D.', side: 'droite', gesture: 'lateral_waist' },
 ];
 
-const STABLE_MS = 850;
-const HIT_RADIUS = 0.13;
+const STABLE_MS = 900;
+const STABLE_UV_EPS = 0.045;
 
-/** UV cible : générique au début, puis relative aux repères déjà posés. */
-export function getCalibrationTargetUV(stepIndex, anchors) {
-  const step = CALIBRATION_STEPS[stepIndex];
-  if (!step) return { u: 0.5, v: 0.5 };
-  const a = anchors;
-  const n = a.nuque;
-  const eg = a.epaule_g;
-  const ed = a.epaule_d;
+function vis(p) {
+  return p?.visibility ?? 0;
+}
 
-  switch (step.id) {
-    case 'nuque':
-      return { ...step.nominal };
-    case 'epaule_g':
-      if (n) return { u: Math.max(0.02, n.u - 0.38), v: n.v + 0.05 };
-      return { ...step.nominal };
-    case 'epaule_d':
-      if (n) return { u: Math.min(0.98, n.u + 0.38), v: n.v + 0.05 };
-      return { ...step.nominal };
-    case 'milieu_g':
-      if (eg) return { u: eg.u, v: (eg.v + (a.bas?.v ?? 0.75)) * 0.52 };
-      if (n) return { u: Math.max(0.02, n.u - 0.4), v: 0.42 };
-      return { ...step.nominal };
-    case 'milieu_d':
-      if (ed) return { u: ed.u, v: (ed.v + (a.bas?.v ?? 0.75)) * 0.52 };
-      if (n) return { u: Math.min(0.98, n.u + 0.4), v: 0.42 };
-      return { ...step.nominal };
-    case 'bas':
-      if (a.milieu_g && a.milieu_d) {
-        return { u: (a.milieu_g.u + a.milieu_d.u) / 2, v: 0.88 };
-      }
-      return { ...step.nominal };
-    case 'rein_g':
-      if (a.milieu_g) return { u: a.milieu_g.u, v: 0.56 };
-      if (eg) return { u: eg.u, v: 0.56 };
-      return { ...step.nominal };
-    case 'rein_d':
-      if (a.milieu_d) return { u: a.milieu_d.u, v: 0.56 };
-      if (ed) return { u: ed.u, v: 0.56 };
-      return { ...step.nominal };
+function torsoLocal(p, frame) {
+  const dx = p.x - frame.origin.x;
+  const dy = p.y - frame.origin.y;
+  return {
+    x: dx * frame.ex.x + dy * frame.ex.y,
+    y: dx * frame.ey.x + dy * frame.ey.y,
+  };
+}
+
+function wristUv(P, frame, wristIdx) {
+  const w = P[wristIdx];
+  if (!w || vis(w) < 0.32) return null;
+  return toBack(w, frame);
+}
+
+function holisticUv(track, frame, W, H, side) {
+  const hand = side === 'gauche' ? track.leftHand2D : track.rightHand2D;
+  if (!hand?.length) return null;
+  const px = hand.map((p) => ({
+    x: p.x * W,
+    y: p.y * H,
+    visibility: p.visibility ?? p.presence ?? 0,
+  }));
+  const palm = palmFromHand(px);
+  const pt = palm ?? (px[0] && (px[0].visibility ?? 0) >= 0.35 ? { x: px[0].x, y: px[0].y } : null);
+  if (!pt) return null;
+  return toBack({ x: pt.x, y: pt.y, visibility: 1 }, frame);
+}
+
+/** Estimation nuque depuis coude/poignet droit si poignet seul insuffisant. */
+function inferNuqueUv(P, frame) {
+  const rs = P[LM.R_SHOULDER];
+  const re = P[LM.R_ELBOW];
+  const rw = P[LM.R_WRIST];
+  const ls = P[LM.L_SHOULDER];
+  if (rw && vis(rw) >= 0.32) return toBack(rw, frame);
+  if (re && vis(re) >= 0.4 && rs && vis(rs) >= 0.4) {
+    const nx = (ls.x + rs.x) / 2;
+    const ny = Math.min(re.y, rs.y) - Math.hypot(rs.x - ls.x) * 0.08;
+    return toBack({ x: nx, y: ny, visibility: 1 }, frame);
+  }
+  if (rs && ls && vis(rs) >= 0.45 && vis(ls) >= 0.45) {
+    return toBack({
+      x: (ls.x + rs.x) / 2,
+      y: Math.min(ls.y, rs.y) - Math.hypot(rs.x - ls.x) * 0.12,
+      visibility: 1,
+    }, frame);
+  }
+  return null;
+}
+
+/** Détecte si le geste attendu est en cours (pose, pas Holistic). */
+export function detectCalibrationGesture(stepId, P, frame) {
+  if (!P || !frame) return false;
+
+  const ls = P[LM.L_SHOULDER], rs = P[LM.R_SHOULDER];
+  const lh = P[LM.L_HIP], rh = P[LM.R_HIP];
+  const le = P[LM.L_ELBOW], re = P[LM.R_ELBOW];
+  const lw = P[LM.L_WRIST], rw = P[LM.R_WRIST];
+
+  switch (stepId) {
+    case 'nuque': {
+      if (vis(rs) < 0.4 || vis(re) < 0.35) return false;
+      const elbowUp = re.y < rs.y + Math.hypot(rs.x - ls.x) * 0.15;
+      const wristUp = !rw || vis(rw) < 0.32 || rw.y < rs.y + Math.hypot(rs.x - ls.x) * 0.22;
+      return elbowUp && wristUp;
+    }
+    case 'epaule_g': {
+      if (vis(lw) < 0.32 && vis(le) < 0.35) return false;
+      const loc = lw && vis(lw) >= 0.32 ? torsoLocal(lw, frame) : torsoLocal(le, frame);
+      return loc.x < -frame.width * 0.18 && loc.y < frame.height * 0.35;
+    }
+    case 'epaule_d': {
+      if (vis(rw) < 0.32 && vis(re) < 0.35) return false;
+      const loc = rw && vis(rw) >= 0.32 ? torsoLocal(rw, frame) : torsoLocal(re, frame);
+      return loc.x > frame.width * 0.18 && loc.y < frame.height * 0.35;
+    }
+    case 'milieu_g': {
+      if (vis(lw) < 0.32) return false;
+      const loc = torsoLocal(lw, frame);
+      return loc.x < -frame.width * 0.15 && loc.y > frame.height * 0.22 && loc.y < frame.height * 0.62;
+    }
+    case 'milieu_d': {
+      if (vis(rw) < 0.32) return false;
+      const loc = torsoLocal(rw, frame);
+      return loc.x > frame.width * 0.15 && loc.y > frame.height * 0.22 && loc.y < frame.height * 0.62;
+    }
+    case 'bas': {
+      const w = (lw && vis(lw) >= 0.32) ? lw : (rw && vis(rw) >= 0.32 ? rw : null);
+      if (!w) return false;
+      const loc = torsoLocal(w, frame);
+      return Math.abs(loc.x) < frame.width * 0.28 && loc.y > frame.height * 0.62;
+    }
+    case 'rein_g': {
+      if (vis(lw) < 0.32) return false;
+      const loc = torsoLocal(lw, frame);
+      const hipY = lh && rh ? (lh.y + rh.y) / 2 : frame.origin.y + frame.height * 0.55;
+      return loc.x < -frame.width * 0.12 && Math.abs(lw.y - hipY) < frame.height * 0.22;
+    }
+    case 'rein_d': {
+      if (vis(rw) < 0.32) return false;
+      const loc = torsoLocal(rw, frame);
+      const hipY = lh && rh ? (lh.y + rh.y) / 2 : frame.origin.y + frame.height * 0.55;
+      return loc.x > frame.width * 0.12 && Math.abs(rw.y - hipY) < frame.height * 0.22;
+    }
     default:
-      return { ...step.nominal };
+      return false;
   }
 }
 
-export function targetScreenPos(uv, frame) {
-  if (!frame) return null;
-  return backToPx(uv.u, uv.v, frame);
-}
+/** Contact UV : cascade poignet → Holistic → inférence. */
+export function getCalibrationContact(stepId, track, P, frame, W, H) {
+  const step = CALIBRATION_STEPS.find((s) => s.id === stepId);
+  if (!step || !P || !frame) return null;
 
-export function handNearTarget(handUv, targetUv, radius = HIT_RADIUS) {
-  if (!handUv || !targetUv) return false;
-  return Math.hypot(handUv.u - targetUv.u, handUv.v - targetUv.v) <= radius;
+  const side = step.side;
+  const wristIdx = side === 'gauche' ? LM.L_WRIST : side === 'droite' ? LM.R_WRIST : null;
+
+  if (stepId === 'nuque') {
+    const uv = wristUv(P, frame, LM.R_WRIST)
+      ?? holisticUv(track, frame, W, H, 'droite')
+      ?? inferNuqueUv(P, frame);
+    return uv ? { ...uv, source: 'nuque' } : null;
+  }
+
+  if (stepId === 'bas') {
+    const lw = wristUv(P, frame, LM.L_WRIST);
+    const rw = wristUv(P, frame, LM.R_WRIST);
+    const uv = lw ?? rw
+      ?? holisticUv(track, frame, W, H, 'gauche')
+      ?? holisticUv(track, frame, W, H, 'droite');
+    return uv ? { ...uv, source: 'bas' } : null;
+  }
+
+  const sideKey = side === 'gauche' ? 'gauche' : 'droite';
+  const uv = wristUv(P, frame, wristIdx)
+    ?? holisticUv(track, frame, W, H, sideKey);
+  return uv ? { ...uv, source: sideKey } : null;
 }
 
 /**
- * Suit la stabilisation de la main près de la cible.
- * @returns {{ done: boolean, progress: number, anchor: {u,v}|null }}
+ * Évalue l'étape courante : geste + stabilité → repère validé.
  */
-export function trackCalibrationHold(handUv, targetUv, ts, state) {
-  if (!handUv || !handNearTarget(handUv, targetUv)) {
-    return { done: false, progress: 0, anchor: null, stableSince: 0 };
+export function evaluateCalibrationStep(stepIndex, track, P, frame, W, H, ts, state = {}) {
+  const step = CALIBRATION_STEPS[stepIndex];
+  if (!step) return { gesture: false, progress: 0, done: false, anchor: null, screen: null };
+
+  const gesture = detectCalibrationGesture(step.id, P, frame);
+  const contact = gesture ? getCalibrationContact(step.id, track, P, frame, W, H) : null;
+
+  if (!gesture || !contact) {
+    return {
+      gesture: false,
+      progress: 0,
+      done: false,
+      anchor: null,
+      screen: null,
+      stableSince: 0,
+    };
   }
-  const since = state.stableSince || ts;
-  const elapsed = ts - since;
+
+  const last = state.lastUv;
+  const jumped = last && Math.hypot(contact.u - last.u, contact.v - last.v) > STABLE_UV_EPS * 2.5;
+  let stableSince = state.stableSince || 0;
+  if (!stableSince || jumped) stableSince = ts;
+
+  const elapsed = ts - stableSince;
   const progress = Math.min(1, elapsed / STABLE_MS);
-  if (elapsed >= STABLE_MS) {
-    return { done: true, progress: 1, anchor: { u: handUv.u, v: handUv.v }, stableSince: since };
-  }
-  return { done: false, progress, anchor: null, stableSince: since };
-}
+  const done = elapsed >= STABLE_MS;
+  const screen = backToPx(contact.u, contact.v, frame);
 
-export function drawCalibrationTarget(ctx, x, y, ts, { near = false, progress = 0 } = {}) {
-  const pulse = 0.7 + 0.3 * Math.sin(ts / 260);
-  const baseR = near ? 30 : 24;
-  const r = baseR * pulse;
-
-  ctx.save();
-  ctx.beginPath();
-  ctx.arc(x, y, r + 6, 0, Math.PI * 2);
-  ctx.strokeStyle = `rgba(255, 120, 0, ${0.25 + 0.2 * pulse})`;
-  ctx.lineWidth = 2;
-  ctx.stroke();
-
-  ctx.beginPath();
-  ctx.arc(x, y, r, 0, Math.PI * 2);
-  ctx.fillStyle = near
-    ? `rgba(255, 160, 30, ${0.45 + 0.25 * pulse})`
-    : `rgba(255, 100, 0, ${0.35 + 0.3 * pulse})`;
-  ctx.fill();
-  ctx.strokeStyle = near ? 'rgba(255, 200, 80, 0.95)' : 'rgba(255, 140, 0, 0.9)';
-  ctx.lineWidth = near ? 3 : 2;
-  ctx.stroke();
-
-  if (progress > 0) {
-    ctx.beginPath();
-    ctx.arc(x, y, r + 10, -Math.PI / 2, -Math.PI / 2 + progress * Math.PI * 2);
-    ctx.strokeStyle = 'rgba(80, 255, 120, 0.95)';
-    ctx.lineWidth = 4;
-    ctx.stroke();
-  }
-
-  ctx.beginPath();
-  ctx.arc(x, y, 4, 0, Math.PI * 2);
-  ctx.fillStyle = '#fff';
-  ctx.fill();
-  ctx.restore();
+  return {
+    gesture: true,
+    progress,
+    done,
+    anchor: done ? { u: contact.u, v: contact.v } : null,
+    screen,
+    stableSince,
+    lastUv: { u: contact.u, v: contact.v },
+    source: contact.source,
+  };
 }
 
 export function drawCalibrationAnchors(ctx, anchors, frame) {
   if (!frame) return;
   const order = ['nuque', 'epaule_g', 'milieu_g', 'rein_g', 'bas', 'rein_d', 'milieu_d', 'epaule_d'];
-  const pts = order.map((id) => anchors[id] && { id, ...targetScreenPos(anchors[id], frame) }).filter(Boolean);
+  const pts = order
+    .map((id) => anchors[id] && { id, ...backToPx(anchors[id].u, anchors[id].v, frame) })
+    .filter(Boolean);
   if (pts.length < 2) return;
 
   ctx.save();
@@ -153,6 +236,28 @@ export function drawCalibrationAnchors(ctx, anchors, frame) {
     ctx.strokeStyle = '#fff';
     ctx.lineWidth = 2;
     ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/** Indicateur visuel discret (pour spectateur) — pas requis pour valider. */
+export function drawCalibrationFeedback(ctx, screen, ts, { gesture = false, progress = 0 } = {}) {
+  if (!screen) return;
+  ctx.save();
+  if (gesture) {
+    const r = 16 + progress * 10;
+    ctx.beginPath();
+    ctx.arc(screen.x, screen.y, r, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(80, 255, 140, ${0.5 + progress * 0.5})`;
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    if (progress > 0) {
+      ctx.beginPath();
+      ctx.arc(screen.x, screen.y, r + 8, -Math.PI / 2, -Math.PI / 2 + progress * Math.PI * 2);
+      ctx.strokeStyle = 'rgba(120, 255, 180, 0.95)';
+      ctx.lineWidth = 4;
+      ctx.stroke();
+    }
   }
   ctx.restore();
 }

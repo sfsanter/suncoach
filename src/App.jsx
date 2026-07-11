@@ -49,7 +49,7 @@ const BRIEFING = [
   '01. CALE LE TÉLÉPHONE SUR UN SUPPORT (PAS EN MAIN).',
   '02. CAMÉRA SELFIE (FACE) VERS TON DOS — RECULE À ~2 M.',
   '03. MONTE LE VOLUME AU MAXIMUM.',
-  '04. CALIBRAGE : 8 POINTS À LA MAIN (REINS EN 7 ET 8).',
+  '04. CALIBRAGE GESTE : 8 POINTS — ÉCOUTE LA VOIX ET LES BIPS.',
   '05. FROTTE TOUT TON DOS — ORANGE → VERT AU FROTTEMENT.',
 ];
 
@@ -83,8 +83,8 @@ function HomeScreen({ error, onStart }) {
         )}
 
         <EmergencyBanner
-          text="VERSION LIVE — CALIBRAGE 8 PTS"
-          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · 8 repères main · reins 7-8 · silhouette perso'}
+          text="VERSION LIVE — CALIBRAGE GESTE"
+          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · Nuque main droite · détection pose · bips audio'}
           severity="info"
           visible
         />

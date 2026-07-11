@@ -29,23 +29,34 @@ export function zoneName(idx) {
 
 const CALIBRATION_VOICES = {
   intro:
-    'Avant de commencer, montre-moi où finit ton dos. ' +
-    'Pose ta main à huit endroits, une seconde immobile à chaque fois. ' +
-    'Suis le rond orange.',
-  nuque: 'Point un : pose ta main au milieu de la nuque, sur le rond orange.',
-  epaule_g: 'Point deux : bord gauche en haut, là où ton dos finit côté épaule.',
-  epaule_d: 'Point trois : même chose à droite, bord de l’épaule.',
-  milieu_g: 'Point quatre : au milieu du dos, côté gauche — le bord externe.',
-  milieu_d: 'Point cinq : au milieu du dos, côté droit.',
-  bas: 'Point six : tout en bas, au centre du bas du dos.',
-  rein_g: 'Point sept : rein gauche — paume sur le bord gauche, au niveau des reins.',
-  rein_d: 'Point huit : rein droit — même chose à droite, au niveau des reins.',
-  hold: 'Reste une seconde immobile sur le point.',
+    'Calibrage de ton dos. À chaque étape, je te dis quel geste faire. ' +
+    'Reste une seconde immobile quand tu entends les bips accélérer.',
+  nuque:
+    'Point un, la nuque. Main droite : passe ton bras par-dessus ton épaule droite, ' +
+    'coude vers le haut, paume sur la nuque. Reste immobile.',
+  epaule_g:
+    'Point deux, épaule gauche. Main gauche par en dessous, touche le bord gauche en haut du dos.',
+  epaule_d:
+    'Point trois, épaule droite. Main droite par en dessous, bord droit en haut du dos.',
+  milieu_g:
+    'Point quatre, milieu gauche. Main gauche sur le bord externe, au milieu du dos.',
+  milieu_d:
+    'Point cinq, milieu droit. Main droite, bord externe à droite, au milieu du dos.',
+  bas:
+    'Point six, bas du dos. Une main au centre, tout en bas du dos.',
+  rein_g:
+    'Point sept, rein gauche. Main gauche à plat, bord gauche au niveau des reins.',
+  rein_d:
+    'Point huit, rein droit. Main droite à plat, bord droit au niveau des reins.',
+  gesture_ok: 'Je vois ton geste, reste immobile.',
   next: 'Parfait ! Point suivant.',
   done:
-    'Super, j’ai ton dos. Mets de la crème dans tes mains, c’est parti ! ' +
-    'Le orange montre ce qui reste à faire, le vert ce qui est couvert.',
-  nohand: 'Je ne vois pas ta main — colle la paume à plat sur le rond orange.',
+    'Calibrage terminé. Mets de la crème dans tes mains, c’est parti ! ' +
+    'L’orange montre ce qui reste à faire, le vert ce qui est couvert.',
+  no_gesture:
+    'Je ne vois pas le bon geste. Écoute bien l’instruction et recommence.',
+  nuque_hint:
+    'Pour la nuque : main droite, bras par-dessus l’épaule droite, coude bien levé.',
 };
 
 export function calibrationVoice(id) {

@@ -107,6 +107,7 @@ export class Beeper {
   setPaintActivity(mode) {
     if (mode === 'new') this.period = 85;
     else if (mode === 'old') this.period = 420;
+    else if (mode === 'cal') this.period = 110;
     else this.period = Infinity;
   }
 
