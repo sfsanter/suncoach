@@ -18,10 +18,14 @@ const ZONE_RATIO = 0.50;
 const SIGMA = 0.10;
 export const DONE_PAINTED_RATIO = 0.82;
 
+const TRACE_BINS = 32;
+
 let shapeScale = 1.0;
 let bodyMask = new Uint8Array(HEAT_W * HEAT_H);
 /** @type {Record<string, {u:number,v:number}>|null} */
 let customAnchors = null;
+/** @type {{ left: Float32Array, right: Float32Array, valid: Uint8Array, vTop: number, vBot: number, outline: {u,v}[] }|null} */
+let tracedContour = null;
 
 const SHAPE_KNOTS = [
   [0.00, 0.42],
@@ -53,6 +57,14 @@ function effectiveHalfWidth(v) {
 }
 
 export function insideBackShape(u, v) {
+  if (tracedContour) {
+    const { left, right, valid, vTop, vBot } = tracedContour;
+    if (v < vTop - 0.04 || v > vBot + 0.04) return false;
+    const idx = Math.max(0, Math.min(TRACE_BINS - 1, Math.floor(v * TRACE_BINS)));
+    if (!valid[idx]) return false;
+    const margin = 0.04;
+    return u >= left[idx] - margin && u <= right[idx] + margin;
+  }
   if (customAnchors) {
     const top = customAnchors.nuque?.v ?? 0;
     const bot = customAnchors.bas?.v ?? 1;
@@ -90,8 +102,9 @@ function boundaryAt(v, side) {
   return pts[pts.length - 1].u;
 }
 
-/** Contour UV pour la minimap (8 repères). */
+/** Contour UV pour la minimap. */
 export function customBackOutlineUV() {
+  if (tracedContour?.outline?.length >= 4) return tracedContour.outline;
   if (!customAnchors) return null;
   const order = ['nuque', 'epaule_g', 'milieu_g', 'rein_g', 'bas', 'rein_d', 'milieu_d', 'epaule_d'];
   const pts = order.map((id) => customAnchors[id]).filter(Boolean);
@@ -100,7 +113,18 @@ export function customBackOutlineUV() {
 
 export function setCustomBackAnchors(anchors) {
   customAnchors = anchors ? { ...anchors } : null;
+  if (anchors) tracedContour = null;
   rebuildBodyMask();
+}
+
+export function setTracedContour(contour) {
+  tracedContour = contour;
+  if (contour) customAnchors = null;
+  rebuildBodyMask();
+}
+
+export function getTracedContour() {
+  return tracedContour;
 }
 
 export function getCustomBackAnchors() {
@@ -109,6 +133,7 @@ export function getCustomBackAnchors() {
 
 /** Marge élargie pour accepter une main légèrement hors silhouette. */
 export function nearBackShape(u, v, margin = 0.06) {
+  if (tracedContour || customAnchors) return insideBackShape(u, v);
   if (v < -0.05 || v > 1.05) return false;
   const vClamped = Math.max(0, Math.min(1, v));
   return Math.abs(u - 0.5) <= effectiveHalfWidth(vClamped) + margin;
@@ -293,6 +318,7 @@ export class CoverageGrid {
     this.heat.fill(0);
     setShapeScale(1.0);
     setCustomBackAnchors(null);
+    setTracedContour(null);
   }
 
   isBody(i) {

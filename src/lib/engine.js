@@ -7,18 +7,14 @@ import { PoseTracker, LM, isBackTurned, OneEuro, BackOrientation, contactPointsF
 import {
   CoverageGrid, torsoFrame, zoneName, backHalfWidth,
   toBack, nearBackShape, coverageHeatRGBA, setShapeScale,
-  setCustomBackAnchors, customBackOutlineUV,
+  setTracedContour, customBackOutlineUV,
   HEAT_W, HEAT_H, ZONE_COUNT, ANATOMICAL_ZONES,
 } from './coverage.js';
 import {
   estimateSubjectDistance, touchDistanceForRange, formatDistance,
 } from './calibration.js';
-import { gapMessage, gapShort, calibrationVoice, calibrationStepAnnounce } from './tips.js';
-import {
-  CALIBRATION_STEPS, CALIBRATION_STEP_COUNT,
-  evaluateCalibrationStep,
-  drawCalibrationAnchors, drawCalibrationFeedback,
-} from './backCalibration.js';
+import { gapMessage, gapShort } from './tips.js';
+import { ContourTracer, collectTraceContacts, traceGapVoice } from './contourTrace.js';
 import {
   buildBackSilhouette, buildFallbackSilhouette, traceBackContour, drawBackSegmentationOverlay,
 } from './segmentation.js';
@@ -83,14 +79,10 @@ export class SunCoachEngine {
     this.smoothMask = null;
     this.backContour = null;
     this.calibrationFrame = null;
-    this.calStep = 0;
-    this.calAnchors = {};
-    this.calStableSince = 0;
-    this.calProgress = 0;
-    this.calLastUv = null;
-    this.calGraceUntil = 0;
-    this.lastCalVoiceStep = -1;
-    this.lastCalNoHandTs = 0;
+    this.contourTracer = null;
+    this.traceReadySince = 0;
+    this.lastTraceVoiceTs = 0;
+    this.lastTraceMilestone = 0;
     this.lastTs = 0;
     this.placementOkSince = 0;
     this.lastMilestone = 0;
@@ -162,7 +154,7 @@ export class SunCoachEngine {
     const frame = this._smoothTorso(P ? torsoFrame(P) : null);
 
     if (P) {
-      const skipSeg = this.state === 'calibrating';
+      const skipSeg = this.state === 'tracing';
       if (!skipSeg) {
         if (track.segmentationMask) {
           this.smoothMask = buildBackSilhouette(track.segmentationMask, P, W, H, this.smoothMask);
@@ -182,7 +174,7 @@ export class SunCoachEngine {
     this._drawMinimap(ts);
 
     if (this.state === 'placement') this._placementTick(P, ts, frame);
-    else if (this.state === 'calibrating') this._calibrationTick(P, track, ts);
+    else if (this.state === 'tracing') this._tracingTick(P, track, frame, ts);
     else if (this.state === 'coverage') {
       this._coverageTick(P, track, frame, ts, dt);
     }
@@ -306,19 +298,16 @@ export class SunCoachEngine {
 
     this.onHud(0, `CALIBRAGE BIENTÔT… DIST. ${formatDistance(distM)}`);
     if (!this.placementOkSince) this.placementOkSince = ts;
-    if (ts - this.placementOkSince > 1500) this._startCalibration(frame);
+    if (ts - this.placementOkSince > 1500) this._startTracing(frame);
   }
 
-  _startCalibration(frame) {
+  _startTracing(frame) {
     this._finalizeCalibration();
-    this.state = 'calibrating';
-    this.calStep = 0;
-    this.calAnchors = {};
-    this.calStableSince = 0;
-    this.calProgress = 0;
-    this.calLastUv = null;
-    this.calGraceUntil = 0;
-    this.lastCalVoiceStep = -1;
+    this.state = 'tracing';
+    this.contourTracer = new ContourTracer();
+    this.traceReadySince = 0;
+    this.lastTraceVoiceTs = 0;
+    this.lastTraceMilestone = 0;
     this.calibrationFrame = frame ? {
       origin: { ...frame.origin },
       ex: { ...frame.ex },
@@ -326,89 +315,77 @@ export class SunCoachEngine {
       width: frame.width,
       height: frame.height,
     } : null;
-    this.onHud(0, `CALIBRAGE 1/${CALIBRATION_STEP_COUNT} — NUQUE`);
-    this.calGraceUntil = performance.now() + 3000;
-    this.voice.say(calibrationVoice('intro'), { interrupt: true });
-    setTimeout(() => {
-      if (this.state === 'calibrating' && this.calStep === 0) {
-        this.voice.say(calibrationStepAnnounce(0), { interrupt: true });
-        this.lastCalVoiceStep = 0;
-      }
-    }, 2800);
+    this.onHud(0, 'TOUR DU DOS — FROTTE LE CONTOUR');
+    this.voice.say(
+      'On va cartographier ton dos. Frotte tout le contour avec tes mains, ' +
+        'comme si tu faisais deux ou trois tours complets. Nuque, côtés, reins, bas. ' +
+        'Quand ça cliquette, je capte ta main.',
+      { interrupt: true },
+    );
   }
 
-  _sayCalibrationStep(step) {
-    if (step === this.lastCalVoiceStep) return;
-    this.lastCalVoiceStep = step;
-    this.voice.say(calibrationStepAnnounce(step), { interrupt: true, id: 'cal:step:' + step, cooldown: 1500 });
-  }
-
-  _calibrationTick(P, track, ts) {
+  _tracingTick(P, track, frame, ts) {
     const W = this.overlay.width;
     const H = this.overlay.height;
-    const frame = this.calibrationFrame;
-    const step = CALIBRATION_STEPS[this.calStep];
+    const calFrame = this.calibrationFrame || frame;
+    const tracer = this.contourTracer;
 
-    if (!P || !frame || !step) {
+    if (!P || !calFrame || !tracer) {
       this.beeper.setPaintActivity('off');
-      this.onHud(0, 'CALIBRAGE… RESTE DANS LE CADRE');
+      this.onHud(0, 'TOUR DU DOS… RESTE DANS LE CADRE');
       return;
     }
 
-    const ev = evaluateCalibrationStep(this.calStep, track, P, frame, W, H, ts, {
-      stableSince: this.calStableSince,
-      lastUv: this.calLastUv,
-    });
+    const contacts = collectTraceContacts(track, P, calFrame, W, H);
+    let added = 0;
+    for (const uv of contacts) {
+      if (tracer.addSample(uv.u, uv.v)) added++;
+    }
 
-    this.calStableSince = ev.stableSince || 0;
-    this.calLastUv = ev.lastUv || null;
-    this.calProgress = ev.progress;
-
-    if (ev.gesture) {
-      this.beeper.setPaintActivity('cal');
-      if (ev.progress > 0.15 && ev.progress < 0.5 && ts - (this.lastCalGestureVoiceTs ?? 0) > 12000) {
-        this.lastCalGestureVoiceTs = ts;
-        this.voice.say(calibrationVoice('gesture_ok'), { id: 'cal:gest', cooldown: 12000, queue: true });
-      }
-    } else if (ts > (this.calGraceUntil ?? 0)) {
-      this.beeper.setPaintActivity('off');
-      const hintId = step.id === 'nuque' ? 'nuque_hint' : step.id;
-      if (ts - (this.lastCalNoHandTs ?? 0) > 14000) {
-        this.lastCalNoHandTs = ts;
-        const msg = step.id === 'nuque'
-          ? calibrationVoice('nuque_hint')
-          : calibrationStepAnnounce(this.calStep);
-        this.voice.say(msg, { id: 'cal:hint:' + step.id, cooldown: 14000, queue: true });
-      }
+    if (added > 0) {
+      this.beeper.setPaintActivity('new');
+      this.lastPaintTs.new = ts;
     } else {
       this.beeper.setPaintActivity('off');
     }
     this.beeper.tick(ts);
 
-    this.onHud(0, `CALIBRAGE ${this.calStep + 1}/${CALIBRATION_STEP_COUNT} — ${step.label}`);
+    const pct = Math.round(tracer.coverage * 100);
+    this.onHud(tracer.coverage, `TOUR DU DOS ${pct} %`);
 
-    if (ev.done && ev.anchor) {
-      this.calAnchors[step.id] = ev.anchor;
-      this.beeper.zoneDone();
-      this.calStep++;
-      this.calStableSince = 0;
-      this.calLastUv = null;
-      this.calProgress = 0;
-      this.lastCalVoiceStep = -1;
-      this.calGraceUntil = ts + 6000;
-      this.lastCalNoHandTs = ts + 6000;
-
-      if (this.calStep >= CALIBRATION_STEP_COUNT) {
-        setCustomBackAnchors(this.calAnchors);
-        this.voice.say(calibrationVoice('done'), { interrupt: true });
-        this._startCoverage();
-        return;
-      }
+    const milestone = Math.floor(tracer.coverage * 4) / 4;
+    if (milestone > this.lastTraceMilestone && milestone >= 0.25) {
+      this.lastTraceMilestone = milestone;
       this.voice.say(
-        'Parfait, point enregistré. ' + calibrationStepAnnounce(this.calStep),
-        { interrupt: true, id: 'cal:advance:' + this.calStep },
+        `Bien, environ ${Math.round(milestone * 100)} pour cent du contour est cartographié.`,
+        { queue: true },
       );
-      this.lastCalVoiceStep = this.calStep;
+    }
+
+    if (ts - this.lastTraceVoiceTs > 14000 && tracer.coverage < 0.85) {
+      const gap = tracer.biggestGap();
+      if (gap) {
+        this.lastTraceVoiceTs = ts;
+        this.voice.say(traceGapVoice(gap), { id: 'trace:gap', cooldown: 14000, queue: true });
+      }
+    }
+
+    const ready = tracer.isReady();
+    if (ready) {
+      if (!this.traceReadySince) this.traceReadySince = ts;
+    } else {
+      this.traceReadySince = 0;
+    }
+
+    const forceDone = tracer.elapsedSec > 55 && tracer.coverage >= 0.45;
+    if ((this.traceReadySince && ts - this.traceReadySince > 1800) || forceDone) {
+      const contour = tracer.getSmoothedContour();
+      setTracedContour(contour);
+      this.voice.say(
+        'Parfait, j’ai le contour de ton dos. Mets de la crème dans tes mains, c’est parti !',
+        { interrupt: true },
+      );
+      this._startCoverage();
     }
   }
 
@@ -424,7 +401,7 @@ export class SunCoachEngine {
     this.freePaintSince = performance.now();
     this.voice.say(
       "C'est parti ! Frotte librement tout ton dos. Quand ça cliquette, ta main est détectée. " +
-        'Le schéma vert montre ce qui est couvert ; le rouge, ce qui manque encore.',
+        'L’orange montre ce qui reste à faire, le vert ce qui est couvert.',
       { interrupt: true }
     );
   }
@@ -712,25 +689,30 @@ export class SunCoachEngine {
     c.textAlign = 'right';
     c.fillText('D', W - pad - 2, headH + 10);
 
-    if (this.state === 'calibrating' && this.calAnchors) {
-      const order = ['nuque', 'epaule_g', 'milieu_g', 'rein_g', 'bas', 'rein_d', 'milieu_d', 'epaule_d'];
-      for (const id of order) {
-        const a = this.calAnchors[id];
-        if (!a) continue;
-        const x = toX(a.u);
-        const y = toY(a.v);
-        c.beginPath();
-        c.arc(x, y, 6, 0, Math.PI * 2);
-        c.fillStyle = 'rgba(0, 255, 100, 1)';
-        c.fill();
-        c.strokeStyle = '#fff';
+    if (this.state === 'tracing' && this.contourTracer) {
+      const partial = this.contourTracer.getSmoothedContour();
+      if (partial.outline.length >= 4) {
+        c.save();
+        c.strokeStyle = 'rgba(0, 255, 120, 0.9)';
         c.lineWidth = 2;
-        c.stroke();
+        c.setLineDash([3, 3]);
         c.beginPath();
-        c.arc(x, y, 2.5, 0, Math.PI * 2);
-        c.fillStyle = '#fff';
-        c.fill();
+        partial.outline.forEach((p, i) => {
+          const x = toX(p.u);
+          const y = toY(p.v);
+          if (i === 0) c.moveTo(x, y);
+          else c.lineTo(x, y);
+        });
+        c.closePath();
+        c.stroke();
+        c.setLineDash([]);
+        c.restore();
       }
+      const pct = Math.round(this.contourTracer.coverage * 100);
+      c.font = 'bold 16px Fira Code, monospace';
+      c.textAlign = 'center';
+      c.fillStyle = '#00FF00';
+      c.fillText(pct + '%', cx, H - 6);
     }
 
     if (this.state === 'coverage') {
@@ -762,17 +744,20 @@ export class SunCoachEngine {
     const ctx = this.ctx;
     ctx.clearRect(0, 0, W, H);
 
-    if (this.state === 'calibrating' && this.calibrationFrame) {
-      const calFrame = this.calibrationFrame;
-      drawCalibrationAnchors(ctx, this.calAnchors, calFrame);
-      const ev = evaluateCalibrationStep(
-        this.calStep, track, P, calFrame, W, H, performance.now(),
-        { stableSince: this.calStableSince, lastUv: this.calLastUv },
-      );
-      drawCalibrationFeedback(ctx, ev.screen, ts, {
-        gesture: ev.gesture,
-        progress: ev.progress,
-      });
+    if (this.state === 'tracing') {
+      if (P) {
+        for (const idx of [LM.L_WRIST, LM.R_WRIST]) {
+          const p = P[idx];
+          if (p.visibility < 0.35) continue;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 12, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(0, 255, 255, 0.35)';
+          ctx.fill();
+          ctx.strokeStyle = '#00FFFF';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
+      }
       return;
     }
 

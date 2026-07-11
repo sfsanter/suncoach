@@ -49,8 +49,8 @@ const BRIEFING = [
   '01. CALE LE TÉLÉPHONE SUR UN SUPPORT (PAS EN MAIN).',
   '02. CAMÉRA SELFIE (FACE) VERS TON DOS — RECULE À ~2 M.',
   '03. MONTE LE VOLUME AU MAXIMUM.',
-  '04. CALIBRAGE GESTE : 8 POINTS — ÉCOUTE LA VOIX ET LES BIPS.',
-  '05. FROTTE TOUT TON DOS — ORANGE → VERT AU FROTTEMENT.',
+  '04. TOUR DU DOS : FROTTE LE CONTOUR 2–3 FOIS (NUQUE → BAS).',
+  '05. FROTTE TOUT LE DOS — ORANGE → VERT AU FROTTEMENT.',
 ];
 
 function HomeScreen({ error, onStart }) {
@@ -83,8 +83,8 @@ function HomeScreen({ error, onStart }) {
         )}
 
         <EmergencyBanner
-          text="VERSION LIVE — CALIBRAGE GESTE"
-          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · Points verts minimap · pause 6s entre étapes'}
+          text="VERSION LIVE — TOUR DU DOS"
+          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · Contour par frottement · moyenne auto'}
           severity="info"
           visible
         />
