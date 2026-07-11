@@ -125,23 +125,46 @@ export function mapBackUV(u, v) {
 }
 
 /**
- * Heatmap inversée : au départ tout le dos est orange (peu opaque) ;
- * plus on frotte (f → 1), plus le pixel passe au vert.
+ * Heatmap inversée : voile orange léger au départ, dégradés visibles en frottant,
+ * vert néon opaque quand la zone est bien couverte.
  * @param {number} f fraction de couverture 0–1
  * @returns {[number, number, number, number]} rgba
  */
 export function coverageHeatRGBA(f) {
-  if (f >= 0.95) return [0, 230, 60, 235];
-  if (f > 0.06) {
-    const t = (f - 0.06) / 0.89;
+  const x = Math.max(0, Math.min(1, f));
+  if (x >= 0.9) return [30, 255, 90, 255];
+  if (x <= 0.03) return [255, 110, 25, 48];
+
+  const t = (x - 0.03) / 0.87;
+  if (t < 0.2) {
+    const u = t / 0.2;
+    return [255, Math.round(105 + u * 70), Math.round(20 + u * 15), Math.round(48 + u * 55)];
+  }
+  if (t < 0.45) {
+    const u = (t - 0.2) / 0.25;
     return [
-      Math.round(255 * (1 - t)),
-      Math.round(130 + t * 100),
-      Math.round(35 * (1 - t) + 60 * t),
-      Math.round(60 + t * 140),
+      Math.round(255 - u * 120),
+      Math.round(175 + u * 55),
+      Math.round(35 - u * 10),
+      Math.round(103 + u * 70),
     ];
   }
-  return [255, 120, 35, 58];
+  if (t < 0.7) {
+    const u = (t - 0.45) / 0.25;
+    return [
+      Math.round(135 - u * 100),
+      Math.round(230 + u * 20),
+      Math.round(25 + u * 35),
+      Math.round(173 + u * 55),
+    ];
+  }
+  const u = (t - 0.7) / 0.3;
+  return [
+    Math.round(35 - u * 5),
+    Math.round(250 + u * 5),
+    Math.round(60 + u * 30),
+    Math.round(228 + u * 27),
+  ];
 }
 
 export function mapBackPoint(p, f) {

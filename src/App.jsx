@@ -47,7 +47,7 @@ export default function App() {
 
 const BRIEFING = [
   '01. CALE LE TÉLÉPHONE SUR UN SUPPORT (PAS EN MAIN).',
-  '02. CAMÉRA ARRIÈRE VERS TON DOS — RECULE À ~2 M.',
+  '02. CAMÉRA SELFIE (FACE) VERS TON DOS — RECULE À ~2 M.',
   '03. MONTE LE VOLUME AU MAXIMUM.',
   '04. FROTTE TOUT TON DOS LIBREMENT.',
   '05. LE SCHÉMA INDIQUE EN ROUGE CE QUI MANQUE ENCORE.',
@@ -84,7 +84,7 @@ function HomeScreen({ error, onStart }) {
 
         <EmergencyBanner
           text="VERSION LIVE — MODE LIBRE"
-          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · Heatmap inversée : orange → vert au frottement'}
+          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · Vert pétant + dégradés · caméra selfie'}
           severity="info"
           visible
         />

@@ -192,11 +192,8 @@ export function drawBackSegmentationOverlay(ctx, alpha, W, H, { contour, grid, f
 
   const path = contour ? pathFromContour(contour) : null;
 
-  if (showCoverage && grid && frame && path) {
-    ctx.save();
-    ctx.clip(path);
+  if (showCoverage && grid && frame) {
     paintCoverageOnSilhouette(ctx, alpha, W, H, grid, frame);
-    ctx.restore();
   } else if (path) {
     const fillImg = ctx.createImageData(W, H);
     const d = fillImg.data;
@@ -214,13 +211,11 @@ export function drawBackSegmentationOverlay(ctx, alpha, W, H, { contour, grid, f
     ctx.restore();
   }
 
-  if (path) {
+  if (path && !showCoverage) {
     ctx.save();
-    ctx.strokeStyle = 'rgba(0, 255, 130, 1)';
-    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(0, 255, 130, 0.55)';
+    ctx.lineWidth = 2;
     ctx.lineJoin = 'round';
-    ctx.shadowColor = 'rgba(0, 255, 0, 0.7)';
-    ctx.shadowBlur = 8;
     ctx.stroke(path);
     ctx.restore();
   }
