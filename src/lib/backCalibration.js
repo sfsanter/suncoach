@@ -209,11 +209,56 @@ export function evaluateCalibrationStep(stepIndex, track, P, frame, W, H, ts, st
   };
 }
 
-export function drawCalibrationAnchors(ctx, anchors, frame) {
+const ANCHOR_ORDER = ['nuque', 'epaule_g', 'milieu_g', 'rein_g', 'bas', 'rein_d', 'milieu_d', 'epaule_d'];
+
+export { ANCHOR_ORDER };
+
+/** 8 repères pré-positionnés sur le contour IA. */
+export function ghostAnchorsFromContour(contour) {
+  const fallback = {
+    nuque: { u: 0.5, v: 0.08 },
+    epaule_g: { u: 0.22, v: 0.18 },
+    epaule_d: { u: 0.78, v: 0.18 },
+    milieu_g: { u: 0.18, v: 0.42 },
+    milieu_d: { u: 0.82, v: 0.42 },
+    bas: { u: 0.5, v: 0.92 },
+    rein_g: { u: 0.22, v: 0.72 },
+    rein_d: { u: 0.78, v: 0.72 },
+  };
+  if (!contour?.valid) return { ...fallback };
+
+  const { left, right, valid, vTop, vBot, bins } = contour;
+  const span = Math.max(0.12, vBot - vTop);
+
+  const atSide = (v, side) => {
+    const idx = Math.max(0, Math.min(bins - 1, Math.round(v * bins)));
+    if (!valid[idx]) return null;
+    return { u: side === 'left' ? left[idx] : right[idx], v: (idx + 0.5) / bins };
+  };
+  const center = (v) => {
+    const l = atSide(v, 'left');
+    const r = atSide(v, 'right');
+    if (!l || !r) return null;
+    return { u: (l.u + r.u) / 2, v: (l.v + r.v) / 2 };
+  };
+
+  return {
+    nuque: center(vTop + 0.02) ?? fallback.nuque,
+    epaule_g: atSide(vTop + span * 0.1, 'left') ?? fallback.epaule_g,
+    epaule_d: atSide(vTop + span * 0.1, 'right') ?? fallback.epaule_d,
+    milieu_g: atSide(vTop + span * 0.38, 'left') ?? fallback.milieu_g,
+    milieu_d: atSide(vTop + span * 0.38, 'right') ?? fallback.milieu_d,
+    bas: center(vBot - 0.02) ?? fallback.bas,
+    rein_g: atSide(vTop + span * 0.68, 'left') ?? fallback.rein_g,
+    rein_d: atSide(vTop + span * 0.68, 'right') ?? fallback.rein_d,
+  };
+}
+
+export function drawCalibrationAnchors(ctx, anchors, frame, { ghost = null, activeId = null } = {}) {
   if (!frame) return;
-  const order = ['nuque', 'epaule_g', 'milieu_g', 'rein_g', 'bas', 'rein_d', 'milieu_d', 'epaule_d'];
-  const pts = order
-    .map((id) => anchors[id] && { id, ...backToPx(anchors[id].u, anchors[id].v, frame) })
+  const merged = { ...ghost, ...anchors };
+  const pts = ANCHOR_ORDER
+    .map((id) => merged[id] && { id, ...backToPx(merged[id].u, merged[id].v, frame), done: !!anchors[id] })
     .filter(Boolean);
   if (pts.length < 2) return;
 
@@ -229,18 +274,39 @@ export function drawCalibrationAnchors(ctx, anchors, frame) {
   ctx.setLineDash([]);
 
   for (const p of pts) {
+    const active = p.id === activeId;
     ctx.beginPath();
-    ctx.arc(p.x, p.y, 8, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(40, 255, 100, 0.85)';
+    ctx.arc(p.x, p.y, active ? 12 : 8, 0, Math.PI * 2);
+    ctx.fillStyle = p.done
+      ? 'rgba(40, 255, 100, 0.95)'
+      : active
+        ? 'rgba(255, 200, 50, 0.9)'
+        : 'rgba(80, 255, 120, 0.45)';
     ctx.fill();
-    ctx.strokeStyle = '#fff';
-    ctx.lineWidth = 2;
+    ctx.strokeStyle = active ? '#FFD700' : '#fff';
+    ctx.lineWidth = active ? 3 : 2;
     ctx.stroke();
   }
   ctx.restore();
 }
 
-/** Indicateur visuel discret (pour spectateur) — pas requis pour valider. */
+/** Peinture haut du dos : geste reconnu + repère calibré (82 % ancre). */
+export function anchorAssistedContacts(P, track, lockedFrame, anchors, W, H) {
+  if (!P || !lockedFrame || !anchors) return [];
+  const out = [];
+  for (const step of CALIBRATION_STEPS) {
+    if (!anchors[step.id]) continue;
+    if (!detectCalibrationGesture(step.id, P, lockedFrame)) continue;
+    const contact = getCalibrationContact(step.id, track, P, lockedFrame, W, H);
+    const a = anchors[step.id];
+    const u = contact ? a.u * 0.82 + contact.u * 0.18 : a.u;
+    const v = contact ? a.v * 0.82 + contact.v * 0.18 : a.v;
+    const name = step.side === 'gauche' ? 'gauche' : step.side === 'droite' ? 'droite' : 'gauche';
+    out.push({ name, u, v, anchor: step.id });
+  }
+  return out;
+}
+
 export function drawCalibrationFeedback(ctx, screen, ts, { gesture = false, progress = 0 } = {}) {
   if (!screen) return;
   ctx.save();

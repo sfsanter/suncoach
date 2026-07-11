@@ -30,8 +30,8 @@ export function zoneName(idx) {
 
 const CALIBRATION_VOICES = {
   intro:
-    'Calibrage de ton dos. À chaque étape, je te dis quel geste faire. ' +
-    'Reste une seconde immobile quand tu entends les bips accélérer.',
+    'Calibrage de ton dos sur la photo figée. Huit points sur le contour : ' +
+    'à chaque étape, fais le geste indiqué et reste immobile quand les bips accélèrent.',
   nuque:
     'Point un, la nuque. Main droite : passe ton bras par-dessus ton épaule droite, ' +
     'coude vers le haut, paume sur la nuque. Reste immobile.',
@@ -52,8 +52,21 @@ const CALIBRATION_VOICES = {
   gesture_ok: 'Je vois ton geste, reste immobile.',
   next: 'Parfait ! Point suivant.',
   done:
-    'Calibrage terminé. Mets de la crème dans tes mains, c’est parti ! ' +
-    'L’orange montre ce qui reste à faire, le vert ce qui est couvert.',
+    'Calibrage terminé. Prends la crème, puis replace-toi dos à la caméra. ' +
+    'Je te guide pour retrouver la même position.',
+  reposition_intro:
+    'Mets de la crème dans tes mains. Replace-toi dos à la caméra, à la même distance qu’au scan.',
+  reposition_ok: 'Position retrouvée. C’est parti, frotte tout ton dos !',
+  reposition_far: 'Tu es un peu loin. Rapproche-toi comme au début.',
+  reposition_close: 'Tu es trop près. Recule un peu.',
+  reposition_turn: 'Tourne-toi, dos à la caméra.',
+  reposition_shift: 'Décale-toi pour retrouver la même position qu’au scan.',
+  scan_done:
+    'Photo enregistrée. Tourne-toi vers l’écran : huit points sont déjà placés sur ton dos. ' +
+    'Glisse chaque point sur le bon endroit, puis valide.',
+  adjust_intro:
+    'Photo prise ! Tourne-toi vers l’écran. Glisse les huit points verts sur le contour de ton dos, ' +
+    'puis appuie sur valider.',
   no_gesture:
     'Je ne vois pas le bon geste. Écoute bien l’instruction et recommence.',
   nuque_hint:

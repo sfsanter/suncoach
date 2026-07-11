@@ -9,7 +9,8 @@ import {
   TerminalDisplay,
 } from '@mdrbx/nerv-ui';
 import { SunCoachEngine, ZONE_COUNT, ANATOMICAL_ZONES } from './lib/engine.js';
-import { backHalfWidth } from './lib/coverage.js';
+import { backHalfWidth, backToPx, toBack } from './lib/coverage.js';
+import { CALIBRATION_STEPS, ANCHOR_ORDER } from './lib/backCalibration.js';
 import { strokeZoneOutline } from './lib/zones.js';
 import { preloadPose, preloadBodySegmenter } from './lib/pose.js';
 
@@ -50,8 +51,9 @@ const BRIEFING = [
   '01. CALE LE TÉLÉPHONE SUR UN SUPPORT (PAS EN MAIN).',
   '02. CAMÉRA SELFIE (FACE) VERS TON DOS — RECULE À ~2 M.',
   '03. MONTE LE VOLUME AU MAXIMUM.',
-  '04. RESTE IMMOBILE 2 S — L’IA SCANNE LA FORME DE TON DOS.',
-  '05. FROTTE TOUT LE DOS — ORANGE → VERT AU FROTTEMENT.',
+  '04. RESTE IMMOBILE — PHOTO + SCAN IA DU DOS.',
+  '05. TOURNE-TOI : GLISSE LES 8 POINTS SUR TA PHOTO.',
+  '06. REPLACE-TOI (VOIX) → FROTTE — ORANGE → VERT.',
 ];
 
 function HomeScreen({ error, onStart }) {
@@ -84,8 +86,8 @@ function HomeScreen({ error, onStart }) {
         )}
 
         <EmergencyBanner
-          text="VERSION LIVE — SCAN IA DOS"
-          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · Segmentation IA · reste immobile 2 s'}
+          text="VERSION LIVE — SCAN + 8 POINTS"
+          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · Photo figée · ajuste les points au doigt'}
           severity="info"
           visible
         />
@@ -120,6 +122,163 @@ function HomeScreen({ error, onStart }) {
   );
 }
 
+// ---------------------------------------------------------------- ajustement points sur photo
+
+function useImageFit(imgRef, boxRef) {
+  const [fit, setFit] = useState(null);
+  const update = () => {
+    const img = imgRef.current;
+    const box = boxRef.current;
+    if (!img?.naturalWidth || !box) return;
+    const scale = Math.min(box.clientWidth / img.naturalWidth, box.clientHeight / img.naturalHeight);
+    setFit({
+      w: img.naturalWidth * scale,
+      h: img.naturalHeight * scale,
+    });
+  };
+  useEffect(() => {
+    update();
+    window.addEventListener('resize', update);
+    return () => window.removeEventListener('resize', update);
+  }, []);
+  return { fit, refresh: update };
+}
+
+function PointAdjustScreen({ payload, engine }) {
+  const imgRef = useRef(null);
+  const boxRef = useRef(null);
+  const { fit, refresh } = useImageFit(imgRef, boxRef);
+  const [anchors, setAnchors] = useState(payload.anchors);
+  const dragRef = useRef(null);
+
+  useEffect(() => {
+    setAnchors(payload.anchors);
+  }, [payload]);
+
+  const labelFor = (id) => CALIBRATION_STEPS.find((s) => s.id === id)?.label ?? id;
+
+  const pctPos = (id) => {
+    const a = anchors[id];
+    if (!a || !payload.frame) return { left: 50, top: 50 };
+    const px = backToPx(a.u, a.v, payload.frame);
+    return {
+      left: (px.x / payload.videoW) * 100,
+      top: (px.y / payload.videoH) * 100,
+    };
+  };
+
+  const linePoints = ANCHOR_ORDER
+    .map((id) => {
+      const p = pctPos(id);
+      return `${p.left},${p.top}`;
+    })
+    .join(' ');
+
+  const onPointerDown = (id, e) => {
+    e.preventDefault();
+    dragRef.current = id;
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+
+  const onPointerMove = (e) => {
+    const id = dragRef.current;
+    const img = imgRef.current;
+    const box = boxRef.current;
+    if (!id || !img || !box || !fit) return;
+    const boxRect = box.getBoundingClientRect();
+    const left = boxRect.left + (boxRect.width - fit.w) / 2;
+    const top = boxRect.top + (boxRect.height - fit.h) / 2;
+    const x = ((e.clientX - left) / fit.w) * payload.videoW;
+    const y = ((e.clientY - top) / fit.h) * payload.videoH;
+    if (x < 0 || y < 0 || x > payload.videoW || y > payload.videoH) return;
+    const uv = toBack({ x, y, visibility: 1 }, payload.frame);
+    engine.setDraftAnchor(id, uv.u, uv.v);
+    setAnchors((prev) => ({ ...prev, [id]: { u: uv.u, v: uv.v } }));
+  };
+
+  const onPointerUp = () => {
+    dragRef.current = null;
+  };
+
+  return (
+    <div className="absolute inset-0 z-40 flex flex-col bg-nerv-black">
+      <div
+        className="border-b border-nerv-orange/40 bg-nerv-panel px-4 py-3 text-center"
+        style={{ fontFamily: 'var(--font-nerv-mono)' }}
+      >
+        <div className="text-sm font-bold tracking-[0.2em] text-nerv-orange">AJUSTE TON DOS</div>
+        <div className="mt-1 text-xs text-nerv-green/80">
+          Glisse chaque point vert sur le contour · puis valide
+        </div>
+      </div>
+
+      <div ref={boxRef} className="relative flex flex-1 items-center justify-center overflow-hidden p-2">
+        <div className="relative" style={fit ? { width: fit.w, height: fit.h } : { maxWidth: '100%', maxHeight: '100%' }}>
+          <img
+            ref={imgRef}
+            src={payload.imageUrl}
+            alt="Photo de ton dos"
+            className="block max-h-full max-w-full select-none"
+            draggable={false}
+            onLoad={refresh}
+          />
+          {fit && (
+            <>
+            <svg
+              className="pointer-events-none absolute inset-0 h-full w-full"
+              viewBox="0 0 100 100"
+              preserveAspectRatio="none"
+            >
+              <polyline
+                points={linePoints}
+                fill="none"
+                stroke="rgba(80,255,120,0.75)"
+                strokeWidth="0.4"
+                strokeDasharray="1.2 0.8"
+              />
+            </svg>
+            {ANCHOR_ORDER.map((id) => {
+              const pos = pctPos(id);
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  className="absolute z-10 flex -translate-x-1/2 -translate-y-1/2 touch-none flex-col items-center"
+                  style={{ left: `${pos.left}%`, top: `${pos.top}%` }}
+                  onPointerDown={(e) => onPointerDown(id, e)}
+                  onPointerMove={onPointerMove}
+                  onPointerUp={onPointerUp}
+                  onPointerCancel={onPointerUp}
+                >
+                  <span
+                    className="flex h-9 w-9 items-center justify-center rounded-full border-2 border-white bg-nerv-green/90 text-[9px] font-bold text-black shadow-lg"
+                    style={{ fontFamily: 'var(--font-nerv-mono)' }}
+                  >
+                    ●
+                  </span>
+                  <span
+                    className="mt-0.5 rounded bg-black/75 px-1.5 py-0.5 text-[8px] tracking-wider text-nerv-green"
+                    style={{ fontFamily: 'var(--font-nerv-mono)' }}
+                  >
+                    {labelFor(id)}
+                  </span>
+                </button>
+              );
+            })}
+            </>
+          )}
+        </div>
+      </div>
+
+      <div className="border-t border-nerv-orange/30 bg-nerv-panel px-4 py-3">
+        <Button variant="primary" size="lg" fullWidth onClick={() => engine.confirmAdjustment()}>
+          VALIDER LES 8 POINTS
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------- session
 
 function SessionScreen({ onAbort, onError, onDone }) {
@@ -131,6 +290,9 @@ function SessionScreen({ onAbort, onError, onDone }) {
   const [muted, setMuted] = useState(false);
   const [ready, setReady] = useState(false);
 
+  const [phase, setPhase] = useState('placement');
+  const [adjustPayload, setAdjustPayload] = useState(null);
+
   useEffect(() => {
     const engine = new SunCoachEngine({
       video: videoRef.current,
@@ -138,6 +300,10 @@ function SessionScreen({ onAbort, onError, onDone }) {
       minimap: minimapRef.current,
       onHud: (pct, status) => setHud({ pct, status }),
       onDone,
+      onPhase: (p, data) => {
+        setPhase(p);
+        setAdjustPayload(p === 'adjusting' ? data : null);
+      },
     });
     engineRef.current = engine;
     let cancelled = false;
@@ -187,6 +353,11 @@ function SessionScreen({ onAbort, onError, onDone }) {
           />
         )}
 
+        {phase === 'adjusting' && adjustPayload && engineRef.current && (
+          <PointAdjustScreen payload={adjustPayload} engine={engineRef.current} />
+        )}
+
+        {phase !== 'adjusting' && (
         <div className="pointer-events-none absolute inset-x-0 top-0 bg-gradient-to-b from-black/85 to-transparent px-4 pb-8 pt-3">
           <SyncProgressBar
             value={hud.pct * 100}
@@ -200,8 +371,9 @@ function SessionScreen({ onAbort, onError, onDone }) {
             {hud.status}
           </div>
         </div>
+        )}
 
-        {/* Dessin de dos fixe : reste lisible même quand on se retourne. */}
+        {phase !== 'adjusting' && (
         <div className="pointer-events-none absolute bottom-3 right-3 flex flex-col items-center gap-1">
           <canvas ref={minimapRef} width={180} height={250} />
           <span
@@ -211,12 +383,15 @@ function SessionScreen({ onAbort, onError, onDone }) {
             SCHÉMA DOS
           </span>
         </div>
+        )}
       </div>
 
       <div className="flex justify-center gap-3 border-t border-nerv-orange/30 bg-nerv-panel px-4 py-3">
+        {phase !== 'adjusting' && (
         <Button variant="ghost" onClick={() => engineRef.current?.flip()}>
           CAMÉRA
         </Button>
+        )}
         <Button variant="ghost" onClick={toggleMute}>
           {muted ? 'SON : OFF' : 'SON : ON'}
         </Button>

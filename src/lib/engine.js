@@ -7,23 +7,26 @@ import { PoseTracker, LM, isBackTurned, OneEuro, BackOrientation, contactPointsF
 import {
   CoverageGrid, torsoFrame, zoneName, backHalfWidth,
   toBack, nearBackShape, coverageHeatRGBA, setShapeScale,
-  setTracedContour, customBackOutlineUV,
+  setTracedContour, customBackOutlineUV, setCustomBackAnchors, getTracedContour,
   HEAT_W, HEAT_H, ZONE_COUNT, ANATOMICAL_ZONES, MIN_COVERAGE_SEC,
 } from './coverage.js';
 import {
   estimateSubjectDistance, touchDistanceForRange, formatDistance,
 } from './calibration.js';
-import { gapMessage, gapShort } from './tips.js';
+import { gapMessage, gapShort, calibrationVoice } from './tips.js';
 import { MaskLockAccumulator, LOCK_FRAMES } from './maskLock.js';
 import { warpToLocked, cloneFrame } from './backTemplate.js';
 import { credibleBackHand, crediblePoseWrist, elbowBackContact, handContactPixels, ContactVelocityGate } from './handGate.js';
+import {
+  CALIBRATION_STEPS, ghostAnchorsFromContour, anchorAssistedContacts,
+} from './backCalibration.js';
 import {
   buildBackSilhouette, buildFallbackSilhouette, buildBackSilhouetteFromBytes,
   traceBackContour, drawBackSegmentationOverlay,
 } from './segmentation.js';
 
 export class SunCoachEngine {
-  constructor({ video, overlay, minimap, onHud, onDone }) {
+  constructor({ video, overlay, minimap, onHud, onDone, onPhase }) {
     this.video = video;
     this.overlay = overlay;
     this.ctx = overlay.getContext('2d');
@@ -31,6 +34,7 @@ export class SunCoachEngine {
     this.minimapCtx = minimap ? minimap.getContext('2d') : null;
     this.onHud = onHud;
     this.onDone = onDone;
+    this.onPhase = onPhase || (() => {});
 
     this.voice = new Voice();
     this.beeper = new Beeper();
@@ -82,8 +86,18 @@ export class SunCoachEngine {
     this.smoothMask = null;
     this.backContour = null;
     this.calibrationFrame = null;
+    this.frozenMask = null;
+    this.lockedShoulderW = 0;
+    this.lockedMid = null;
     this.maskLock = null;
     this.lockStartedAt = 0;
+    this.calibrationAnchors = {};
+    this.calibrationGhost = null;
+    this.draftAnchors = null;
+    this.snapshotDataUrl = null;
+    this.snapshotW = 0;
+    this.snapshotH = 0;
+    this.repositionOkSince = 0;
     this.lastTs = 0;
     this.placementOkSince = 0;
     this.lastMilestone = 0;
@@ -157,7 +171,8 @@ export class SunCoachEngine {
     const frame = this._smoothTorso(P ? torsoFrame(P) : null);
 
     if (P) {
-      const skipSeg = this.state === 'locking';
+      const useFrozen = this.frozenMask && this.state !== 'placement';
+      const skipSeg = this.state === 'locking' || useFrozen;
       if (!skipSeg) {
         if (track.aiPersonMask) {
           this.smoothMask = buildBackSilhouetteFromBytes(
@@ -182,6 +197,8 @@ export class SunCoachEngine {
 
     if (this.state === 'placement') this._placementTick(P, ts, frame);
     else if (this.state === 'locking') this._lockingTick(P, track, frame, ts, W, H);
+    else if (this.state === 'adjusting') { /* pose en pause visuelle — ajustement écran */ }
+    else if (this.state === 'reposition') this._repositionTick(P, ts, W);
     else if (this.state === 'coverage') {
       this._coverageTick(P, track, frame, ts, dt);
     }
@@ -319,7 +336,7 @@ export class SunCoachEngine {
     this.tracker.aiSegEnabled = true;
     this.onHud(0, 'SCAN IA DU DOS… RESTE IMMOBILE');
     this.voice.say(
-      'Parfait. Reste immobile deux secondes, je scanne ton dos avec l’intelligence artificielle.',
+      'Parfait. Reste immobile, je prends une photo et je scanne ton dos.',
       { interrupt: true },
     );
   }
@@ -383,22 +400,132 @@ export class SunCoachEngine {
 
     if (contour) {
       setTracedContour(contour);
-      this.smoothMask = buildBackSilhouetteFromBytes(averaged, P, W, H, null);
+      this.frozenMask = buildBackSilhouetteFromBytes(averaged, P, W, H, null);
+      this.smoothMask = this.frozenMask;
       this.backContour = traceBackContour(this.smoothMask, W, H);
-      this.voice.say(
-        'J’ai capturé la forme de ton dos. Mets de la crème dans tes mains, c’est parti !',
-        { interrupt: true },
-      );
     } else {
-      this.smoothMask = buildFallbackSilhouette(P, W, H, null);
+      this.frozenMask = buildFallbackSilhouette(P, W, H, null);
+      this.smoothMask = this.frozenMask;
       this.backContour = traceBackContour(this.smoothMask, W, H);
-      this.voice.say(
-        'Scan partiel, mais on peut commencer. Mets de la crème dans tes mains !',
-        { interrupt: true },
+    }
+
+    const ls = P[LM.L_SHOULDER];
+    const rs = P[LM.R_SHOULDER];
+    this.lockedShoulderW = Math.hypot(rs.x - ls.x, rs.y - ls.y);
+    this.lockedMid = { x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2 };
+
+    this.calibrationGhost = ghostAnchorsFromContour(contour ?? getTracedContour());
+    this.maskLock = null;
+    this._startAdjusting();
+  }
+
+  _captureSnapshot() {
+    const W = this.video.videoWidth;
+    const H = this.video.videoHeight;
+    const c = document.createElement('canvas');
+    c.width = W;
+    c.height = H;
+    c.getContext('2d').drawImage(this.video, 0, 0, W, H);
+    this.snapshotDataUrl = c.toDataURL('image/jpeg', 0.9);
+    this.snapshotW = W;
+    this.snapshotH = H;
+  }
+
+  getAdjustmentPayload() {
+    return {
+      imageUrl: this.snapshotDataUrl,
+      anchors: { ...this.draftAnchors },
+      videoW: this.snapshotW,
+      videoH: this.snapshotH,
+      frame: this.calibrationFrame,
+    };
+  }
+
+  setDraftAnchor(id, u, v) {
+    if (this.state !== 'adjusting' || !this.draftAnchors) return;
+    this.draftAnchors[id] = {
+      u: Math.max(0.02, Math.min(0.98, u)),
+      v: Math.max(0.02, Math.min(0.98, v)),
+    };
+    this.onPhase('adjusting', this.getAdjustmentPayload());
+  }
+
+  confirmAdjustment() {
+    if (this.state !== 'adjusting' || !this.draftAnchors) return;
+    this.calibrationAnchors = { ...this.draftAnchors };
+    setCustomBackAnchors(this.calibrationAnchors);
+    this.voice.say(calibrationVoice('done'), { interrupt: true });
+    this._startReposition();
+  }
+
+  _notifyPhase() {
+    const data = this.state === 'adjusting' ? this.getAdjustmentPayload() : {};
+    this.onPhase(this.state, data);
+  }
+
+  _startAdjusting() {
+    this._captureSnapshot();
+    this.state = 'adjusting';
+    this.draftAnchors = { ...this.calibrationGhost };
+    this.calibrationAnchors = {};
+    this.onHud(0, 'AJUSTE LES 8 POINTS SUR TA PHOTO');
+    this.voice.say(calibrationVoice('adjust_intro'), { interrupt: true });
+    this._notifyPhase();
+  }
+
+  _startReposition() {
+    this.state = 'reposition';
+    this.repositionOkSince = 0;
+    this.onHud(0, 'REPLACE-TOI POUR LA CRÈME');
+    this.voice.say(calibrationVoice('reposition_intro'), { interrupt: true });
+    this._notifyPhase();
+  }
+
+  _repositionTick(P, ts, W) {
+    const locked = this.calibrationFrame;
+    const fail = (msg, id, status) => {
+      this.repositionOkSince = 0;
+      this.onHud(0, status);
+      this.voice.say(msg, { id, cooldown: 7000 });
+    };
+
+    if (!P || !locked || !this.lockedMid) {
+      return fail(
+        'Je ne te vois pas. Replace-toi dos à la caméra.',
+        'repo:novis', 'REPOSITION…'
       );
     }
-    this.maskLock = null;
-    this._startCoverage();
+
+    const ls = P[LM.L_SHOULDER], rs = P[LM.R_SHOULDER];
+    if (ls.visibility < 0.45 || rs.visibility < 0.45) {
+      return fail('Montre tes épaules à la caméra.', 'repo:sh', 'ÉPAULES NON VISIBLES');
+    }
+    if (!isBackTurned(P, W)) {
+      return fail(calibrationVoice('reposition_turn'), 'repo:turn', 'TOURNE-TOI');
+    }
+
+    const shoulderW = Math.hypot(rs.x - ls.x, rs.y - ls.y);
+    const ratio = shoulderW / (this.lockedShoulderW || shoulderW);
+    if (ratio < 0.82) {
+      return fail(calibrationVoice('reposition_far'), 'repo:far', 'TROP LOIN');
+    }
+    if (ratio > 1.22) {
+      return fail(calibrationVoice('reposition_close'), 'repo:close', 'TROP PRÈS');
+    }
+
+    const midX = (ls.x + rs.x) / 2;
+    const midY = (ls.y + rs.y) / 2;
+    const drift = Math.hypot(midX - this.lockedMid.x, midY - this.lockedMid.y);
+    if (drift > this.lockedShoulderW * 0.14) {
+      return fail(calibrationVoice('reposition_shift'), 'repo:shift', 'DÉCALE-TOI');
+    }
+
+    this.onHud(0, 'POSITION OK…');
+    if (!this.repositionOkSince) this.repositionOkSince = ts;
+    if (ts - this.repositionOkSince > 1800) {
+      this.voice.say(calibrationVoice('reposition_ok'), { interrupt: true });
+      this._startCoverage();
+    }
   }
 
   _startCoverage() {
@@ -416,6 +543,7 @@ export class SunCoachEngine {
     this.onHud(0, 'CRÈME DANS LES MAINS !');
     this.lastGapVoiceTs = 0;
     this.freePaintSince = performance.now();
+    this._notifyPhase();
     this.voice.say(
       "C'est parti ! Frotte librement tout ton dos. Quand ça cliquette, ta main est détectée. " +
         'L’orange montre ce qui reste à faire, le vert ce qui est couvert.',
@@ -487,6 +615,18 @@ export class SunCoachEngine {
   _getCoverageContacts(track, P, liveFrame, lockedFrame, W, H, ts) {
     if (!lockedFrame || !P) return [];
     const out = [];
+
+    const anchorPts = anchorAssistedContacts(
+      P, track, lockedFrame, this.calibrationAnchors, W, H
+    );
+    const anchorUsed = new Set();
+    for (const pt of anchorPts) {
+      const f = this.filters[pt.name];
+      const sm = this.contactGate.clamp(pt.name, f.u.filter(pt.u, ts), f.v.filter(pt.v, ts));
+      out.push({ name: pt.name, u: sm.u, v: sm.v });
+      anchorUsed.add(pt.anchor);
+    }
+
     const defs = [
       { hand: track.leftHand2D, poseWrist: LM.L_WRIST, name: 'gauche' },
       { hand: track.rightHand2D, poseWrist: LM.R_WRIST, name: 'droite' },
@@ -515,6 +655,7 @@ export class SunCoachEngine {
         if (!this._pointNearTorso(warped, lockedFrame)) continue;
         const raw = toBack(warped, lockedFrame);
         const sm = this.contactGate.clamp(d.name, f.u.filter(raw.u, ts), f.v.filter(raw.v, ts));
+        if (sm.v < 0.42 && anchorUsed.size > 0) continue;
         out.push({ name: d.name, u: sm.u, v: sm.v });
       }
     }
@@ -770,6 +911,13 @@ export class SunCoachEngine {
       c.fillText('SCAN ' + pct + '%', cx, H - 6);
     }
 
+    if (this.state === 'reposition') {
+      c.font = 'bold 14px Fira Code, monospace';
+      c.textAlign = 'center';
+      c.fillStyle = '#FF9900';
+      c.fillText('REPLACE-TOI', cx, H - 6);
+    }
+
     if (this.state === 'coverage') {
       const gap = this.grid.biggestGap();
       if (gap) {
@@ -811,11 +959,27 @@ export class SunCoachEngine {
       return;
     }
 
-    if (!frame && !this.smoothMask) return;
+    if (this.state === 'adjusting') return;
 
-    if (this.smoothMask) {
-      const paintFrame = this.calibrationFrame || frame;
-      drawBackSegmentationOverlay(ctx, this.smoothMask, W, H, {
+    const paintFrame = this.calibrationFrame || frame;
+    const mask = this.frozenMask || this.smoothMask;
+
+    if (this.state === 'reposition') {
+      if (mask) {
+        drawBackSegmentationOverlay(ctx, mask, W, H, {
+          contour: this.backContour,
+          grid: null,
+          frame: paintFrame,
+          showCoverage: false,
+        });
+      }
+      return;
+    }
+
+    if (!frame && !mask) return;
+
+    if (mask) {
+      drawBackSegmentationOverlay(ctx, mask, W, H, {
         contour: this.backContour,
         grid: this.state === 'coverage' ? this.grid : null,
         frame: paintFrame,
