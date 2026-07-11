@@ -11,7 +11,7 @@ import {
 import { SunCoachEngine, ZONE_COUNT, ANATOMICAL_ZONES } from './lib/engine.js';
 import { backHalfWidth } from './lib/coverage.js';
 import { strokeZoneOutline } from './lib/zones.js';
-import { preloadPose } from './lib/pose.js';
+import { preloadPose, preloadBodySegmenter } from './lib/pose.js';
 
 export default function App() {
   const [screen, setScreen] = useState('home'); // home | session | done
@@ -22,6 +22,7 @@ export default function App() {
   // appuie sur "Commencer", tout est déjà prêt (fini le chargement qui traîne).
   useEffect(() => {
     preloadPose().catch(() => { /* sera retenté au lancement de la session */ });
+    preloadBodySegmenter().catch(() => { /* chargé au scan IA */ });
   }, []);
 
   return (
@@ -49,7 +50,7 @@ const BRIEFING = [
   '01. CALE LE TÉLÉPHONE SUR UN SUPPORT (PAS EN MAIN).',
   '02. CAMÉRA SELFIE (FACE) VERS TON DOS — RECULE À ~2 M.',
   '03. MONTE LE VOLUME AU MAXIMUM.',
-  '04. TOUR DU DOS : FROTTE LE CONTOUR 2–3 FOIS (NUQUE → BAS).',
+  '04. RESTE IMMOBILE 2 S — L’IA SCANNE LA FORME DE TON DOS.',
   '05. FROTTE TOUT LE DOS — ORANGE → VERT AU FROTTEMENT.',
 ];
 
@@ -83,8 +84,8 @@ function HomeScreen({ error, onStart }) {
         )}
 
         <EmergencyBanner
-          text="VERSION LIVE — TOUR DU DOS"
-          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · Contour par frottement · moyenne auto'}
+          text="VERSION LIVE — SCAN IA DOS"
+          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · Segmentation IA · reste immobile 2 s'}
           severity="info"
           visible
         />

@@ -14,9 +14,10 @@ import {
   estimateSubjectDistance, touchDistanceForRange, formatDistance,
 } from './calibration.js';
 import { gapMessage, gapShort } from './tips.js';
-import { ContourTracer, collectTraceContacts, traceGapVoice } from './contourTrace.js';
+import { MaskLockAccumulator, LOCK_FRAMES } from './maskLock.js';
 import {
-  buildBackSilhouette, buildFallbackSilhouette, traceBackContour, drawBackSegmentationOverlay,
+  buildBackSilhouette, buildFallbackSilhouette, buildBackSilhouetteFromBytes,
+  traceBackContour, drawBackSegmentationOverlay,
 } from './segmentation.js';
 
 export class SunCoachEngine {
@@ -79,10 +80,8 @@ export class SunCoachEngine {
     this.smoothMask = null;
     this.backContour = null;
     this.calibrationFrame = null;
-    this.contourTracer = null;
-    this.traceReadySince = 0;
-    this.lastTraceVoiceTs = 0;
-    this.lastTraceMilestone = 0;
+    this.maskLock = null;
+    this.lockStartedAt = 0;
     this.lastTs = 0;
     this.placementOkSince = 0;
     this.lastMilestone = 0;
@@ -120,6 +119,7 @@ export class SunCoachEngine {
     this._released = true;
     this.tracker.stop();
     this.tracker.stopCamera();
+    this.tracker.aiSegEnabled = false;
     if (silence) this.voice.stop();
     this.beeper.setPaintActivity('off');
     this.wakeLock?.release().catch(() => {});
@@ -154,9 +154,13 @@ export class SunCoachEngine {
     const frame = this._smoothTorso(P ? torsoFrame(P) : null);
 
     if (P) {
-      const skipSeg = this.state === 'tracing';
+      const skipSeg = this.state === 'locking';
       if (!skipSeg) {
-        if (track.segmentationMask) {
+        if (track.aiPersonMask) {
+          this.smoothMask = buildBackSilhouetteFromBytes(
+            track.aiPersonMask, P, W, H, this.smoothMask
+          );
+        } else if (track.segmentationMask) {
           this.smoothMask = buildBackSilhouette(track.segmentationMask, P, W, H, this.smoothMask);
         } else {
           this.smoothMask = buildFallbackSilhouette(P, W, H, this.smoothMask);
@@ -174,7 +178,7 @@ export class SunCoachEngine {
     this._drawMinimap(ts);
 
     if (this.state === 'placement') this._placementTick(P, ts, frame);
-    else if (this.state === 'tracing') this._tracingTick(P, track, frame, ts);
+    else if (this.state === 'locking') this._lockingTick(P, track, frame, ts, W, H);
     else if (this.state === 'coverage') {
       this._coverageTick(P, track, frame, ts, dt);
     }
@@ -298,16 +302,13 @@ export class SunCoachEngine {
 
     this.onHud(0, `CALIBRAGE BIENTÔT… DIST. ${formatDistance(distM)}`);
     if (!this.placementOkSince) this.placementOkSince = ts;
-    if (ts - this.placementOkSince > 1500) this._startTracing(frame);
+    if (ts - this.placementOkSince > 1500) this._startLocking(frame);
   }
 
-  _startTracing(frame) {
+  _startLocking(frame) {
     this._finalizeCalibration();
-    this.state = 'tracing';
-    this.contourTracer = new ContourTracer();
-    this.traceReadySince = 0;
-    this.lastTraceVoiceTs = 0;
-    this.lastTraceMilestone = 0;
+    this.state = 'locking';
+    this.lockStartedAt = performance.now();
     this.calibrationFrame = frame ? {
       origin: { ...frame.origin },
       ex: { ...frame.ex },
@@ -315,78 +316,92 @@ export class SunCoachEngine {
       width: frame.width,
       height: frame.height,
     } : null;
-    this.onHud(0, 'TOUR DU DOS — FROTTE LE CONTOUR');
+    const W = this.overlay.width;
+    const H = this.overlay.height;
+    this.maskLock = new MaskLockAccumulator(W, H);
+    this.tracker.aiSegEnabled = true;
+    this.onHud(0, 'SCAN IA DU DOS… RESTE IMMOBILE');
     this.voice.say(
-      'On va cartographier ton dos. Frotte tout le contour avec tes mains, ' +
-        'comme si tu faisais deux ou trois tours complets. Nuque, côtés, reins, bas. ' +
-        'Quand ça cliquette, je capte ta main.',
+      'Parfait. Reste immobile deux secondes, je scanne ton dos avec l’intelligence artificielle.',
       { interrupt: true },
     );
   }
 
-  _tracingTick(P, track, frame, ts) {
-    const W = this.overlay.width;
-    const H = this.overlay.height;
-    const calFrame = this.calibrationFrame || frame;
-    const tracer = this.contourTracer;
+  _holisticMaskBytes(mask, P, W, H) {
+    if (!mask) return null;
+    let raw;
+    try {
+      raw = mask.getAsFloat32Array();
+    } catch {
+      return null;
+    }
+    const mw = mask.width;
+    const mh = mask.height;
+    const out = new Uint8ClampedArray(W * H);
+    for (let y = 0; y < H; y++) {
+      const sy = Math.min(mh - 1, Math.round((y / H) * mh));
+      for (let x = 0; x < W; x++) {
+        const sx = Math.min(mw - 1, Math.round((x / W) * mw));
+        out[y * W + x] = raw[sy * mw + sx] > 0.28 ? 255 : 0;
+      }
+    }
+    return out;
+  }
 
-    if (!P || !calFrame || !tracer) {
-      this.beeper.setPaintActivity('off');
-      this.onHud(0, 'TOUR DU DOS… RESTE DANS LE CADRE');
+  _lockingTick(P, track, frame, ts, W, H) {
+    const calFrame = this.calibrationFrame || frame;
+    const lock = this.maskLock;
+
+    if (!P || !calFrame || !lock) {
+      this.onHud(0, 'SCAN IA… RESTE DANS LE CADRE');
       return;
     }
 
-    const contacts = collectTraceContacts(track, P, calFrame, W, H);
-    let added = 0;
-    for (const uv of contacts) {
-      if (tracer.addSample(uv.u, uv.v)) added++;
-    }
+    const bytes = track.aiPersonMask
+      ?? this._holisticMaskBytes(track.segmentationMask, P, W, H);
+    if (bytes) lock.push(bytes);
 
-    if (added > 0) {
-      this.beeper.setPaintActivity('new');
-      this.lastPaintTs.new = ts;
-    } else {
-      this.beeper.setPaintActivity('off');
-    }
-    this.beeper.tick(ts);
+    const pct = Math.min(100, Math.round((lock.count / LOCK_FRAMES) * 100));
+    this.onHud(lock.count / LOCK_FRAMES, `SCAN IA ${pct} %`);
 
-    const pct = Math.round(tracer.coverage * 100);
-    this.onHud(tracer.coverage, `TOUR DU DOS ${pct} %`);
-
-    const milestone = Math.floor(tracer.coverage * 4) / 4;
-    if (milestone > this.lastTraceMilestone && milestone >= 0.25) {
-      this.lastTraceMilestone = milestone;
+    const timedOut = performance.now() - this.lockStartedAt > 8000;
+    if (lock.count >= LOCK_FRAMES || (timedOut && lock.count >= 8)) {
+      this._finalizeLock(calFrame, P, W, H);
+    } else if (timedOut) {
       this.voice.say(
-        `Bien, environ ${Math.round(milestone * 100)} pour cent du contour est cartographié.`,
-        { queue: true },
+        'Je n’arrive pas à bien te voir. Vérifie la lumière et reste dos à la caméra.',
+        { id: 'lock:fail', cooldown: 6000 },
       );
+      this.lockStartedAt = performance.now();
     }
+  }
 
-    if (ts - this.lastTraceVoiceTs > 14000 && tracer.coverage < 0.85) {
-      const gap = tracer.biggestGap();
-      if (gap) {
-        this.lastTraceVoiceTs = ts;
-        this.voice.say(traceGapVoice(gap), { id: 'trace:gap', cooldown: 14000, queue: true });
-      }
-    }
+  _finalizeLock(calFrame, P, W, H) {
+    this.tracker.aiSegEnabled = false;
+    const lock = this.maskLock;
+    const averaged = lock?.getAveraged() ?? null;
+    const contour = averaged
+      ? lock.extractContour(calFrame, averaged)
+      : null;
 
-    const ready = tracer.isReady();
-    if (ready) {
-      if (!this.traceReadySince) this.traceReadySince = ts;
-    } else {
-      this.traceReadySince = 0;
-    }
-
-    const forceDone = tracer.elapsedSec > 55 && tracer.coverage >= 0.45;
-    if ((this.traceReadySince && ts - this.traceReadySince > 1800) || forceDone) {
-      const contour = tracer.getSmoothedContour();
+    if (contour) {
       setTracedContour(contour);
+      this.smoothMask = buildBackSilhouetteFromBytes(averaged, P, W, H, null);
+      this.backContour = traceBackContour(this.smoothMask, W, H);
       this.voice.say(
-        'Parfait, j’ai le contour de ton dos. Mets de la crème dans tes mains, c’est parti !',
+        'J’ai capturé la forme de ton dos. Mets de la crème dans tes mains, c’est parti !',
         { interrupt: true },
       );
-      this._startCoverage();
+    } else {
+      this.smoothMask = buildFallbackSilhouette(P, W, H, null);
+      this.backContour = traceBackContour(this.smoothMask, W, H);
+      this.voice.say(
+        'Scan partiel, mais on peut commencer. Mets de la crème dans tes mains !',
+        { interrupt: true },
+      );
     }
+    this.maskLock = null;
+    this._startCoverage();
   }
 
   _startCoverage() {
@@ -689,30 +704,12 @@ export class SunCoachEngine {
     c.textAlign = 'right';
     c.fillText('D', W - pad - 2, headH + 10);
 
-    if (this.state === 'tracing' && this.contourTracer) {
-      const partial = this.contourTracer.getSmoothedContour();
-      if (partial.outline.length >= 4) {
-        c.save();
-        c.strokeStyle = 'rgba(0, 255, 120, 0.9)';
-        c.lineWidth = 2;
-        c.setLineDash([3, 3]);
-        c.beginPath();
-        partial.outline.forEach((p, i) => {
-          const x = toX(p.u);
-          const y = toY(p.v);
-          if (i === 0) c.moveTo(x, y);
-          else c.lineTo(x, y);
-        });
-        c.closePath();
-        c.stroke();
-        c.setLineDash([]);
-        c.restore();
-      }
-      const pct = Math.round(this.contourTracer.coverage * 100);
+    if (this.state === 'locking' && this.maskLock) {
+      const pct = Math.round((this.maskLock.count / LOCK_FRAMES) * 100);
       c.font = 'bold 16px Fira Code, monospace';
       c.textAlign = 'center';
       c.fillStyle = '#00FF00';
-      c.fillText(pct + '%', cx, H - 6);
+      c.fillText('SCAN ' + pct + '%', cx, H - 6);
     }
 
     if (this.state === 'coverage') {
@@ -744,19 +741,14 @@ export class SunCoachEngine {
     const ctx = this.ctx;
     ctx.clearRect(0, 0, W, H);
 
-    if (this.state === 'tracing') {
-      if (P) {
-        for (const idx of [LM.L_WRIST, LM.R_WRIST]) {
-          const p = P[idx];
-          if (p.visibility < 0.35) continue;
-          ctx.beginPath();
-          ctx.arc(p.x, p.y, 12, 0, Math.PI * 2);
-          ctx.fillStyle = 'rgba(0, 255, 255, 0.35)';
-          ctx.fill();
-          ctx.strokeStyle = '#00FFFF';
-          ctx.lineWidth = 2;
-          ctx.stroke();
-        }
+    if (this.state === 'locking') {
+      if (this.smoothMask) {
+        drawBackSegmentationOverlay(ctx, this.smoothMask, W, H, {
+          contour: this.backContour,
+          grid: null,
+          frame: this.calibrationFrame || frame,
+          showCoverage: false,
+        });
       }
       return;
     }

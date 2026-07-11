@@ -3,6 +3,7 @@
  * + masque de segmentation léger pour ajuster la morphologie du dos.
  */
 import { FilesetResolver, HolisticLandmarker } from '@mediapipe/tasks-vision';
+import { BodySegmenter } from './bodySegmenter.js';
 
 export const LM = {
   NOSE: 0,
@@ -55,6 +56,8 @@ export function preloadPose() {
   }
   return landmarkerPromise;
 }
+
+export { preloadBodySegmenter } from './bodySegmenter.js';
 
 function lmScore(p) {
   return p.visibility ?? p.presence ?? 0;
@@ -133,6 +136,8 @@ export class PoseTracker {
   constructor(video) {
     this.video = video;
     this.landmarker = null;
+    this.bodySegmenter = new BodySegmenter();
+    this.aiSegEnabled = false;
     this.stream = null;
     this.facing = 'user';
     this.smoothed = null;
@@ -147,6 +152,7 @@ export class PoseTracker {
     } catch {
       this.landmarker = await preloadPose();
     }
+    await this.bodySegmenter.init();
   }
 
   async startCamera(facing = this.facing) {
@@ -207,6 +213,11 @@ export class PoseTracker {
       const raw = result.poseLandmarks?.[0];
       const world = result.poseWorldLandmarks?.[0];
       const mask = result.poseSegmentationMasks?.[0] ?? null;
+      const W = this.video.videoWidth;
+      const H = this.video.videoHeight;
+      const aiPersonMask = this.aiSegEnabled
+        ? this.bodySegmenter.segmentPersonMask(this.video, ts, W, H)
+        : null;
 
       onFrame(
         {
@@ -217,6 +228,7 @@ export class PoseTracker {
           leftHand2D: result.leftHandLandmarks?.[0] ?? null,
           rightHand2D: result.rightHandLandmarks?.[0] ?? null,
           segmentationMask: mask,
+          aiPersonMask,
         },
         ts
       );

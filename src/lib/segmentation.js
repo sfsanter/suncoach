@@ -105,6 +105,30 @@ export function buildBackSilhouette(mask, P, W, H, prev = null) {
   return out;
 }
 
+/** Masque IA (Uint8ClampedArray W×H) → silhouette dorsale lissée. */
+export function buildBackSilhouetteFromBytes(bytes, P, W, H, prev = null) {
+  if (!P || !bytes || bytes.length !== W * H) return prev;
+
+  const n = W * H;
+  const out = prev && prev.length === n ? prev : new Uint8ClampedArray(n);
+  let hits = 0;
+
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      let v = bytes[i] > 128 && inTorsoClip(x, y, P) ? 255 : 0;
+      if (v) hits++;
+      if (prev) v = Math.round(prev[i] * (1 - BLEND) + v * BLEND);
+      out[i] = v;
+    }
+  }
+
+  if (hits < n * 0.002) {
+    return buildFallbackSilhouette(P, W, H, out);
+  }
+  return out;
+}
+
 function isEdge(alpha, W, H, x, y, t = 80) {
   const i = y * W + x;
   if (alpha[i] < t) return false;
