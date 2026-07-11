@@ -86,8 +86,8 @@ function HomeScreen({ error, onStart }) {
         )}
 
         <EmergencyBanner
-          text="VERSION LIVE — POINTS + MINIMAP"
-          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · pixels photo · schéma depuis tes 8 points'}
+          text="SUNCOACH · MINIMAP PROPORTIONS V2"
+          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · schéma = tes 8 points · reposition approx · poignées 28px'}
           severity="info"
           visible
         />
@@ -115,7 +115,7 @@ function HomeScreen({ error, onStart }) {
         >
           100 % LOCAL — LA VIDÉO NE QUITTE JAMAIS TON APPAREIL
           <br />
-          BUILD {typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?'} — MODE LIBRE
+          BUILD {typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?'} — MINIMAP PROPORTIONS V2
         </p>
       </div>
     </div>
@@ -393,12 +393,17 @@ function SessionScreen({ onAbort, onError, onDone }) {
 
         {phase !== 'adjusting' && (
         <div className="pointer-events-none absolute bottom-3 right-3 flex flex-col items-center gap-1">
-          <canvas ref={minimapRef} width={220} height={300} />
+          <canvas
+            ref={minimapRef}
+            width={220}
+            height={300}
+            style={{ width: 110, height: 150, display: 'block' }}
+          />
           <span
             className="text-[10px] tracking-[0.25em] text-nerv-green/80"
             style={{ fontFamily: 'var(--font-nerv-mono)' }}
           >
-            SCHÉMA DOS
+            SCHÉMA DOS · {typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?'}
           </span>
         </div>
         )}
