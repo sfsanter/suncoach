@@ -2,7 +2,7 @@
  * Segmentation MediaPipe → silhouette dorsale live + couverture lissée (sans grille).
  */
 import { LM } from './pose.js';
-import { backHalfWidth, nearBackShape, toBack } from './coverage.js';
+import { backHalfWidth, nearBackShape, toBack, coverageHeatRGBA } from './coverage.js';
 
 const MASK_THRESH = 0.28;
 const BLEND = 0.38;
@@ -151,12 +151,6 @@ export function pathFromContour(contour) {
   return path;
 }
 
-function heatColor(f) {
-  if (f >= 0.95) return [0, 255, 80, Math.round(140 + f * 80)];
-  if (f > 0.08) return [255, Math.round(80 + f * 120), 0, Math.round(90 + f * 100)];
-  return [255, 40, 40, Math.round(50 + (1 - f) * 40)];
-}
-
 /**
  * Peint la couverture pixel par pixel sur la silhouette (pas de grille 36×48 upscalée).
  */
@@ -173,7 +167,7 @@ function paintCoverageOnSilhouette(ctx, alpha, W, H, grid, frame) {
       const { u, v } = toBack({ x, y }, frame);
       if (!nearBackShape(u, v, 0.08)) continue;
       const f = grid.sample(u, v);
-      const [r, g, b, a] = heatColor(f);
+      const [r, g, b, a] = coverageHeatRGBA(f);
       for (let dy = 0; dy < step && y + dy < H; dy++) {
         for (let dx = 0; dx < step && x + dx < W; dx++) {
           const j = (y + dy) * W + (x + dx);
@@ -209,10 +203,10 @@ export function drawBackSegmentationOverlay(ctx, alpha, W, H, { contour, grid, f
     for (let i = 0; i < W * H; i++) {
       if (alpha[i] < 70) continue;
       const o = i * 4;
-      d[o] = 0;
-      d[o + 1] = 255;
-      d[o + 2] = 100;
-      d[o + 3] = 35;
+      d[o] = 255;
+      d[o + 1] = 120;
+      d[o + 2] = 35;
+      d[o + 3] = 50;
     }
     ctx.save();
     ctx.clip(path);

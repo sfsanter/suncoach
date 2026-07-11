@@ -124,6 +124,26 @@ export function mapBackUV(u, v) {
   return { u: 1 - u, v: 1 - v };
 }
 
+/**
+ * Heatmap inversée : au départ tout le dos est orange (peu opaque) ;
+ * plus on frotte (f → 1), plus le pixel passe au vert.
+ * @param {number} f fraction de couverture 0–1
+ * @returns {[number, number, number, number]} rgba
+ */
+export function coverageHeatRGBA(f) {
+  if (f >= 0.95) return [0, 230, 60, 235];
+  if (f > 0.06) {
+    const t = (f - 0.06) / 0.89;
+    return [
+      Math.round(255 * (1 - t)),
+      Math.round(130 + t * 100),
+      Math.round(35 * (1 - t) + 60 * t),
+      Math.round(60 + t * 140),
+    ];
+  }
+  return [255, 120, 35, 58];
+}
+
 export function mapBackPoint(p, f) {
   return toBack(p, f);
 }

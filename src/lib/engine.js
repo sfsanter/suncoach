@@ -6,7 +6,7 @@ import { Voice, Beeper } from './voice.js';
 import { PoseTracker, LM, isBackTurned, OneEuro, BackOrientation, contactPointsFromHand, palmFromHand } from './pose.js';
 import {
   CoverageGrid, torsoFrame, zoneName, backHalfWidth,
-  toBack, nearBackShape, setShapeScale,
+  toBack, nearBackShape, coverageHeatRGBA,
   HEAT_W, HEAT_H, ZONE_COUNT, ANATOMICAL_ZONES,
 } from './coverage.js';
 import {
@@ -481,16 +481,8 @@ export class SunCoachEngine {
         px[o + 3] = 0;
         continue;
       }
-      const f = this.grid.pixelFraction(i);
-      if (f >= 0.95) {
-        px[o] = 0; px[o + 1] = 230; px[o + 2] = 60; px[o + 3] = 255;
-      } else if (f > 0.06) {
-        px[o] = 255; px[o + 1] = Math.round(70 + f * 130); px[o + 2] = 0;
-        px[o + 3] = 230;
-      } else {
-        px[o] = 255; px[o + 1] = 35; px[o + 2] = 35;
-        px[o + 3] = 220;
-      }
+      const [r, g, b, a] = coverageHeatRGBA(this.grid.pixelFraction(i));
+      px[o] = r; px[o + 1] = g; px[o + 2] = b; px[o + 3] = a;
     }
     this.miniCtx.putImageData(this.miniImage, 0, 0);
   }
