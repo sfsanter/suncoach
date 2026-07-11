@@ -4,6 +4,7 @@
  */
 import { LM } from './pose.js';
 import { ANATOMICAL_ZONES, ZONE_COUNT } from './zones.js';
+import { buildCanonicalShape, canonicalToBackUv, backUvToCanonical } from './anchorShape.js';
 
 export { ANATOMICAL_ZONES, ZONE_COUNT };
 export const ROWS = 4;
@@ -25,6 +26,7 @@ let shapeScale = 1.0;
 let bodyMask = new Uint8Array(HEAT_W * HEAT_H);
 /** @type {Record<string, {u:number,v:number}>|null} */
 let customAnchors = null;
+let canonicalShape = null;
 /** @type {{ left: Float32Array, right: Float32Array, valid: Uint8Array, vTop: number, vBot: number, outline: {u,v}[] }|null} */
 let tracedContour = null;
 
@@ -111,17 +113,28 @@ function boundaryAt(v, side) {
   return pts[pts.length - 1].u;
 }
 
-/** Contour UV pour la minimap. */
+/** Contour minimap : uniquement les 8 points manuels (espace canonique 0–1). */
 export function customBackOutlineUV() {
-  if (tracedContour?.outline?.length >= 4) return tracedContour.outline;
+  if (canonicalShape?.outline?.length >= 4) {
+    return canonicalShape.outline.map((p) => ({ u: p.u, v: p.v }));
+  }
   if (!customAnchors) return null;
   const order = ['nuque', 'epaule_g', 'milieu_g', 'rein_g', 'bas', 'rein_d', 'milieu_d', 'epaule_d'];
   const pts = order.map((id) => customAnchors[id]).filter(Boolean);
   return pts.length >= 4 ? pts : null;
 }
 
+export function getCanonicalShape() {
+  return canonicalShape;
+}
+
+export function toCanonicalUV(u, v) {
+  return canonicalShape ? backUvToCanonical(u, v, canonicalShape) : { u, v };
+}
+
 export function setCustomBackAnchors(anchors) {
   customAnchors = anchors ? { ...anchors } : null;
+  canonicalShape = anchors ? buildCanonicalShape(anchors) : null;
   if (anchors) tracedContour = null;
   rebuildBodyMask();
 }
@@ -152,7 +165,14 @@ function rebuildBodyMask() {
   for (let y = 0; y < HEAT_H; y++) {
     for (let x = 0; x < HEAT_W; x++) {
       const i = y * HEAT_W + x;
-      bodyMask[i] = insideBackShape((x + 0.5) / HEAT_W, (y + 0.5) / HEAT_H) ? 1 : 0;
+      const uc = (x + 0.5) / HEAT_W;
+      const vc = (y + 0.5) / HEAT_H;
+      if (canonicalShape && customAnchors) {
+        const { u, v } = canonicalToBackUv(uc, vc, canonicalShape);
+        bodyMask[i] = insideBackShape(u, v) ? 1 : 0;
+      } else {
+        bodyMask[i] = insideBackShape(uc, vc) ? 1 : 0;
+      }
     }
   }
 }
@@ -328,6 +348,7 @@ export class CoverageGrid {
     setShapeScale(1.0);
     setCustomBackAnchors(null);
     setTracedContour(null);
+    canonicalShape = null;
   }
 
   isBody(i) {
@@ -338,11 +359,18 @@ export class CoverageGrid {
     return Math.min(1, this.heat[i] / PIXEL_NEED);
   }
 
-  /** Interpolation bilinéaire de la couverture en (u, v). */
+  /** Interpolation bilinéaire — entrée en repère dos, stockage canonique si 8 points. */
   sample(u, v) {
-    if (u < 0 || u > 1 || v < 0 || v > 1) return 0;
-    const x = u * (HEAT_W - 1);
-    const y = v * (HEAT_H - 1);
+    let qu = u;
+    let qv = v;
+    if (canonicalShape && customAnchors) {
+      const c = backUvToCanonical(u, v, canonicalShape);
+      qu = c.u;
+      qv = c.v;
+    }
+    if (qu < 0 || qu > 1 || qv < 0 || qv > 1) return 0;
+    const x = qu * (HEAT_W - 1);
+    const y = qv * (HEAT_H - 1);
     const x0 = Math.floor(x), y0 = Math.floor(y);
     const x1 = Math.min(HEAT_W - 1, x0 + 1);
     const y1 = Math.min(HEAT_H - 1, y0 + 1);
@@ -377,19 +405,26 @@ export class CoverageGrid {
     const reach = 3 * SIGMA;
     let added = 0, crossed = 0;
     for (const h of hands) {
-      if (h.u < -0.08 || h.u > 1.08 || h.v < -0.08 || h.v > 1.08) continue;
-      const x0 = Math.max(0, Math.floor((h.u - reach) * HEAT_W));
-      const x1 = Math.min(HEAT_W - 1, Math.ceil((h.u + reach) * HEAT_W));
-      const y0 = Math.max(0, Math.floor((h.v - reach) * HEAT_H));
-      const y1 = Math.min(HEAT_H - 1, Math.ceil((h.v + reach) * HEAT_H));
+      let hu = h.u;
+      let hv = h.v;
+      if (canonicalShape && customAnchors) {
+        const c = backUvToCanonical(hu, hv, canonicalShape);
+        hu = c.u;
+        hv = c.v;
+      }
+      if (hu < -0.08 || hu > 1.08 || hv < -0.08 || hv > 1.08) continue;
+      const x0 = Math.max(0, Math.floor((hu - reach) * HEAT_W));
+      const x1 = Math.min(HEAT_W - 1, Math.ceil((hu + reach) * HEAT_W));
+      const y0 = Math.max(0, Math.floor((hv - reach) * HEAT_H));
+      const y1 = Math.min(HEAT_H - 1, Math.ceil((hv + reach) * HEAT_H));
       for (let y = y0; y <= y1; y++) {
         const pv = (y + 0.5) / HEAT_H;
         for (let x = x0; x <= x1; x++) {
           const i = y * HEAT_W + x;
           if (bodyMask[i] === 0) continue;
           const pu = (x + 0.5) / HEAT_W;
-          const du = pu - h.u;
-          const dv = pv - h.v;
+          const du = pu - hu;
+          const dv = pv - hv;
           const wgt = Math.exp(-(du * du + dv * dv) / (2 * SIGMA * SIGMA));
           if (wgt <= 0.03) continue;
           const before = this.heat[i];

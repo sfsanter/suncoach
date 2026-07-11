@@ -7,7 +7,7 @@ import { PoseTracker, LM, isBackTurned, OneEuro, BackOrientation, contactPointsF
 import {
   CoverageGrid, torsoFrame, zoneName, backHalfWidth,
   toBack, nearBackShape, coverageHeatRGBA, setShapeScale,
-  setTracedContour, customBackOutlineUV, setCustomBackAnchors, getTracedContour,
+  setTracedContour, customBackOutlineUV, setCustomBackAnchors, getTracedContour, toCanonicalUV,
   HEAT_W, HEAT_H, ZONE_COUNT, ANATOMICAL_ZONES, MIN_COVERAGE_SEC,
 } from './coverage.js';
 import {
@@ -18,8 +18,10 @@ import { MaskLockAccumulator, LOCK_FRAMES } from './maskLock.js';
 import { warpToLocked, cloneFrame } from './backTemplate.js';
 import { credibleBackHand, crediblePoseWrist, elbowBackContact, handContactPixels, ContactVelocityGate } from './handGate.js';
 import {
-  CALIBRATION_STEPS, ghostAnchorsFromContour, anchorAssistedContacts,
-} from './backCalibration.js';
+  defaultAnchorsPx, pixelsToBackAnchors,
+  capturePoseSignature, comparePoseSignature,
+} from './anchorShape.js';
+import { CALIBRATION_STEPS, anchorAssistedContacts } from './backCalibration.js';
 import {
   buildBackSilhouette, buildFallbackSilhouette, buildBackSilhouetteFromBytes,
   traceBackContour, drawBackSegmentationOverlay,
@@ -93,7 +95,9 @@ export class SunCoachEngine {
     this.lockStartedAt = 0;
     this.calibrationAnchors = {};
     this.calibrationGhost = null;
-    this.draftAnchors = null;
+    this.draftAnchorsPx = null;
+    this.frozenPoseP = null;
+    this.lockedPoseSignature = null;
     this.snapshotDataUrl = null;
     this.snapshotW = 0;
     this.snapshotH = 0;
@@ -414,9 +418,11 @@ export class SunCoachEngine {
     this.lockedShoulderW = Math.hypot(rs.x - ls.x, rs.y - ls.y);
     this.lockedMid = { x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2 };
 
-    this.calibrationGhost = ghostAnchorsFromContour(contour ?? getTracedContour());
+    this.frozenPoseP = P.map((p) => ({ x: p.x, y: p.y, visibility: p.visibility }));
+    this.lockedPoseSignature = capturePoseSignature(P, calFrame);
+
     this.maskLock = null;
-    this._startAdjusting();
+    this._startAdjusting(P, W, H);
   }
 
   _captureSnapshot() {
@@ -434,25 +440,26 @@ export class SunCoachEngine {
   getAdjustmentPayload() {
     return {
       imageUrl: this.snapshotDataUrl,
-      anchors: { ...this.draftAnchors },
+      anchorsPx: { ...this.draftAnchorsPx },
       videoW: this.snapshotW,
       videoH: this.snapshotH,
-      frame: this.calibrationFrame,
     };
   }
 
-  setDraftAnchor(id, u, v) {
-    if (this.state !== 'adjusting' || !this.draftAnchors) return;
-    this.draftAnchors[id] = {
-      u: Math.max(0.02, Math.min(0.98, u)),
-      v: Math.max(0.02, Math.min(0.98, v)),
+  setDraftAnchorPx(id, x, y) {
+    if (this.state !== 'adjusting' || !this.draftAnchorsPx) return;
+    const W = this.snapshotW;
+    const H = this.snapshotH;
+    this.draftAnchorsPx[id] = {
+      x: Math.max(8, Math.min(W - 8, x)),
+      y: Math.max(8, Math.min(H - 8, y)),
     };
-    this.onPhase('adjusting', this.getAdjustmentPayload());
   }
 
   confirmAdjustment() {
-    if (this.state !== 'adjusting' || !this.draftAnchors) return;
-    this.calibrationAnchors = { ...this.draftAnchors };
+    if (this.state !== 'adjusting' || !this.draftAnchorsPx || !this.calibrationFrame) return;
+    this.calibrationAnchors = pixelsToBackAnchors(this.draftAnchorsPx, this.calibrationFrame);
+    setTracedContour(null);
     setCustomBackAnchors(this.calibrationAnchors);
     this.voice.say(calibrationVoice('done'), { interrupt: true });
     this._startReposition();
@@ -463,10 +470,12 @@ export class SunCoachEngine {
     this.onPhase(this.state, data);
   }
 
-  _startAdjusting() {
+  _startAdjusting(P, W, H) {
     this._captureSnapshot();
     this.state = 'adjusting';
-    this.draftAnchors = { ...this.calibrationGhost };
+    this.draftAnchorsPx = defaultAnchorsPx(P, W, H)
+      ?? defaultAnchorsPx(this.frozenPoseP, W, H)
+      ?? {};
     this.calibrationAnchors = {};
     this.onHud(0, 'AJUSTE LES 8 POINTS SUR TA PHOTO');
     this.voice.say(calibrationVoice('adjust_intro'), { interrupt: true });
@@ -489,7 +498,7 @@ export class SunCoachEngine {
       this.voice.say(msg, { id, cooldown: 7000 });
     };
 
-    if (!P || !locked || !this.lockedMid) {
+    if (!P || !locked || !this.lockedPoseSignature) {
       return fail(
         'Je ne te vois pas. Replace-toi dos à la caméra.',
         'repo:novis', 'REPOSITION…'
@@ -504,25 +513,18 @@ export class SunCoachEngine {
       return fail(calibrationVoice('reposition_turn'), 'repo:turn', 'TOURNE-TOI');
     }
 
-    const shoulderW = Math.hypot(rs.x - ls.x, rs.y - ls.y);
-    const ratio = shoulderW / (this.lockedShoulderW || shoulderW);
-    if (ratio < 0.82) {
-      return fail(calibrationVoice('reposition_far'), 'repo:far', 'TROP LOIN');
-    }
-    if (ratio > 1.22) {
-      return fail(calibrationVoice('reposition_close'), 'repo:close', 'TROP PRÈS');
+    const frame = torsoFrame(P);
+    const liveSig = capturePoseSignature(P, frame ?? locked);
+    const cmp = comparePoseSignature(liveSig, this.lockedPoseSignature);
+
+    if (!cmp.ok) {
+      const msg = calibrationVoice(cmp.hint) || calibrationVoice('reposition_shift');
+      return fail(msg, 'repo:' + cmp.hint, cmp.status);
     }
 
-    const midX = (ls.x + rs.x) / 2;
-    const midY = (ls.y + rs.y) / 2;
-    const drift = Math.hypot(midX - this.lockedMid.x, midY - this.lockedMid.y);
-    if (drift > this.lockedShoulderW * 0.14) {
-      return fail(calibrationVoice('reposition_shift'), 'repo:shift', 'DÉCALE-TOI');
-    }
-
-    this.onHud(0, 'POSITION OK…');
+    this.onHud(cmp.pct ?? 0, cmp.status);
     if (!this.repositionOkSince) this.repositionOkSince = ts;
-    if (ts - this.repositionOkSince > 1800) {
+    if (ts - this.repositionOkSince > 2000) {
       this.voice.say(calibrationVoice('reposition_ok'), { interrupt: true });
       this._startCoverage();
     }
@@ -731,7 +733,8 @@ export class SunCoachEngine {
     for (const h of painting) {
       if (ts - this.lastPathTs[h.name] > 80) {
         this.lastPathTs[h.name] = ts;
-        this.paths[h.name].push({ u: h.u, v: h.v });
+        const cuv = toCanonicalUV(h.u, h.v);
+        this.paths[h.name].push({ u: cuv.u, v: cuv.v });
       }
     }
 

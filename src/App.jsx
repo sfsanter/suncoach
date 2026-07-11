@@ -9,7 +9,7 @@ import {
   TerminalDisplay,
 } from '@mdrbx/nerv-ui';
 import { SunCoachEngine, ZONE_COUNT, ANATOMICAL_ZONES } from './lib/engine.js';
-import { backHalfWidth, backToPx, toBack } from './lib/coverage.js';
+import { backHalfWidth } from './lib/coverage.js';
 import { CALIBRATION_STEPS, ANCHOR_ORDER } from './lib/backCalibration.js';
 import { strokeZoneOutline } from './lib/zones.js';
 import { preloadPose, preloadBodySegmenter } from './lib/pose.js';
@@ -86,8 +86,8 @@ function HomeScreen({ error, onStart }) {
         )}
 
         <EmergencyBanner
-          text="VERSION LIVE — SCAN + 8 POINTS"
-          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · Photo figée · ajuste les points au doigt'}
+          text="VERSION LIVE — POINTS + MINIMAP"
+          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · pixels photo · schéma depuis tes 8 points'}
           severity="info"
           visible
         />
@@ -122,7 +122,7 @@ function HomeScreen({ error, onStart }) {
   );
 }
 
-// ---------------------------------------------------------------- ajustement points sur photo
+// ---------------------------------------------------------------- ajustement points sur photo (pixels image, pas UV)
 
 function useImageFit(imgRef, boxRef) {
   const [fit, setFit] = useState(null);
@@ -138,66 +138,83 @@ function useImageFit(imgRef, boxRef) {
   };
   useEffect(() => {
     update();
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(update) : null;
+    if (ro && boxRef.current) ro.observe(boxRef.current);
     window.addEventListener('resize', update);
-    return () => window.removeEventListener('resize', update);
+    return () => {
+      ro?.disconnect();
+      window.removeEventListener('resize', update);
+    };
   }, []);
   return { fit, refresh: update };
+}
+
+function clientToImagePx(clientX, clientY, imgEl, videoW, videoH) {
+  const rect = imgEl.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  return {
+    x: ((clientX - rect.left) / rect.width) * videoW,
+    y: ((clientY - rect.top) / rect.height) * videoH,
+  };
 }
 
 function PointAdjustScreen({ payload, engine }) {
   const imgRef = useRef(null);
   const boxRef = useRef(null);
   const { fit, refresh } = useImageFit(imgRef, boxRef);
-  const [anchors, setAnchors] = useState(payload.anchors);
-  const dragRef = useRef(null);
+  const [anchorsPx, setAnchorsPx] = useState(payload.anchorsPx ?? {});
+  const dragIdRef = useRef(null);
 
   useEffect(() => {
-    setAnchors(payload.anchors);
-  }, [payload]);
+    setAnchorsPx(payload.anchorsPx ?? {});
+  }, [payload.imageUrl]);
 
   const labelFor = (id) => CALIBRATION_STEPS.find((s) => s.id === id)?.label ?? id;
 
-  const pctPos = (id) => {
-    const a = anchors[id];
-    if (!a || !payload.frame) return { left: 50, top: 50 };
-    const px = backToPx(a.u, a.v, payload.frame);
+  const pct = (id) => {
+    const p = anchorsPx[id];
+    if (!p) return { left: 50, top: 50 };
     return {
-      left: (px.x / payload.videoW) * 100,
-      top: (px.y / payload.videoH) * 100,
+      left: (p.x / payload.videoW) * 100,
+      top: (p.y / payload.videoH) * 100,
     };
   };
 
-  const linePoints = ANCHOR_ORDER
-    .map((id) => {
-      const p = pctPos(id);
-      return `${p.left},${p.top}`;
-    })
-    .join(' ');
+  const linePoints = ANCHOR_ORDER.map((id) => {
+    const p = pct(id);
+    return `${p.left},${p.top}`;
+  }).join(' ');
 
-  const onPointerDown = (id, e) => {
+  useEffect(() => {
+    const onMove = (e) => {
+      const id = dragIdRef.current;
+      const img = imgRef.current;
+      if (!id || !img) return;
+      const pt = clientToImagePx(e.clientX, e.clientY, img, payload.videoW, payload.videoH);
+      if (!pt) return;
+      engine.setDraftAnchorPx(id, pt.x, pt.y);
+      setAnchorsPx((prev) => ({
+        ...prev,
+        [id]: {
+          x: Math.max(8, Math.min(payload.videoW - 8, pt.x)),
+          y: Math.max(8, Math.min(payload.videoH - 8, pt.y)),
+        },
+      }));
+    };
+    const onUp = () => { dragIdRef.current = null; };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+  }, [engine, payload.videoW, payload.videoH]);
+
+  const startDrag = (id, e) => {
     e.preventDefault();
-    dragRef.current = id;
-    e.currentTarget.setPointerCapture(e.pointerId);
-  };
-
-  const onPointerMove = (e) => {
-    const id = dragRef.current;
-    const img = imgRef.current;
-    const box = boxRef.current;
-    if (!id || !img || !box || !fit) return;
-    const boxRect = box.getBoundingClientRect();
-    const left = boxRect.left + (boxRect.width - fit.w) / 2;
-    const top = boxRect.top + (boxRect.height - fit.h) / 2;
-    const x = ((e.clientX - left) / fit.w) * payload.videoW;
-    const y = ((e.clientY - top) / fit.h) * payload.videoH;
-    if (x < 0 || y < 0 || x > payload.videoW || y > payload.videoH) return;
-    const uv = toBack({ x, y, visibility: 1 }, payload.frame);
-    engine.setDraftAnchor(id, uv.u, uv.v);
-    setAnchors((prev) => ({ ...prev, [id]: { u: uv.u, v: uv.v } }));
-  };
-
-  const onPointerUp = () => {
-    dragRef.current = null;
+    dragIdRef.current = id;
   };
 
   return (
@@ -208,63 +225,59 @@ function PointAdjustScreen({ payload, engine }) {
       >
         <div className="text-sm font-bold tracking-[0.2em] text-nerv-orange">AJUSTE TON DOS</div>
         <div className="mt-1 text-xs text-nerv-green/80">
-          Glisse chaque point vert sur le contour · puis valide
+          Points sur épaules/nuque au départ · glisse sur le bord du dos
         </div>
       </div>
 
       <div ref={boxRef} className="relative flex flex-1 items-center justify-center overflow-hidden p-2">
-        <div className="relative" style={fit ? { width: fit.w, height: fit.h } : { maxWidth: '100%', maxHeight: '100%' }}>
+        <div
+          className="relative touch-none"
+          style={fit ? { width: fit.w, height: fit.h } : undefined}
+        >
           <img
             ref={imgRef}
             src={payload.imageUrl}
             alt="Photo de ton dos"
-            className="block max-h-full max-w-full select-none"
+            className="block h-full w-full select-none"
             draggable={false}
             onLoad={refresh}
           />
           {fit && (
             <>
-            <svg
-              className="pointer-events-none absolute inset-0 h-full w-full"
-              viewBox="0 0 100 100"
-              preserveAspectRatio="none"
-            >
-              <polyline
-                points={linePoints}
-                fill="none"
-                stroke="rgba(80,255,120,0.75)"
-                strokeWidth="0.4"
-                strokeDasharray="1.2 0.8"
-              />
-            </svg>
-            {ANCHOR_ORDER.map((id) => {
-              const pos = pctPos(id);
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  className="absolute z-10 flex -translate-x-1/2 -translate-y-1/2 touch-none flex-col items-center"
-                  style={{ left: `${pos.left}%`, top: `${pos.top}%` }}
-                  onPointerDown={(e) => onPointerDown(id, e)}
-                  onPointerMove={onPointerMove}
-                  onPointerUp={onPointerUp}
-                  onPointerCancel={onPointerUp}
-                >
-                  <span
-                    className="flex h-9 w-9 items-center justify-center rounded-full border-2 border-white bg-nerv-green/90 text-[9px] font-bold text-black shadow-lg"
-                    style={{ fontFamily: 'var(--font-nerv-mono)' }}
+              <svg
+                className="pointer-events-none absolute inset-0 h-full w-full"
+                viewBox="0 0 100 100"
+                preserveAspectRatio="none"
+              >
+                <polyline
+                  points={linePoints}
+                  fill="none"
+                  stroke="rgba(80,255,120,0.8)"
+                  strokeWidth="0.35"
+                  strokeDasharray="1.5 1"
+                />
+              </svg>
+              {ANCHOR_ORDER.map((id) => {
+                const pos = pct(id);
+                return (
+                  <div
+                    key={id}
+                    role="button"
+                    tabIndex={0}
+                    className="absolute z-10 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center"
+                    style={{ left: `${pos.left}%`, top: `${pos.top}%`, touchAction: 'none' }}
+                    onPointerDown={(e) => startDrag(id, e)}
                   >
-                    ●
-                  </span>
-                  <span
-                    className="mt-0.5 rounded bg-black/75 px-1.5 py-0.5 text-[8px] tracking-wider text-nerv-green"
-                    style={{ fontFamily: 'var(--font-nerv-mono)' }}
-                  >
-                    {labelFor(id)}
-                  </span>
-                </button>
-              );
-            })}
+                    <span className="flex h-12 w-12 items-center justify-center rounded-full border-[3px] border-white bg-nerv-green shadow-lg shadow-nerv-green/40" />
+                    <span
+                      className="mt-1 rounded bg-black/80 px-2 py-0.5 text-[9px] font-bold tracking-wider text-nerv-green"
+                      style={{ fontFamily: 'var(--font-nerv-mono)' }}
+                    >
+                      {labelFor(id)}
+                    </span>
+                  </div>
+                );
+              })}
             </>
           )}
         </div>

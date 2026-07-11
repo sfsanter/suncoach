@@ -61,12 +61,16 @@ const CALIBRATION_VOICES = {
   reposition_close: 'Tu es trop près. Recule un peu.',
   reposition_turn: 'Tourne-toi, dos à la caméra.',
   reposition_shift: 'Décale-toi pour retrouver la même position qu’au scan.',
+  reposition_left: 'Décale-toi un peu vers la droite.',
+  reposition_right: 'Décale-toi un peu vers la gauche.',
+  reposition_back: 'Recule légèrement.',
+  reposition_forward: 'Avance légèrement vers la caméra.',
   scan_done:
-    'Photo enregistrée. Tourne-toi vers l’écran : huit points sont déjà placés sur ton dos. ' +
-    'Glisse chaque point sur le bon endroit, puis valide.',
+    'Photo enregistrée. Tourne-toi vers l’écran : les points sont sur tes épaules. ' +
+    'Glisse-les sur le bord de ton dos, puis valide.',
   adjust_intro:
-    'Photo prise ! Tourne-toi vers l’écran. Glisse les huit points verts sur le contour de ton dos, ' +
-    'puis appuie sur valider.',
+    'Photo prise ! Les points verts sont sur tes épaules et ta nuque. ' +
+    'Glisse chaque point sur le contour de ton dos, puis valide.',
   no_gesture:
     'Je ne vois pas le bon geste. Écoute bien l’instruction et recommence.',
   nuque_hint:
