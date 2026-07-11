@@ -84,7 +84,7 @@ function HomeScreen({ error, onStart }) {
 
         <EmergencyBanner
           text="VERSION LIVE — CALIBRAGE GESTE"
-          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · Nuque main droite · détection pose · bips audio'}
+          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · Points verts minimap · pause 6s entre étapes'}
           severity="info"
           visible
         />

@@ -2,6 +2,7 @@
  * Messages vocaux pour les zones manquantes.
  */
 import { ANATOMICAL_ZONES } from './zones.js';
+import { CALIBRATION_STEPS, CALIBRATION_STEP_COUNT } from './backCalibration.js';
 
 export function gapMessage(gap) {
   if (!gap) return '';
@@ -61,4 +62,11 @@ const CALIBRATION_VOICES = {
 
 export function calibrationVoice(id) {
   return CALIBRATION_VOICES[id] ?? '';
+}
+
+/** Annonce complète d'une étape (évite file d'attente voix + message négatif). */
+export function calibrationStepAnnounce(stepIndex) {
+  const step = CALIBRATION_STEPS[stepIndex];
+  if (!step) return '';
+  return `Point ${stepIndex + 1} sur ${CALIBRATION_STEP_COUNT}, ${step.label}. ${calibrationVoice(step.id)}`;
 }

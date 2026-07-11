@@ -13,7 +13,7 @@ import {
 import {
   estimateSubjectDistance, touchDistanceForRange, formatDistance,
 } from './calibration.js';
-import { gapMessage, gapShort, calibrationVoice } from './tips.js';
+import { gapMessage, gapShort, calibrationVoice, calibrationStepAnnounce } from './tips.js';
 import {
   CALIBRATION_STEPS, CALIBRATION_STEP_COUNT,
   evaluateCalibrationStep,
@@ -88,6 +88,7 @@ export class SunCoachEngine {
     this.calStableSince = 0;
     this.calProgress = 0;
     this.calLastUv = null;
+    this.calGraceUntil = 0;
     this.lastCalVoiceStep = -1;
     this.lastCalNoHandTs = 0;
     this.lastTs = 0;
@@ -316,6 +317,7 @@ export class SunCoachEngine {
     this.calStableSince = 0;
     this.calProgress = 0;
     this.calLastUv = null;
+    this.calGraceUntil = 0;
     this.lastCalVoiceStep = -1;
     this.calibrationFrame = frame ? {
       origin: { ...frame.origin },
@@ -325,15 +327,20 @@ export class SunCoachEngine {
       height: frame.height,
     } : null;
     this.onHud(0, `CALIBRAGE 1/${CALIBRATION_STEP_COUNT} — NUQUE`);
+    this.calGraceUntil = performance.now() + 3000;
     this.voice.say(calibrationVoice('intro'), { interrupt: true });
-    this._sayCalibrationStep(0);
+    setTimeout(() => {
+      if (this.state === 'calibrating' && this.calStep === 0) {
+        this.voice.say(calibrationStepAnnounce(0), { interrupt: true });
+        this.lastCalVoiceStep = 0;
+      }
+    }, 2800);
   }
 
   _sayCalibrationStep(step) {
     if (step === this.lastCalVoiceStep) return;
     this.lastCalVoiceStep = step;
-    const id = CALIBRATION_STEPS[step]?.id;
-    if (id) this.voice.say(calibrationVoice(id), { id: 'cal:' + id, cooldown: 2000 });
+    this.voice.say(calibrationStepAnnounce(step), { interrupt: true, id: 'cal:step:' + step, cooldown: 1500 });
   }
 
   _calibrationTick(P, track, ts) {
@@ -363,13 +370,18 @@ export class SunCoachEngine {
         this.lastCalGestureVoiceTs = ts;
         this.voice.say(calibrationVoice('gesture_ok'), { id: 'cal:gest', cooldown: 12000, queue: true });
       }
+    } else if (ts > (this.calGraceUntil ?? 0)) {
+      this.beeper.setPaintActivity('off');
+      const hintId = step.id === 'nuque' ? 'nuque_hint' : step.id;
+      if (ts - (this.lastCalNoHandTs ?? 0) > 14000) {
+        this.lastCalNoHandTs = ts;
+        const msg = step.id === 'nuque'
+          ? calibrationVoice('nuque_hint')
+          : calibrationStepAnnounce(this.calStep);
+        this.voice.say(msg, { id: 'cal:hint:' + step.id, cooldown: 14000, queue: true });
+      }
     } else {
       this.beeper.setPaintActivity('off');
-      const hintId = step.id === 'nuque' ? 'nuque_hint' : 'no_gesture';
-      if (ts - (this.lastCalNoHandTs ?? 0) > 10000) {
-        this.lastCalNoHandTs = ts;
-        this.voice.say(calibrationVoice(hintId), { id: 'cal:' + hintId, cooldown: 10000 });
-      }
     }
     this.beeper.tick(ts);
 
@@ -383,6 +395,8 @@ export class SunCoachEngine {
       this.calLastUv = null;
       this.calProgress = 0;
       this.lastCalVoiceStep = -1;
+      this.calGraceUntil = ts + 6000;
+      this.lastCalNoHandTs = ts + 6000;
 
       if (this.calStep >= CALIBRATION_STEP_COUNT) {
         setCustomBackAnchors(this.calAnchors);
@@ -390,8 +404,11 @@ export class SunCoachEngine {
         this._startCoverage();
         return;
       }
-      this.voice.say(calibrationVoice('next'), { queue: true });
-      this._sayCalibrationStep(this.calStep);
+      this.voice.say(
+        'Parfait, point enregistré. ' + calibrationStepAnnounce(this.calStep),
+        { interrupt: true, id: 'cal:advance:' + this.calStep },
+      );
+      this.lastCalVoiceStep = this.calStep;
     }
   }
 
@@ -694,6 +711,27 @@ export class SunCoachEngine {
     c.fillText('G', pad + 2, headH + 10);
     c.textAlign = 'right';
     c.fillText('D', W - pad - 2, headH + 10);
+
+    if (this.state === 'calibrating' && this.calAnchors) {
+      const order = ['nuque', 'epaule_g', 'milieu_g', 'rein_g', 'bas', 'rein_d', 'milieu_d', 'epaule_d'];
+      for (const id of order) {
+        const a = this.calAnchors[id];
+        if (!a) continue;
+        const x = toX(a.u);
+        const y = toY(a.v);
+        c.beginPath();
+        c.arc(x, y, 6, 0, Math.PI * 2);
+        c.fillStyle = 'rgba(0, 255, 100, 1)';
+        c.fill();
+        c.strokeStyle = '#fff';
+        c.lineWidth = 2;
+        c.stroke();
+        c.beginPath();
+        c.arc(x, y, 2.5, 0, Math.PI * 2);
+        c.fillStyle = '#fff';
+        c.fill();
+      }
+    }
 
     if (this.state === 'coverage') {
       const gap = this.grid.biggestGap();
