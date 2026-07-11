@@ -20,6 +20,8 @@ export const DONE_PAINTED_RATIO = 0.82;
 
 let shapeScale = 1.0;
 let bodyMask = new Uint8Array(HEAT_W * HEAT_H);
+/** @type {Record<string, {u:number,v:number}>|null} */
+let customAnchors = null;
 
 const SHAPE_KNOTS = [
   [0.00, 0.42],
@@ -51,8 +53,58 @@ function effectiveHalfWidth(v) {
 }
 
 export function insideBackShape(u, v) {
+  if (customAnchors) {
+    const top = customAnchors.nuque?.v ?? 0;
+    const bot = customAnchors.bas?.v ?? 1;
+    if (v < top - 0.03 || v > bot + 0.03) return false;
+    const left = boundaryAt(v, 'left');
+    const right = boundaryAt(v, 'right');
+    return u >= left && u <= right;
+  }
   if (v < 0 || v > 1) return false;
   return Math.abs(u - 0.5) <= effectiveHalfWidth(v);
+}
+
+function boundaryAt(v, side) {
+  const ids = side === 'left'
+    ? ['epaule_g', 'milieu_g', 'rein_g']
+    : ['epaule_d', 'milieu_d', 'rein_d'];
+  const pts = ids
+    .map((id) => customAnchors?.[id])
+    .filter(Boolean)
+    .sort((a, b) => a.v - b.v);
+  if (!pts.length) {
+    const hw = effectiveHalfWidth(v);
+    return side === 'left' ? 0.5 - hw : 0.5 + hw;
+  }
+  if (v <= pts[0].v) return pts[0].u;
+  if (v >= pts[pts.length - 1].v) return pts[pts.length - 1].u;
+  for (let i = 1; i < pts.length; i++) {
+    const p0 = pts[i - 1];
+    const p1 = pts[i];
+    if (v <= p1.v) {
+      const t = (v - p0.v) / (p1.v - p0.v || 1);
+      return p0.u + t * (p1.u - p0.u);
+    }
+  }
+  return pts[pts.length - 1].u;
+}
+
+/** Contour UV pour la minimap (8 repères). */
+export function customBackOutlineUV() {
+  if (!customAnchors) return null;
+  const order = ['nuque', 'epaule_g', 'milieu_g', 'rein_g', 'bas', 'rein_d', 'milieu_d', 'epaule_d'];
+  const pts = order.map((id) => customAnchors[id]).filter(Boolean);
+  return pts.length >= 4 ? pts : null;
+}
+
+export function setCustomBackAnchors(anchors) {
+  customAnchors = anchors ? { ...anchors } : null;
+  rebuildBodyMask();
+}
+
+export function getCustomBackAnchors() {
+  return customAnchors;
 }
 
 /** Marge élargie pour accepter une main légèrement hors silhouette. */
@@ -240,6 +292,7 @@ export class CoverageGrid {
   reset() {
     this.heat.fill(0);
     setShapeScale(1.0);
+    setCustomBackAnchors(null);
   }
 
   isBody(i) {

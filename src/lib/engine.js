@@ -6,13 +6,19 @@ import { Voice, Beeper } from './voice.js';
 import { PoseTracker, LM, isBackTurned, OneEuro, BackOrientation, contactPointsFromHand, palmFromHand } from './pose.js';
 import {
   CoverageGrid, torsoFrame, zoneName, backHalfWidth,
-  toBack, nearBackShape, coverageHeatRGBA,
+  toBack, nearBackShape, coverageHeatRGBA, setShapeScale,
+  setCustomBackAnchors, customBackOutlineUV,
   HEAT_W, HEAT_H, ZONE_COUNT, ANATOMICAL_ZONES,
 } from './coverage.js';
 import {
   estimateSubjectDistance, touchDistanceForRange, formatDistance,
 } from './calibration.js';
-import { gapMessage, gapShort } from './tips.js';
+import { gapMessage, gapShort, calibrationVoice } from './tips.js';
+import {
+  CALIBRATION_STEPS, CALIBRATION_STEP_COUNT,
+  getCalibrationTargetUV, targetScreenPos, trackCalibrationHold, handNearTarget,
+  drawCalibrationTarget, drawCalibrationAnchors,
+} from './backCalibration.js';
 import {
   buildBackSilhouette, buildFallbackSilhouette, traceBackContour, drawBackSegmentationOverlay,
 } from './segmentation.js';
@@ -76,6 +82,13 @@ export class SunCoachEngine {
     this.grid.reset();
     this.smoothMask = null;
     this.backContour = null;
+    this.calibrationFrame = null;
+    this.calStep = 0;
+    this.calAnchors = {};
+    this.calStableSince = 0;
+    this.calProgress = 0;
+    this.lastCalVoiceStep = -1;
+    this.lastCalNoHandTs = 0;
     this.lastTs = 0;
     this.placementOkSince = 0;
     this.lastMilestone = 0;
@@ -147,23 +160,27 @@ export class SunCoachEngine {
     const frame = this._smoothTorso(P ? torsoFrame(P) : null);
 
     if (P) {
-      if (track.segmentationMask) {
-        this.smoothMask = buildBackSilhouette(track.segmentationMask, P, W, H, this.smoothMask);
-      } else {
-        this.smoothMask = buildFallbackSilhouette(P, W, H, this.smoothMask);
+      const skipSeg = this.state === 'calibrating';
+      if (!skipSeg) {
+        if (track.segmentationMask) {
+          this.smoothMask = buildBackSilhouette(track.segmentationMask, P, W, H, this.smoothMask);
+        } else {
+          this.smoothMask = buildFallbackSilhouette(P, W, H, this.smoothMask);
+        }
+        this.backContour = this.smoothMask
+          ? traceBackContour(this.smoothMask, W, H)
+          : null;
       }
-      this.backContour = this.smoothMask
-        ? traceBackContour(this.smoothMask, W, H)
-        : null;
       if (this.state === 'placement' && track.segmentationMask && frame) {
         this._sampleShapeFromMask(track.segmentationMask, P, frame, W, H);
       }
     }
 
-    this._drawOverlay(P, frame, track, W, H);
+    this._drawOverlay(P, frame, track, ts, W, H);
     this._drawMinimap(ts);
 
-    if (this.state === 'placement') this._placementTick(P, ts);
+    if (this.state === 'placement') this._placementTick(P, ts, frame);
+    else if (this.state === 'calibrating') this._calibrationTick(P, track, ts);
     else if (this.state === 'coverage') {
       this._coverageTick(P, track, frame, ts, dt);
     }
@@ -245,7 +262,7 @@ export class SunCoachEngine {
 
   // ---------------------------------------------------------------- placement
 
-  _placementTick(P, ts) {
+  _placementTick(P, ts, frame) {
     const W = this.overlay.width;
     const fail = (msg, id, statusMsg) => {
       this.placementOkSince = 0;
@@ -271,10 +288,10 @@ export class SunCoachEngine {
       );
     }
     const shoulderW = Math.hypot(rs.x - ls.x, rs.y - ls.y);
-    if (shoulderW > 0.45 * W) {
+    if (shoulderW > 0.52 * W) {
       return fail('Tu es trop près. Recule un peu.', 'tooclose', 'DISTANCE : TROP PRÈS');
     }
-    if (shoulderW < 0.08 * W) {
+    if (shoulderW < 0.05 * W) {
       return fail('Tu es un peu loin. Approche-toi.', 'toofar', 'DISTANCE : TROP LOIN');
     }
     if (!isBackTurned(P, W)) {
@@ -285,9 +302,87 @@ export class SunCoachEngine {
     this.distSamples.push(distM);
     if (this.distSamples.length > 40) this.distSamples.shift();
 
-    this.onHud(0, `VERROUILLAGE… DIST. ${formatDistance(distM)}`);
+    this.onHud(0, `CALIBRAGE BIENTÔT… DIST. ${formatDistance(distM)}`);
     if (!this.placementOkSince) this.placementOkSince = ts;
-    if (ts - this.placementOkSince > 1500) this._startCoverage();
+    if (ts - this.placementOkSince > 1500) this._startCalibration(frame);
+  }
+
+  _startCalibration(frame) {
+    this._finalizeCalibration();
+    this.state = 'calibrating';
+    this.calStep = 0;
+    this.calAnchors = {};
+    this.calStableSince = 0;
+    this.calProgress = 0;
+    this.lastCalVoiceStep = -1;
+    this.calibrationFrame = frame ? {
+      origin: { ...frame.origin },
+      ex: { ...frame.ex },
+      ey: { ...frame.ey },
+      width: frame.width,
+      height: frame.height,
+    } : null;
+    this.onHud(0, `CALIBRAGE 1/${CALIBRATION_STEP_COUNT} — NUQUE`);
+    this.voice.say(calibrationVoice('intro'), { interrupt: true });
+    this._sayCalibrationStep(0);
+  }
+
+  _sayCalibrationStep(step) {
+    if (step === this.lastCalVoiceStep) return;
+    this.lastCalVoiceStep = step;
+    const id = CALIBRATION_STEPS[step]?.id;
+    if (id) this.voice.say(calibrationVoice(id), { id: 'cal:' + id, cooldown: 2000 });
+  }
+
+  _calibrationTick(P, track, ts) {
+    const W = this.overlay.width;
+    const H = this.overlay.height;
+    const frame = this.calibrationFrame;
+    const step = CALIBRATION_STEPS[this.calStep];
+
+    if (!P || !frame || !step) {
+      this.onHud(0, 'CALIBRAGE… RESTE DANS LE CADRE');
+      return;
+    }
+
+    this.onHud(0, `CALIBRAGE ${this.calStep + 1}/${CALIBRATION_STEP_COUNT} — ${step.label}`);
+
+    const contacts = this._getContactPoints2D(track, P, frame, W, H, ts, { forCalibration: true });
+    const hand = contacts[0] ?? null;
+    const targetUv = getCalibrationTargetUV(this.calStep, this.calAnchors);
+
+    if (!hand && ts - (this.lastCalNoHandTs ?? 0) > 8000) {
+      this.lastCalNoHandTs = ts;
+      this.voice.say(calibrationVoice('nohand'), { id: 'cal:nohand', cooldown: 8000 });
+    }
+
+    if (hand) {
+      const hold = trackCalibrationHold(hand, targetUv, ts, { stableSince: this.calStableSince });
+      if (this.calStableSince === 0 && hold.stableSince) this.calStableSince = hold.stableSince;
+      if (!handNearTarget(hand, targetUv)) this.calStableSince = 0;
+      this.calProgress = hold.progress;
+
+      if (hold.done && hold.anchor) {
+        this.calAnchors[step.id] = hold.anchor;
+        this.beeper.zoneDone();
+        this.calStep++;
+        this.calStableSince = 0;
+        this.calProgress = 0;
+        this.lastCalVoiceStep = -1;
+
+        if (this.calStep >= CALIBRATION_STEP_COUNT) {
+          setCustomBackAnchors(this.calAnchors);
+          this.voice.say(calibrationVoice('done'), { interrupt: true });
+          this._startCoverage();
+          return;
+        }
+        this.voice.say(calibrationVoice('next'), { queue: true });
+        this._sayCalibrationStep(this.calStep);
+      }
+    } else {
+      this.calStableSince = 0;
+      this.calProgress = 0;
+    }
   }
 
   _startCoverage() {
@@ -326,12 +421,13 @@ export class SunCoachEngine {
    * Projection 2D image → repère torse (u, v). Plus fiable que le monde 3D
    * quand on frotte le dos dos à la caméra.
    */
-  _getContactPoints2D(track, P, frame, W, H, ts) {
+  _getContactPoints2D(track, P, frame, W, H, ts, { forCalibration = false } = {}) {
     const out = [];
     const defs = [
       { hand: track.leftHand2D, poseWrist: LM.L_WRIST, name: 'gauche' },
       { hand: track.rightHand2D, poseWrist: LM.R_WRIST, name: 'droite' },
     ];
+    const margin = forCalibration ? 0.72 : 0.58;
 
     for (const d of defs) {
       let points = [];
@@ -350,16 +446,29 @@ export class SunCoachEngine {
 
       const f = this.filters[d.name];
       for (const p of points) {
-        if (!this._pointNearTorso(p, frame)) continue;
+        if (!forCalibration && !this._pointNearTorso(p, frame)) continue;
+        if (forCalibration && !this._pointNearTorsoWide(p, frame, margin)) continue;
         const raw = toBack(p, frame);
         out.push({
           name: d.name,
-          u: f.u.filter(raw.u, ts),
-          v: f.v.filter(raw.v, ts),
+          u: forCalibration ? raw.u : f.u.filter(raw.u, ts),
+          v: forCalibration ? raw.v : f.v.filter(raw.v, ts),
         });
       }
     }
     return out;
+  }
+
+  _pointNearTorsoWide(p, frame, marginRatio = 0.72) {
+    const dx = p.x - frame.origin.x;
+    const dy = p.y - frame.origin.y;
+    const localX = dx * frame.ex.x + dy * frame.ex.y;
+    const localY = dx * frame.ey.x + dy * frame.ey.y;
+    return (
+      Math.abs(localX) <= frame.width * marginRatio &&
+      localY >= -frame.height * 0.28 &&
+      localY <= frame.height * 1.12
+    );
   }
 
   _coverageTick(P, track, frame, ts, dt) {
@@ -378,7 +487,8 @@ export class SunCoachEngine {
       this.voice.say('Reste bien dos à la caméra.', { id: 'stayback', cooldown: 15000 });
     }
 
-    const contacts = this._getContactPoints2D(track, P, frame, W, this.overlay.height, ts);
+    const paintFrame = this.calibrationFrame || frame;
+    const contacts = this._getContactPoints2D(track, P, paintFrame, W, this.overlay.height, ts);
     const painting = contacts.filter((h) => nearBackShape(h.u, h.v));
 
     const { added, crossed } = this.grid.update(painting, dt);
@@ -488,6 +598,18 @@ export class SunCoachEngine {
   }
 
   _traceBackPath(c, toX, toY) {
+    const outline = customBackOutlineUV();
+    if (outline?.length >= 4) {
+      c.beginPath();
+      outline.forEach((p, i) => {
+        const x = toX(p.u);
+        const y = toY(p.v);
+        if (i === 0) c.moveTo(x, y);
+        else c.lineTo(x, y);
+      });
+      c.closePath();
+      return;
+    }
     const STEPS = 28;
     c.beginPath();
     for (let i = 0; i <= STEPS; i++) {
@@ -588,16 +710,30 @@ export class SunCoachEngine {
     }
   }
 
-  _drawOverlay(P, frame, track, W, H) {
+  _drawOverlay(P, frame, track, ts, W, H) {
     const ctx = this.ctx;
     ctx.clearRect(0, 0, W, H);
+
+    if (this.state === 'calibrating' && this.calibrationFrame) {
+      const calFrame = this.calibrationFrame;
+      drawCalibrationAnchors(ctx, this.calAnchors, calFrame);
+      const targetUv = getCalibrationTargetUV(this.calStep, this.calAnchors);
+      const pos = targetScreenPos(targetUv, calFrame);
+      const contacts = this._getContactPoints2D(track, P, calFrame, W, H, ts, { forCalibration: true });
+      const hand = contacts[0] ?? null;
+      const near = hand && handNearTarget(hand, targetUv);
+      if (pos) drawCalibrationTarget(ctx, pos.x, pos.y, ts, { near, progress: this.calProgress });
+      return;
+    }
+
     if (!frame && !this.smoothMask) return;
 
     if (this.smoothMask) {
+      const paintFrame = this.calibrationFrame || frame;
       drawBackSegmentationOverlay(ctx, this.smoothMask, W, H, {
         contour: this.backContour,
         grid: this.state === 'coverage' ? this.grid : null,
-        frame,
+        frame: paintFrame,
         showCoverage: this.state === 'coverage',
       });
     }

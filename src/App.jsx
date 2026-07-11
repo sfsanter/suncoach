@@ -49,8 +49,8 @@ const BRIEFING = [
   '01. CALE LE TÉLÉPHONE SUR UN SUPPORT (PAS EN MAIN).',
   '02. CAMÉRA SELFIE (FACE) VERS TON DOS — RECULE À ~2 M.',
   '03. MONTE LE VOLUME AU MAXIMUM.',
-  '04. FROTTE TOUT TON DOS LIBREMENT.',
-  '05. LE SCHÉMA INDIQUE EN ROUGE CE QUI MANQUE ENCORE.',
+  '04. CALIBRAGE : 8 POINTS À LA MAIN (REINS EN 7 ET 8).',
+  '05. FROTTE TOUT TON DOS — ORANGE → VERT AU FROTTEMENT.',
 ];
 
 function HomeScreen({ error, onStart }) {
@@ -83,8 +83,8 @@ function HomeScreen({ error, onStart }) {
         )}
 
         <EmergencyBanner
-          text="VERSION LIVE — MODE LIBRE"
-          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · Vert pétant + dégradés · caméra selfie'}
+          text="VERSION LIVE — CALIBRAGE 8 PTS"
+          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · 8 repères main · reins 7-8 · silhouette perso'}
           severity="info"
           visible
         />
