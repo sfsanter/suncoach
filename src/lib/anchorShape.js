@@ -31,6 +31,83 @@ export function defaultAnchorsPx(P, W, H) {
   };
 }
 
+/** Schéma minimap = proportions exactes des 8 points en pixels photo. */
+export function buildMinimapLayout(pxAnchors) {
+  const pts = ANCHOR_ORDER.map((id) => pxAnchors[id]).filter(Boolean);
+  if (pts.length < 4) return null;
+
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const p of pts) {
+    minX = Math.min(minX, p.x);
+    maxX = Math.max(maxX, p.x);
+    minY = Math.min(minY, p.y);
+    maxY = Math.max(maxY, p.y);
+  }
+  const padX = (maxX - minX) * 0.1;
+  const padY = (maxY - minY) * 0.08;
+  minX -= padX;
+  maxX += padX;
+  minY -= padY;
+  maxY += padY;
+  const bw = Math.max(40, maxX - minX);
+  const bh = Math.max(60, maxY - minY);
+
+  const uvAnchors = {};
+  for (const id of ANCHOR_ORDER) {
+    const p = pxAnchors[id];
+    if (!p) continue;
+    uvAnchors[id] = { u: (p.x - minX) / bw, v: (p.y - minY) / bh };
+  }
+
+  const leftIds = ['epaule_g', 'milieu_g', 'rein_g'];
+  const rightIds = ['epaule_d', 'milieu_d', 'rein_d'];
+
+  const boundaryAt = (v, side) => {
+    const ids = side === 'left' ? leftIds : rightIds;
+    const list = ids.map((id) => uvAnchors[id]).filter(Boolean).sort((a, b) => a.v - b.v);
+    if (!list.length) return side === 'left' ? 0.12 : 0.88;
+    if (v <= list[0].v) return list[0].u;
+    if (v >= list[list.length - 1].v) return list[list.length - 1].u;
+    for (let i = 1; i < list.length; i++) {
+      const p0 = list[i - 1];
+      const p1 = list[i];
+      if (v <= p1.v) {
+        const t = (v - p0.v) / (p1.v - p0.v || 1);
+        return p0.u + t * (p1.u - p0.u);
+      }
+    }
+    return list[list.length - 1].u;
+  };
+
+  const outline = ANCHOR_ORDER.map((id) => uvAnchors[id]).filter(Boolean);
+
+  return {
+    minX, minY, bw, bh,
+    aspect: bw / bh,
+    uvAnchors,
+    boundaryAt,
+    outline,
+  };
+}
+
+export function pixelToLayoutUv(x, y, layout) {
+  if (!layout) return { u: 0.5, v: 0.5 };
+  return {
+    u: (x - layout.minX) / layout.bw,
+    v: (y - layout.minY) / layout.bh,
+  };
+}
+
+export function insideLayoutShape(u, v, layout) {
+  if (!layout?.uvAnchors) return false;
+  const top = layout.uvAnchors.nuque?.v ?? 0;
+  const bot = layout.uvAnchors.bas?.v ?? 1;
+  if (v < top - 0.03 || v > bot + 0.03) return false;
+  const left = layout.boundaryAt(v, 'left');
+  const right = layout.boundaryAt(v, 'right');
+  return u >= left - 0.02 && u <= right + 0.02;
+}
+
 /** Pixels image → repère dos (u, v) pour la heatmap. */
 export function pixelsToBackAnchors(pxAnchors, frame) {
   const out = {};
@@ -124,7 +201,9 @@ export function capturePoseSignature(P, frame) {
 }
 
 export function comparePoseSignature(live, locked) {
-  if (!live || !locked) return { ok: false, hint: 'reposition_shift', status: 'REPOSITION…' };
+  if (!live || !locked) {
+    return { ok: false, approxOk: false, hint: 'reposition_shift', status: 'REPOSITION…', pct: 0 };
+  }
 
   const scale = live.shoulderW / locked.shoulderW;
   const dx = live.midX - locked.midX;
@@ -133,27 +212,41 @@ export function comparePoseSignature(live, locked) {
   const depth = dx * locked.ey.x + dy * locked.ey.y;
   const w = locked.shoulderW;
 
-  if (scale < 0.84) {
-    return { ok: false, hint: 'reposition_far', status: 'TROP LOIN — APPROCHE-TOI' };
+  const score = 1 - Math.min(1,
+    Math.abs(scale - 1) / 0.35 * 0.5 +
+    Math.abs(lateral) / (0.2 * w) * 0.35 +
+    Math.abs(depth) / (0.16 * w) * 0.15
+  );
+  const pct = Math.max(0, Math.round(score * 100));
+
+  const approxOk = scale >= 0.68 && scale <= 1.45 &&
+    Math.abs(lateral) <= 0.2 * w && Math.abs(depth) <= 0.16 * w;
+
+  if (scale < 0.68) {
+    return { ok: false, approxOk, hint: 'reposition_far', status: 'TROP LOIN', pct: pct / 100 };
   }
-  if (scale > 1.18) {
-    return { ok: false, hint: 'reposition_close', status: 'TROP PRÈS — RECULE' };
+  if (scale > 1.45) {
+    return { ok: false, approxOk, hint: 'reposition_close', status: 'TROP PRÈS', pct: pct / 100 };
   }
-  if (lateral < -0.1 * w) {
-    return { ok: false, hint: 'reposition_left', status: 'DÉCALE-TOI À DROITE' };
+  if (lateral < -0.2 * w) {
+    return { ok: false, approxOk, hint: 'reposition_left', status: '→ DROITE', pct: pct / 100 };
   }
-  if (lateral > 0.1 * w) {
-    return { ok: false, hint: 'reposition_right', status: 'DÉCALE-TOI À GAUCHE' };
+  if (lateral > 0.2 * w) {
+    return { ok: false, approxOk, hint: 'reposition_right', status: '→ GAUCHE', pct: pct / 100 };
   }
-  if (depth < -0.08 * w) {
-    return { ok: false, hint: 'reposition_back', status: 'RECULE UN PEU' };
+  if (depth < -0.16 * w) {
+    return { ok: false, approxOk, hint: 'reposition_back', status: 'RECULE UN PEU', pct: pct / 100 };
   }
-  if (depth > 0.08 * w) {
-    return { ok: false, hint: 'reposition_forward', status: 'AVANCE UN PEU' };
+  if (depth > 0.16 * w) {
+    return { ok: false, approxOk, hint: 'reposition_forward', status: 'AVANCE UN PEU', pct: pct / 100 };
   }
 
-  const pct = Math.round(
-    (1 - Math.min(1, (Math.abs(scale - 1) / 0.18 + Math.abs(lateral) / (0.12 * w)) / 2)) * 100
-  );
-  return { ok: true, hint: null, status: `POSITION ${pct} %`, pct: pct / 100 };
+  const ok = pct >= 55;
+  return {
+    ok,
+    approxOk,
+    hint: ok ? null : 'reposition_approx',
+    status: ok ? `POSITION ${pct} %` : `APPROX. ${pct} %`,
+    pct: pct / 100,
+  };
 }

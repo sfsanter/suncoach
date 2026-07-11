@@ -64,7 +64,10 @@ const CALIBRATION_VOICES = {
   reposition_left: 'Décale-toi un peu vers la droite.',
   reposition_right: 'Décale-toi un peu vers la gauche.',
   reposition_back: 'Recule légèrement.',
-  reposition_forward: 'Avance légèrement vers la caméra.',
+  reposition_approx:
+    'Position approximative, mais ton contour reste figé. On continue !',
+  reposition_approx_ok:
+    'C’est suffisant. Ton schéma de dos est enregistré, frotte maintenant !',
   scan_done:
     'Photo enregistrée. Tourne-toi vers l’écran : les points sont sur tes épaules. ' +
     'Glisse-les sur le bord de ton dos, puis valide.',

@@ -164,6 +164,7 @@ function PointAdjustScreen({ payload, engine }) {
   const { fit, refresh } = useImageFit(imgRef, boxRef);
   const [anchorsPx, setAnchorsPx] = useState(payload.anchorsPx ?? {});
   const dragIdRef = useRef(null);
+  const dragOffsetRef = useRef({ dx: 0, dy: 0 });
 
   useEffect(() => {
     setAnchorsPx(payload.anchorsPx ?? {});
@@ -192,14 +193,12 @@ function PointAdjustScreen({ payload, engine }) {
       if (!id || !img) return;
       const pt = clientToImagePx(e.clientX, e.clientY, img, payload.videoW, payload.videoH);
       if (!pt) return;
-      engine.setDraftAnchorPx(id, pt.x, pt.y);
-      setAnchorsPx((prev) => ({
-        ...prev,
-        [id]: {
-          x: Math.max(8, Math.min(payload.videoW - 8, pt.x)),
-          y: Math.max(8, Math.min(payload.videoH - 8, pt.y)),
-        },
-      }));
+      const x = pt.x - dragOffsetRef.current.dx;
+      const y = pt.y - dragOffsetRef.current.dy;
+      const cx = Math.max(8, Math.min(payload.videoW - 8, x));
+      const cy = Math.max(8, Math.min(payload.videoH - 8, y));
+      engine.setDraftAnchorPx(id, cx, cy);
+      setAnchorsPx((prev) => ({ ...prev, [id]: { x: cx, y: cy } }));
     };
     const onUp = () => { dragIdRef.current = null; };
     window.addEventListener('pointermove', onMove);
@@ -214,6 +213,12 @@ function PointAdjustScreen({ payload, engine }) {
 
   const startDrag = (id, e) => {
     e.preventDefault();
+    const img = imgRef.current;
+    const p = anchorsPx[id];
+    if (!img || !p) return;
+    const pt = clientToImagePx(e.clientX, e.clientY, img, payload.videoW, payload.videoH);
+    if (!pt) return;
+    dragOffsetRef.current = { dx: pt.x - p.x, dy: pt.y - p.y };
     dragIdRef.current = id;
   };
 
@@ -268,9 +273,9 @@ function PointAdjustScreen({ payload, engine }) {
                     style={{ left: `${pos.left}%`, top: `${pos.top}%`, touchAction: 'none' }}
                     onPointerDown={(e) => startDrag(id, e)}
                   >
-                    <span className="flex h-12 w-12 items-center justify-center rounded-full border-[3px] border-white bg-nerv-green shadow-lg shadow-nerv-green/40" />
+                    <span className="flex h-7 w-7 items-center justify-center rounded-full border-2 border-white bg-nerv-green shadow-md" />
                     <span
-                      className="mt-1 rounded bg-black/80 px-2 py-0.5 text-[9px] font-bold tracking-wider text-nerv-green"
+                      className="mt-0.5 rounded bg-black/80 px-1.5 py-0.5 text-[7px] font-bold tracking-wider text-nerv-green"
                       style={{ fontFamily: 'var(--font-nerv-mono)' }}
                     >
                       {labelFor(id)}
@@ -388,7 +393,7 @@ function SessionScreen({ onAbort, onError, onDone }) {
 
         {phase !== 'adjusting' && (
         <div className="pointer-events-none absolute bottom-3 right-3 flex flex-col items-center gap-1">
-          <canvas ref={minimapRef} width={180} height={250} />
+          <canvas ref={minimapRef} width={220} height={300} />
           <span
             className="text-[10px] tracking-[0.25em] text-nerv-green/80"
             style={{ fontFamily: 'var(--font-nerv-mono)' }}
@@ -403,6 +408,11 @@ function SessionScreen({ onAbort, onError, onDone }) {
         {phase !== 'adjusting' && (
         <Button variant="ghost" onClick={() => engineRef.current?.flip()}>
           CAMÉRA
+        </Button>
+        )}
+        {phase === 'reposition' && (
+        <Button variant="primary" onClick={() => engineRef.current?.skipReposition()}>
+          C’EST BON — COMMENCER
         </Button>
         )}
         <Button variant="ghost" onClick={toggleMute}>

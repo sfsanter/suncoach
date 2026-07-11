@@ -4,7 +4,7 @@
  */
 import { LM } from './pose.js';
 import { ANATOMICAL_ZONES, ZONE_COUNT } from './zones.js';
-import { buildCanonicalShape, canonicalToBackUv, backUvToCanonical } from './anchorShape.js';
+import { buildCanonicalShape, canonicalToBackUv, backUvToCanonical, insideLayoutShape } from './anchorShape.js';
 
 export { ANATOMICAL_ZONES, ZONE_COUNT };
 export const ROWS = 4;
@@ -113,8 +113,11 @@ function boundaryAt(v, side) {
   return pts[pts.length - 1].u;
 }
 
-/** Contour minimap : uniquement les 8 points manuels (espace canonique 0–1). */
+let minimapLayout = null;
+
+/** Contour minimap : proportions exactes des 8 points manuels. */
 export function customBackOutlineUV() {
+  if (minimapLayout?.outline?.length >= 4) return minimapLayout.outline;
   if (canonicalShape?.outline?.length >= 4) {
     return canonicalShape.outline.map((p) => ({ u: p.u, v: p.v }));
   }
@@ -122,6 +125,15 @@ export function customBackOutlineUV() {
   const order = ['nuque', 'epaule_g', 'milieu_g', 'rein_g', 'bas', 'rein_d', 'milieu_d', 'epaule_d'];
   const pts = order.map((id) => customAnchors[id]).filter(Boolean);
   return pts.length >= 4 ? pts : null;
+}
+
+export function getMinimapLayout() {
+  return minimapLayout;
+}
+
+export function setMinimapLayout(layout) {
+  minimapLayout = layout;
+  rebuildBodyMask();
 }
 
 export function getCanonicalShape() {
@@ -134,7 +146,7 @@ export function toCanonicalUV(u, v) {
 
 export function setCustomBackAnchors(anchors) {
   customAnchors = anchors ? { ...anchors } : null;
-  canonicalShape = anchors ? buildCanonicalShape(anchors) : null;
+  canonicalShape = anchors && !minimapLayout ? buildCanonicalShape(anchors) : null;
   if (anchors) tracedContour = null;
   rebuildBodyMask();
 }
@@ -155,6 +167,7 @@ export function getCustomBackAnchors() {
 
 /** Marge élargie pour accepter une main légèrement hors silhouette. */
 export function nearBackShape(u, v, margin = 0.06) {
+  if (minimapLayout) return insideLayoutShape(u, v, minimapLayout);
   if (tracedContour || customAnchors) return insideBackShape(u, v);
   if (v < -0.05 || v > 1.05) return false;
   const vClamped = Math.max(0, Math.min(1, v));
@@ -165,13 +178,15 @@ function rebuildBodyMask() {
   for (let y = 0; y < HEAT_H; y++) {
     for (let x = 0; x < HEAT_W; x++) {
       const i = y * HEAT_W + x;
-      const uc = (x + 0.5) / HEAT_W;
-      const vc = (y + 0.5) / HEAT_H;
-      if (canonicalShape && customAnchors) {
-        const { u, v } = canonicalToBackUv(uc, vc, canonicalShape);
-        bodyMask[i] = insideBackShape(u, v) ? 1 : 0;
+      const u = (x + 0.5) / HEAT_W;
+      const v = (y + 0.5) / HEAT_H;
+      if (minimapLayout) {
+        bodyMask[i] = insideLayoutShape(u, v, minimapLayout) ? 1 : 0;
+      } else if (canonicalShape && customAnchors) {
+        const { u: bu, v: bv } = canonicalToBackUv(u, v, canonicalShape);
+        bodyMask[i] = insideBackShape(bu, bv) ? 1 : 0;
       } else {
-        bodyMask[i] = insideBackShape(uc, vc) ? 1 : 0;
+        bodyMask[i] = insideBackShape(u, v) ? 1 : 0;
       }
     }
   }
@@ -346,6 +361,7 @@ export class CoverageGrid {
   reset() {
     this.heat.fill(0);
     setShapeScale(1.0);
+    setMinimapLayout(null);
     setCustomBackAnchors(null);
     setTracedContour(null);
     canonicalShape = null;
@@ -363,7 +379,7 @@ export class CoverageGrid {
   sample(u, v) {
     let qu = u;
     let qv = v;
-    if (canonicalShape && customAnchors) {
+    if (!minimapLayout && canonicalShape && customAnchors) {
       const c = backUvToCanonical(u, v, canonicalShape);
       qu = c.u;
       qv = c.v;
@@ -407,7 +423,7 @@ export class CoverageGrid {
     for (const h of hands) {
       let hu = h.u;
       let hv = h.v;
-      if (canonicalShape && customAnchors) {
+      if (!minimapLayout && canonicalShape && customAnchors) {
         const c = backUvToCanonical(hu, hv, canonicalShape);
         hu = c.u;
         hv = c.v;

@@ -7,7 +7,8 @@ import { PoseTracker, LM, isBackTurned, OneEuro, BackOrientation, contactPointsF
 import {
   CoverageGrid, torsoFrame, zoneName, backHalfWidth,
   toBack, nearBackShape, coverageHeatRGBA, setShapeScale,
-  setTracedContour, customBackOutlineUV, setCustomBackAnchors, getTracedContour, toCanonicalUV,
+  setTracedContour, customBackOutlineUV, setCustomBackAnchors, getTracedContour,
+  toCanonicalUV, setMinimapLayout, getMinimapLayout, backToPx,
   HEAT_W, HEAT_H, ZONE_COUNT, ANATOMICAL_ZONES, MIN_COVERAGE_SEC,
 } from './coverage.js';
 import {
@@ -18,7 +19,7 @@ import { MaskLockAccumulator, LOCK_FRAMES } from './maskLock.js';
 import { warpToLocked, cloneFrame } from './backTemplate.js';
 import { credibleBackHand, crediblePoseWrist, elbowBackContact, handContactPixels, ContactVelocityGate } from './handGate.js';
 import {
-  defaultAnchorsPx, pixelsToBackAnchors,
+  defaultAnchorsPx, pixelsToBackAnchors, buildMinimapLayout, pixelToLayoutUv,
   capturePoseSignature, comparePoseSignature,
 } from './anchorShape.js';
 import { CALIBRATION_STEPS, anchorAssistedContacts } from './backCalibration.js';
@@ -102,6 +103,7 @@ export class SunCoachEngine {
     this.snapshotW = 0;
     this.snapshotH = 0;
     this.repositionOkSince = 0;
+    this.repositionStartedAt = 0;
     this.lastTs = 0;
     this.placementOkSince = 0;
     this.lastMilestone = 0;
@@ -459,10 +461,18 @@ export class SunCoachEngine {
   confirmAdjustment() {
     if (this.state !== 'adjusting' || !this.draftAnchorsPx || !this.calibrationFrame) return;
     this.calibrationAnchors = pixelsToBackAnchors(this.draftAnchorsPx, this.calibrationFrame);
+    const layout = buildMinimapLayout(this.draftAnchorsPx);
     setTracedContour(null);
+    setMinimapLayout(layout);
     setCustomBackAnchors(this.calibrationAnchors);
     this.voice.say(calibrationVoice('done'), { interrupt: true });
     this._startReposition();
+  }
+
+  skipReposition() {
+    if (this.state !== 'reposition') return;
+    this.voice.say(calibrationVoice('reposition_approx_ok'), { interrupt: true });
+    this._startCoverage();
   }
 
   _notifyPhase() {
@@ -485,7 +495,8 @@ export class SunCoachEngine {
   _startReposition() {
     this.state = 'reposition';
     this.repositionOkSince = 0;
-    this.onHud(0, 'REPLACE-TOI POUR LA CRÈME');
+    this.repositionStartedAt = performance.now();
+    this.onHud(0, 'REPLACE-TOI (APPROX. OK)');
     this.voice.say(calibrationVoice('reposition_intro'), { interrupt: true });
     this._notifyPhase();
   }
@@ -516,18 +527,34 @@ export class SunCoachEngine {
     const frame = torsoFrame(P);
     const liveSig = capturePoseSignature(P, frame ?? locked);
     const cmp = comparePoseSignature(liveSig, this.lockedPoseSignature);
+    const elapsed = performance.now() - (this.repositionStartedAt || 0);
 
-    if (!cmp.ok) {
+    if (!cmp.ok && !cmp.approxOk) {
       const msg = calibrationVoice(cmp.hint) || calibrationVoice('reposition_shift');
-      return fail(msg, 'repo:' + cmp.hint, cmp.status);
+      return fail(msg, 'repo:' + (cmp.hint || 'shift'), cmp.status);
     }
 
     this.onHud(cmp.pct ?? 0, cmp.status);
     if (!this.repositionOkSince) this.repositionOkSince = ts;
-    if (ts - this.repositionOkSince > 2000) {
+
+    const stable = ts - this.repositionOkSince;
+    if (cmp.ok && stable > 1200) {
       this.voice.say(calibrationVoice('reposition_ok'), { interrupt: true });
       this._startCoverage();
+    } else if (cmp.approxOk && stable > 2500) {
+      this.voice.say(calibrationVoice('reposition_approx_ok'), { interrupt: true });
+      this._startCoverage();
+    } else if (elapsed > 12000 && cmp.approxOk) {
+      this.voice.say(calibrationVoice('reposition_approx_ok'), { interrupt: true });
+      this._startCoverage();
     }
+  }
+
+  /** Contact → repère schéma (layout) figé au moment de la photo. */
+  _toPaintUv(warpedPx, backU, backV) {
+    const layout = getMinimapLayout();
+    if (layout && warpedPx) return pixelToLayoutUv(warpedPx.x, warpedPx.y, layout);
+    return toCanonicalUV(backU, backV);
   }
 
   _startCoverage() {
@@ -624,7 +651,9 @@ export class SunCoachEngine {
     const anchorUsed = new Set();
     for (const pt of anchorPts) {
       const f = this.filters[pt.name];
-      const sm = this.contactGate.clamp(pt.name, f.u.filter(pt.u, ts), f.v.filter(pt.v, ts));
+      const px = backToPx(pt.u, pt.v, lockedFrame);
+      const layoutUv = this._toPaintUv(px, pt.u, pt.v);
+      const sm = this.contactGate.clamp(pt.name, f.u.filter(layoutUv.u, ts), f.v.filter(layoutUv.v, ts));
       out.push({ name: pt.name, u: sm.u, v: sm.v });
       anchorUsed.add(pt.anchor);
     }
@@ -656,7 +685,8 @@ export class SunCoachEngine {
         const warped = liveFrame ? warpToLocked(p, liveFrame, lockedFrame) : p;
         if (!this._pointNearTorso(warped, lockedFrame)) continue;
         const raw = toBack(warped, lockedFrame);
-        const sm = this.contactGate.clamp(d.name, f.u.filter(raw.u, ts), f.v.filter(raw.v, ts));
+        const layoutUv = this._toPaintUv(warped, raw.u, raw.v);
+        const sm = this.contactGate.clamp(d.name, f.u.filter(layoutUv.u, ts), f.v.filter(layoutUv.v, ts));
         if (sm.v < 0.42 && anchorUsed.size > 0) continue;
         out.push({ name: d.name, u: sm.u, v: sm.v });
       }
@@ -733,8 +763,7 @@ export class SunCoachEngine {
     for (const h of painting) {
       if (ts - this.lastPathTs[h.name] > 80) {
         this.lastPathTs[h.name] = ts;
-        const cuv = toCanonicalUV(h.u, h.v);
-        this.paths[h.name].push({ u: cuv.u, v: cuv.v });
+        this.paths[h.name].push({ u: h.u, v: h.v });
       }
     }
 
@@ -846,6 +875,32 @@ export class SunCoachEngine {
     c.closePath();
   }
 
+  _minimapViewport(W, H) {
+    const layout = getMinimapLayout();
+    const pad = 6;
+    const labelH = 14;
+    const availW = W - 2 * pad;
+    const availH = H - 2 * pad - labelH;
+    const aspect = layout?.aspect ?? 0.55;
+
+    let mapW, mapH;
+    if (availW / availH > aspect) {
+      mapH = availH;
+      mapW = mapH * aspect;
+    } else {
+      mapW = availW;
+      mapH = mapW / aspect;
+    }
+    const ox = pad + (availW - mapW) / 2;
+    const oy = pad + (availH - mapH) / 2;
+    return {
+      mapW, mapH, ox, oy,
+      toX: (u) => ox + u * mapW,
+      toY: (v) => oy + v * mapH,
+      customShape: !!layout,
+    };
+  }
+
   _drawMinimap(ts) {
     if (!this.minimapCtx) return;
     const c = this.minimapCtx;
@@ -854,18 +909,18 @@ export class SunCoachEngine {
     c.fillStyle = 'rgba(0, 0, 0, 0.78)';
     c.fillRect(0, 0, W, H);
 
-    const headH = H * 0.16;
-    const pad = 7;
-    const mapW = W - 2 * pad, mapH = H - headH - pad;
-    const toX = (u) => pad + u * mapW;
-    const toY = (v) => headH + v * mapH;
-
+    const vp = this._minimapViewport(W, H);
+    const { toX, toY, customShape } = vp;
     const cx = W / 2;
-    c.beginPath();
-    c.arc(cx, headH * 0.45, headH * 0.34, 0, Math.PI * 2);
-    c.fillStyle = 'rgba(120, 130, 120, 0.9)';
-    c.fill();
-    c.fillRect(cx - headH * 0.13, headH * 0.7, headH * 0.26, headH * 0.35);
+
+    if (!customShape) {
+      const headH = H * 0.16;
+      c.beginPath();
+      c.arc(cx, headH * 0.45, headH * 0.34, 0, Math.PI * 2);
+      c.fillStyle = 'rgba(120, 130, 120, 0.9)';
+      c.fill();
+      c.fillRect(cx - headH * 0.13, headH * 0.7, headH * 0.26, headH * 0.35);
+    }
 
     this._renderMiniHeat();
 
@@ -873,7 +928,7 @@ export class SunCoachEngine {
     this._traceBackPath(c, toX, toY);
     c.clip();
     c.imageSmoothingEnabled = true;
-    c.drawImage(this.miniCanvas, pad, headH, mapW, mapH);
+    c.drawImage(this.miniCanvas, vp.ox, vp.oy, vp.mapW, vp.mapH);
 
     if (this.paths) {
       const trail = (path, color) => {
@@ -902,9 +957,9 @@ export class SunCoachEngine {
     c.font = '9px Fira Code, monospace';
     c.fillStyle = 'rgba(0, 255, 0, 0.7)';
     c.textAlign = 'left';
-    c.fillText('G', pad + 2, headH + 10);
+    c.fillText('G', vp.ox + 2, vp.oy + 10);
     c.textAlign = 'right';
-    c.fillText('D', W - pad - 2, headH + 10);
+    c.fillText('D', vp.ox + vp.mapW - 2, vp.oy + 10);
 
     if (this.state === 'locking' && this.maskLock) {
       const pct = Math.round((this.maskLock.count / LOCK_FRAMES) * 100);
