@@ -8,13 +8,15 @@ import {
   CoverageGrid, torsoFrame, zoneName, backHalfWidth,
   toBack, nearBackShape, coverageHeatRGBA, setShapeScale,
   setTracedContour, customBackOutlineUV,
-  HEAT_W, HEAT_H, ZONE_COUNT, ANATOMICAL_ZONES,
+  HEAT_W, HEAT_H, ZONE_COUNT, ANATOMICAL_ZONES, MIN_COVERAGE_SEC,
 } from './coverage.js';
 import {
   estimateSubjectDistance, touchDistanceForRange, formatDistance,
 } from './calibration.js';
 import { gapMessage, gapShort } from './tips.js';
 import { MaskLockAccumulator, LOCK_FRAMES } from './maskLock.js';
+import { warpToLocked, cloneFrame } from './backTemplate.js';
+import { credibleBackHand, ContactVelocityGate } from './handGate.js';
 import {
   buildBackSilhouette, buildFallbackSilhouette, buildBackSilhouetteFromBytes,
   traceBackContour, drawBackSegmentationOverlay,
@@ -102,6 +104,7 @@ export class SunCoachEngine {
       gauche: { u: new OneEuro(), v: new OneEuro() },
       droite: { u: new OneEuro(), v: new OneEuro() },
     };
+    this.contactGate = new ContactVelocityGate();
 
     this.state = 'placement';
     this.onHud(0, 'PLACEMENT…');
@@ -309,13 +312,7 @@ export class SunCoachEngine {
     this._finalizeCalibration();
     this.state = 'locking';
     this.lockStartedAt = performance.now();
-    this.calibrationFrame = frame ? {
-      origin: { ...frame.origin },
-      ex: { ...frame.ex },
-      ey: { ...frame.ey },
-      width: frame.width,
-      height: frame.height,
-    } : null;
+    this.calibrationFrame = frame ? cloneFrame(frame) : null;
     const W = this.overlay.width;
     const H = this.overlay.height;
     this.maskLock = new MaskLockAccumulator(W, H);
@@ -408,6 +405,11 @@ export class SunCoachEngine {
     this._finalizeCalibration();
     this.backOrient.reset();
     this.orientWarnTs = 0;
+    this.contactGate.reset();
+    this.filters.gauche.u.reset();
+    this.filters.gauche.v.reset();
+    this.filters.droite.u.reset();
+    this.filters.droite.v.reset();
     this.state = 'coverage';
     this.coverageStartedAt = performance.now();
     this.lastCaptureHintTs = this.coverageStartedAt + 6000;
@@ -478,6 +480,44 @@ export class SunCoachEngine {
     return out;
   }
 
+  /**
+   * Contacts pour la couverture : repère figé au scan + filtre anti-hallucination.
+   * Pas de repli poignet pose (trop de faux positifs dos tourné).
+   */
+  _getCoverageContacts(track, P, liveFrame, lockedFrame, W, H, ts) {
+    if (!lockedFrame) return [];
+    const out = [];
+    const defs = [
+      { hand: track.leftHand2D, poseWrist: LM.L_WRIST, name: 'gauche' },
+      { hand: track.rightHand2D, poseWrist: LM.R_WRIST, name: 'droite' },
+    ];
+
+    for (const d of defs) {
+      if (!d.hand?.length || d.hand.length < 21) continue;
+      if (!credibleBackHand(d.hand, P?.[d.poseWrist], P, W, H)) continue;
+
+      const handPx = d.hand.map((p) => ({
+        x: p.x * W,
+        y: p.y * H,
+        visibility: p.visibility ?? p.presence ?? 0,
+      }));
+      const points = contactPointsFromHand(handPx).map((p) =>
+        warpToLocked(p, liveFrame, lockedFrame)
+      );
+
+      const f = this.filters[d.name];
+      for (const p of points) {
+        if (!this._pointNearTorso(p, lockedFrame)) continue;
+        const raw = toBack(p, lockedFrame);
+        const u = f.u.filter(raw.u, ts);
+        const v = f.v.filter(raw.v, ts);
+        if (!this.contactGate.allow(d.name, u, v)) continue;
+        out.push({ name: d.name, u, v });
+      }
+    }
+    return out;
+  }
+
   _pointNearTorsoWide(p, frame, marginRatio = 0.72) {
     const dx = p.x - frame.origin.x;
     const dy = p.y - frame.origin.y;
@@ -507,7 +547,9 @@ export class SunCoachEngine {
     }
 
     const paintFrame = this.calibrationFrame || frame;
-    const contacts = this._getContactPoints2D(track, P, paintFrame, W, this.overlay.height, ts);
+    const contacts = this._getCoverageContacts(
+      track, P, frame, paintFrame, W, this.overlay.height, ts
+    );
     const painting = contacts.filter((h) => nearBackShape(h.u, h.v));
 
     const { added, crossed } = this.grid.update(painting, dt);
@@ -548,7 +590,10 @@ export class SunCoachEngine {
       this.voice.say('La moitié du dos est couverte, continue !', { queue: true });
     }
 
-    if (this.grid.done) return this._finish();
+    if (this.grid.done) {
+      const elapsedSec = (performance.now() - this.coverageStartedAt) / 1000;
+      if (elapsedSec >= MIN_COVERAGE_SEC) return this._finish();
+    }
 
     this.onHud(painted, gap ? gapShort(gap) : `${pct} % COUVERT`);
 

@@ -12,11 +12,12 @@ export const COLS = 3;
 export const HEAT_W = 36;
 export const HEAT_H = 48;
 
-const PIXEL_NEED = 0.16;
-const ZONE_RATIO = 0.50;
-/** Pinceau plus large : une paume couvre une zone visible sur la minimap. */
-const SIGMA = 0.10;
-export const DONE_PAINTED_RATIO = 0.82;
+const PIXEL_NEED = 0.28;
+const ZONE_RATIO = 0.62;
+/** Pinceau : une paume couvre une zone visible sur la minimap. */
+const SIGMA = 0.075;
+export const DONE_PAINTED_RATIO = 0.94;
+export const MIN_COVERAGE_SEC = 50;
 
 const TRACE_BINS = 32;
 
@@ -385,8 +386,9 @@ export class CoverageGrid {
           if (wgt <= 0.03) continue;
           const before = this.heat[i];
           if (before < PIXEL_NEED) {
-            this.heat[i] = before + dt * wgt;
-            added += dt * wgt;
+            const step = Math.min(dt, 0.035) * wgt;
+            this.heat[i] = before + step;
+            added += step;
             if (this.heat[i] >= PIXEL_NEED) crossed++;
           }
         }

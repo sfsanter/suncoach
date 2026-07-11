@@ -59,7 +59,7 @@ export function preloadPose() {
 
 export { preloadBodySegmenter } from './bodySegmenter.js';
 
-function lmScore(p) {
+export function lmScore(p) {
   return p.visibility ?? p.presence ?? 0;
 }
 
