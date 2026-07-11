@@ -16,7 +16,7 @@ import {
 import { gapMessage, gapShort } from './tips.js';
 import { MaskLockAccumulator, LOCK_FRAMES } from './maskLock.js';
 import { warpToLocked, cloneFrame } from './backTemplate.js';
-import { credibleBackHand, ContactVelocityGate } from './handGate.js';
+import { credibleBackHand, crediblePoseWrist, elbowBackContact, handContactPixels, ContactVelocityGate } from './handGate.js';
 import {
   buildBackSilhouette, buildFallbackSilhouette, buildBackSilhouetteFromBytes,
   traceBackContour, drawBackSegmentationOverlay,
@@ -425,16 +425,16 @@ export class SunCoachEngine {
 
   // ---------------------------------------------------------------- couverture
 
-  /** La main doit être dans la zone torse élargie (bras par-dessus l'épaule). */
+  /** Zone torse + nuque (main qui monte au-dessus des épaules). */
   _pointNearTorso(p, frame) {
     const dx = p.x - frame.origin.x;
     const dy = p.y - frame.origin.y;
     const localX = dx * frame.ex.x + dy * frame.ex.y;
     const localY = dx * frame.ey.x + dy * frame.ey.y;
     return (
-      Math.abs(localX) <= frame.width * 0.58 &&
-      localY >= -frame.height * 0.18 &&
-      localY <= frame.height * 1.06
+      Math.abs(localX) <= frame.width * 0.65 &&
+      localY >= -frame.height * 0.38 &&
+      localY <= frame.height * 1.08
     );
   }
 
@@ -485,7 +485,7 @@ export class SunCoachEngine {
    * Pas de repli poignet pose (trop de faux positifs dos tourné).
    */
   _getCoverageContacts(track, P, liveFrame, lockedFrame, W, H, ts) {
-    if (!lockedFrame) return [];
+    if (!lockedFrame || !P) return [];
     const out = [];
     const defs = [
       { hand: track.leftHand2D, poseWrist: LM.L_WRIST, name: 'gauche' },
@@ -493,26 +493,29 @@ export class SunCoachEngine {
     ];
 
     for (const d of defs) {
-      if (!d.hand?.length || d.hand.length < 21) continue;
-      if (!credibleBackHand(d.hand, P?.[d.poseWrist], P, W, H)) continue;
+      let rawPoints = [];
 
-      const handPx = d.hand.map((p) => ({
-        x: p.x * W,
-        y: p.y * H,
-        visibility: p.visibility ?? p.presence ?? 0,
-      }));
-      const points = contactPointsFromHand(handPx).map((p) =>
-        warpToLocked(p, liveFrame, lockedFrame)
-      );
+      if (d.hand?.length >= 21 && credibleBackHand(d.hand, P[d.poseWrist], P, W, H)) {
+        rawPoints = handContactPixels(d.hand, W, H);
+      }
+
+      if (!rawPoints.length) {
+        const w = P[d.poseWrist];
+        if (crediblePoseWrist(w, P)) rawPoints = [w];
+      }
+
+      if (!rawPoints.length) {
+        const est = elbowBackContact(P, d.name);
+        if (est) rawPoints = [est];
+      }
 
       const f = this.filters[d.name];
-      for (const p of points) {
-        if (!this._pointNearTorso(p, lockedFrame)) continue;
-        const raw = toBack(p, lockedFrame);
-        const u = f.u.filter(raw.u, ts);
-        const v = f.v.filter(raw.v, ts);
-        if (!this.contactGate.allow(d.name, u, v)) continue;
-        out.push({ name: d.name, u, v });
+      for (const p of rawPoints) {
+        const warped = liveFrame ? warpToLocked(p, liveFrame, lockedFrame) : p;
+        if (!this._pointNearTorso(warped, lockedFrame)) continue;
+        const raw = toBack(warped, lockedFrame);
+        const sm = this.contactGate.clamp(d.name, f.u.filter(raw.u, ts), f.v.filter(raw.v, ts));
+        out.push({ name: d.name, u: sm.u, v: sm.v });
       }
     }
     return out;
@@ -569,7 +572,17 @@ export class SunCoachEngine {
     ) {
       this.lastCaptureHintTs = ts;
       this.voice.say(
-        'Je ne capte pas ta paume sur le dos. Colle bien la main à plat et frotte lentement.',
+        'Je vois ton bras mais pas sur le dos enregistré. Reste dos à la caméra, frotte lentement.',
+        { queue: true }
+      );
+    } else if (
+      contacts.length === 0 &&
+      (this.lastPaintTs.new === 0 || ts - this.lastPaintTs.new > 10000) &&
+      ts - this.lastCaptureHintTs > 14000
+    ) {
+      this.lastCaptureHintTs = ts;
+      this.voice.say(
+        'Je ne capte pas ta main. Colle la paume à plat sur le dos et frotte lentement.',
         { queue: true }
       );
     }

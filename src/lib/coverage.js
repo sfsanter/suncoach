@@ -12,10 +12,10 @@ export const COLS = 3;
 export const HEAT_W = 36;
 export const HEAT_H = 48;
 
-const PIXEL_NEED = 0.28;
-const ZONE_RATIO = 0.62;
+const PIXEL_NEED = 0.2;
+const ZONE_RATIO = 0.58;
 /** Pinceau : une paume couvre une zone visible sur la minimap. */
-const SIGMA = 0.075;
+const SIGMA = 0.085;
 export const DONE_PAINTED_RATIO = 0.94;
 export const MIN_COVERAGE_SEC = 50;
 
@@ -60,7 +60,15 @@ function effectiveHalfWidth(v) {
 export function insideBackShape(u, v) {
   if (tracedContour) {
     const { left, right, valid, vTop, vBot } = tracedContour;
-    if (v < vTop - 0.04 || v > vBot + 0.04) return false;
+    // Nuque : au-dessus du masque IA (cheveux souvent exclus du scan).
+    if (v < vTop - 0.04) {
+      if (v >= vTop - 0.18) {
+        const hw = effectiveHalfWidth(Math.max(0, vTop - 0.06)) * 0.88;
+        return Math.abs(u - 0.5) <= hw;
+      }
+      return false;
+    }
+    if (v > vBot + 0.04) return false;
     const idx = Math.max(0, Math.min(TRACE_BINS - 1, Math.floor(v * TRACE_BINS)));
     if (!valid[idx]) return false;
     const margin = 0.04;
