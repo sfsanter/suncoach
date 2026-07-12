@@ -13,11 +13,17 @@ import { setupMinimapCanvas } from './lib/minimapCanvas.js';
 import { CALIBRATION_STEPS, ANCHOR_ORDER } from './lib/backCalibration.js';
 import { strokeZoneOutline } from './lib/zones.js';
 import { preloadPose, preloadBodySegmenter } from './lib/pose.js';
+import { isTestMode } from './lib/testMode.js';
+import TestPage from './TestPage.jsx';
+
+const testMode = isTestMode();
 
 export default function App() {
-  const [screen, setScreen] = useState('home'); // home | session | done
+  const [screen, setScreen] = useState('home'); // home | session | done | test
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
+  const [sessionRunning, setSessionRunning] = useState(false);
+  const engineRef = useRef(null);
 
   // Télécharge WASM + modèle de pose dès l'accueil : quand l'utilisateur
   // appuie sur "Commencer", tout est déjà prêt (fini le chargement qui traîne).
@@ -29,14 +35,32 @@ export default function App() {
   return (
     <div className="h-full bg-nerv-black">
       {screen === 'home' && (
-        <HomeScreen error={error} onStart={() => { setError(null); setScreen('session'); }} />
-      )}
-      {screen === 'session' && (
-        <SessionScreen
-          onAbort={() => setScreen('home')}
-          onError={(msg) => { setError(msg); setScreen('home'); }}
-          onDone={(res) => { setResult(res); setScreen('done'); }}
+        <HomeScreen
+          error={error}
+          testMode={testMode}
+          onStart={() => { setError(null); setSessionRunning(true); setScreen('session'); }}
+          onOpenTest={() => setScreen('test')}
         />
+      )}
+      {screen === 'test' && testMode && (
+        <TestPage
+          engine={engineRef.current}
+          sessionActive={sessionRunning}
+          onBack={() => setScreen(sessionRunning ? 'session' : 'home')}
+          onStartSession={() => { setError(null); setSessionRunning(true); setScreen('session'); }}
+        />
+      )}
+      {(screen === 'session' || (screen === 'test' && sessionRunning)) && (
+        <div className={screen === 'test' ? 'hidden' : undefined}>
+        <SessionScreen
+          engineRef={engineRef}
+          testMode={testMode}
+          onOpenTest={() => setScreen('test')}
+          onAbort={() => { setSessionRunning(false); setScreen('home'); }}
+          onError={(msg) => { setError(msg); setSessionRunning(false); setScreen('home'); }}
+          onDone={(res) => { setResult(res); setSessionRunning(false); setScreen('done'); }}
+        />
+        </div>
       )}
       {screen === 'done' && (
         <DoneScreen result={result} onRestart={() => setScreen('home')} />
@@ -56,11 +80,19 @@ const BRIEFING = [
   '06. REPLACE-TOI (VOIX) → FROTTE — ORANGE → VERT.',
 ];
 
-function HomeScreen({ error, onStart }) {
+function HomeScreen({ error, onStart, testMode, onOpenTest }) {
   return (
     <div className="relative min-h-full overflow-hidden">
       <HexGridBackground color="#FF9900" opacity={0.07} />
       <div className="relative mx-auto flex min-h-screen max-w-md flex-col justify-center gap-4 px-4 py-8">
+        {testMode && (
+          <EmergencyBanner
+            text="TEST MODE — LAN SYNC"
+            subtext="Panneau debug · transmission vers Mac (même WiFi)"
+            severity="warning"
+            visible
+          />
+        )}
         <div className="text-center">
           <div
             className="text-nerv-red text-5xl font-bold tracking-[0.15em] nerv-text-shadow-red"
@@ -108,6 +140,12 @@ function HomeScreen({ error, onStart }) {
         <Button variant="primary" size="lg" fullWidth onClick={onStart}>
           COMMENCER LE PROTOCOLE
         </Button>
+
+        {testMode && (
+          <Button variant="ghost" size="lg" fullWidth onClick={onOpenTest}>
+            PANNEAU TEST DEBUG
+          </Button>
+        )}
 
         <p
           className="text-center text-xs text-nerv-white/50"
@@ -299,11 +337,11 @@ function PointAdjustScreen({ payload, engine }) {
 
 // ---------------------------------------------------------------- session
 
-function SessionScreen({ onAbort, onError, onDone }) {
+function SessionScreen({ onAbort, onError, onDone, engineRef, testMode, onOpenTest }) {
   const videoRef = useRef(null);
   const overlayRef = useRef(null);
   const minimapRef = useRef(null);
-  const engineRef = useRef(null);
+  const localEngineRef = useRef(null);
   const [hud, setHud] = useState({ pct: 0, status: 'INITIALISATION…' });
   const [muted, setMuted] = useState(false);
   const [ready, setReady] = useState(false);
@@ -327,7 +365,8 @@ function SessionScreen({ onAbort, onError, onDone }) {
         setAdjustPayload(p === 'adjusting' ? data : null);
       },
     });
-    engineRef.current = engine;
+    localEngineRef.current = engine;
+    if (engineRef) engineRef.current = engine;
     let cancelled = false;
     engine
       .start()
@@ -347,9 +386,11 @@ function SessionScreen({ onAbort, onError, onDone }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const engine = () => engineRef?.current ?? localEngineRef.current;
+
   const toggleMute = () => {
     const m = !muted;
-    engineRef.current?.setMuted(m);
+    engine()?.setMuted(m);
     setMuted(m);
   };
 
@@ -375,8 +416,8 @@ function SessionScreen({ onAbort, onError, onDone }) {
           />
         )}
 
-        {phase === 'adjusting' && adjustPayload && engineRef.current && (
-          <PointAdjustScreen payload={adjustPayload} engine={engineRef.current} />
+        {phase === 'adjusting' && adjustPayload && engine() && (
+          <PointAdjustScreen payload={adjustPayload} engine={engine()} />
         )}
 
         {phase !== 'adjusting' && (
@@ -411,14 +452,19 @@ function SessionScreen({ onAbort, onError, onDone }) {
         )}
       </div>
 
-      <div className="flex justify-center gap-3 border-t border-nerv-orange/30 bg-nerv-panel px-4 py-3">
+      <div className="flex flex-wrap justify-center gap-3 border-t border-nerv-orange/30 bg-nerv-panel px-4 py-3">
+        {testMode && (
+          <Button variant="ghost" onClick={onOpenTest}>
+            TEST
+          </Button>
+        )}
         {phase !== 'adjusting' && (
-        <Button variant="ghost" onClick={() => engineRef.current?.flip()}>
+        <Button variant="ghost" onClick={() => engine()?.flip()}>
           CAMÉRA
         </Button>
         )}
         {phase === 'reposition' && (
-        <Button variant="primary" onClick={() => engineRef.current?.skipReposition()}>
+        <Button variant="primary" onClick={() => engine()?.skipReposition()}>
           C’EST BON — COMMENCER
         </Button>
         )}
@@ -428,7 +474,7 @@ function SessionScreen({ onAbort, onError, onDone }) {
         <Button
           variant="danger"
           onClick={() => {
-            const res = engineRef.current?.stopEarly();
+            const res = engine()?.stopEarly();
             if (res) onDone(res);
             else onAbort();
           }}

@@ -778,6 +778,44 @@ export class SunCoachEngine {
     return result;
   }
 
+  /** État sérialisable pour le panneau test (?test=1) — sans refs DOM. */
+  getDebugBundle() {
+    const outline = customBackOutlineUV();
+    const warp = getBackWarp();
+    return {
+      state: this.state,
+      coachMode: this.coachMode,
+      paintedRatio: this.grid?.paintedRatio ?? 0,
+      warpActive: !!warp,
+      outlinePointCount: outline?.length ?? 0,
+      outline: outline?.map((p) => ({ u: p.u, v: p.v })) ?? null,
+      draftAnchorsPx: this.draftAnchorsPx ? { ...this.draftAnchorsPx } : null,
+      calibrationAnchors: this.calibrationAnchors
+        ? Object.fromEntries(
+            Object.entries(this.calibrationAnchors).map(([k, v]) => [k, { u: v.u, v: v.v }])
+          )
+        : null,
+      minimap: this.minimap
+        ? {
+            bufferW: this.minimap.width,
+            bufferH: this.minimap.height,
+            cssW: this.minimap.style?.width ?? null,
+            cssH: this.minimap.style?.height ?? null,
+            logicalW: this.minimapLogicalW ?? null,
+            logicalH: this.minimapLogicalH ?? null,
+            debugInfo: minimapDebugInfo(this.minimap),
+          }
+        : null,
+      bodyPixelCount: this.grid?.heat?.length ?? 0,
+      zonesCovered: (() => {
+        let n = 0;
+        for (let i = 0; i < ZONE_COUNT; i++) if (this.grid?.isCovered?.(i)) n++;
+        return n;
+      })(),
+      zonesTotal: ZONE_COUNT,
+    };
+  }
+
   _finish() {
     const result = this._buildResult(false);
     this.beeper.success();

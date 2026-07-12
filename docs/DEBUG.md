@@ -68,3 +68,39 @@ Le `__BUILD_ID__` injecté par Vite apparaît sur l'accueil et sous la minimap.
 - Voix TTS (`speechSynthesis`)
 
 Ces points restent des tests manuels sur appareil réel.
+
+## Transmission vers le Mac
+
+Panneau test activé avec `?test=1` (ex. `https://sfsanter.github.io/suncoach/?test=1` ou `?test=1&debug=1`).
+
+### 1. Sur le Mac
+
+```bash
+node test-receiver.mjs
+```
+
+Le script affiche les adresses IPv4 locales (ex. `192.168.1.42`) et écoute le port **39281**.
+
+### 2. Sur le téléphone
+
+1. Ouvre l’URL avec `?test=1`.
+2. Depuis l’accueil : **PANNEAU TEST DEBUG**, ou **TEST** pendant une session.
+3. Saisis l’IP du Mac et le port (39281 par défaut).
+4. Lance une session, puis **CAPTURER ÉTAT DEBUG**.
+5. **ENVOYER AU MAC** — ou **COPIER JSON** / **TÉLÉCHARGER JSON** en secours.
+
+### 3. Vérifier sur le Mac
+
+Les captures arrivent dans `test-captures/` :
+
+- `YYYY-MM-DD_HH-mm-ss.json` — bundle debug (`engine.getDebugBundle()` + métadonnées)
+- `YYYY-MM-DD_HH-mm-ss.jpg` — snapshot JPEG de la minimap (si session active)
+
+### Test curl local
+
+```bash
+curl -s http://127.0.0.1:39281/
+curl -X POST http://127.0.0.1:39281/capture \
+  -H 'Content-Type: application/json' \
+  -d '{"build":"test","url":"http://example","capturedAt":"2026-07-12T10:00:00Z"}'
+```
