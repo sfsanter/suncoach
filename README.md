@@ -1,34 +1,53 @@
-# 🧴☀️ SunCoach
+# SunCoach
 
 Assistant vocal pour mettre de la crème solaire **dans le dos**, sans oublier une zone.
-Interface façon NERV (Neon Genesis Evangelion) grâce à [@mdrbx/nerv-ui](https://github.com/mdrbx/nerv-ui).
+Interface façon NERV ([@mdrbx/nerv-ui](https://github.com/mdrbx/nerv-ui)).
 
 Pose ton téléphone, mets-toi dos à la caméra, et laisse-toi guider à la voix : l'app
-suit tes mains grâce à [MediaPipe Pose](https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker),
-découpe ton dos en zones, et te dit où il manque de la crème — avec des conseils de
-mouvements pour les zones difficiles (omoplates, milieu du dos…).
+suit tes mains, découpe ton dos en 7 zones anatomiques, et te dit où il manque de la crème.
 
-## Utilisation
+## Flux réel (Holistic + Segmenter)
 
-1. Ouvre la page sur ton téléphone, monte le volume.
-2. Cale le téléphone à hauteur de poitrine, recule d'environ 2 mètres, dos à la caméra.
-3. Suis la voix. Des bips façon « radar de recul » t'indiquent si ta main approche
-   d'une zone à couvrir. Un jingle sonne quand tout le dos est couvert.
+1. **Placement** — distance ~2 m, dos à la caméra, épaules et hanches visibles.
+2. **Scan IA** — `HolisticLandmarker` + `BodySegmenter` : photo figée, masque dos moyenné (~30 frames).
+3. **Ajustement** — 8 points glissables sur la photo (épaules/nuque au départ → contour du dos).
+4. **Reposition** — retour dos caméra ; score de pose continu (pas de seuil binaire).
+5. **Couverture libre** — frotte tout le dos ; heatmap orange → vert, bips radar, voix sur les zones manquantes.
+
+Tout tourne **100 % dans le navigateur** (WASM/GPU). La vidéo ne quitte jamais l'appareil.
 
 ## Technique
 
-- React + Vite, UI : composants [@mdrbx/nerv-ui](https://www.npmjs.com/package/@mdrbx/nerv-ui) (Tailwind CSS).
-- Détection de pose : MediaPipe Tasks Vision (`PoseLandmarker`, modèle lite) en
-  WebAssembly/GPU, directement dans le navigateur.
-- Voix : Web Speech API (`speechSynthesis`, fr-FR). Sons : WebAudio.
-- Déploiement : GitHub Actions pousse `dist/` sur la branche `gh-pages` à chaque push sur `main`.
-  Dans **Settings → Pages**, source = branche `gh-pages` / dossier racine.
-- Confidentialité : la vidéo est analysée localement, **rien n'est envoyé sur internet**.
+| Couche | Fichiers |
+|--------|----------|
+| UI | `src/App.jsx`, `@mdrbx/nerv-ui` |
+| Moteur | `src/lib/engine.js` |
+| Pose + mains | `src/lib/pose.js` — `HolisticLandmarker` |
+| Segmentation IA | `src/lib/bodySegmenter.js`, `src/lib/segmentation.js` |
+| Schéma dos | `src/lib/backWarp.js`, `src/lib/anchorShape.js`, `src/lib/sessionCore.js` |
+| Couverture | `src/lib/coverage.js`, `src/lib/zones.js`, `src/lib/handGate.js` |
+| Voix / sons | `src/lib/voice.js`, `src/lib/tips.js` |
 
-## Développement local
+- **Warp** : les 8 points photo → UV générique (zones anatomiques + heatmap).
+- **Mode dégradé** : si confiance main basse, peinture par zone via `grid.paintZone`.
+- **Debug** : `?debug=1` sur l'URL, ou `node debug-harness.mjs` (voir `docs/DEBUG.md`).
+
+## Développement
 
 ```bash
 npm install
-npm run dev     # serveur de dev (la caméra exige HTTPS ou localhost)
-npm run build   # build de production dans dist/
+npm run build          # dist/
+node debug-harness.mjs # logique session sans DOM
 ```
+
+La caméra exige HTTPS ou `localhost` — utilise `npm run dev` en local uniquement.
+
+## Déploiement
+
+GitHub Actions sur `main` → `dist/` → GitHub Pages. Détails : [DEPLOI.md](./DEPLOI.md).
+
+## Documentation
+
+- [ARCHITECTURE.md](./ARCHITECTURE.md) — états, figé/live, fichiers
+- [AGENTS.md](./AGENTS.md) — règles agents, hiérarchie, vagues
+- [docs/DEBUG.md](./docs/DEBUG.md) — `?debug=1`, harness

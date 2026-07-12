@@ -9,7 +9,7 @@ import {
   TerminalDisplay,
 } from '@mdrbx/nerv-ui';
 import { SunCoachEngine, ZONE_COUNT, ANATOMICAL_ZONES } from './lib/engine.js';
-import { backHalfWidth } from './lib/coverage.js';
+import { setupMinimapCanvas } from './lib/minimapCanvas.js';
 import { CALIBRATION_STEPS, ANCHOR_ORDER } from './lib/backCalibration.js';
 import { strokeZoneOutline } from './lib/zones.js';
 import { preloadPose, preloadBodySegmenter } from './lib/pose.js';
@@ -86,8 +86,8 @@ function HomeScreen({ error, onStart }) {
         )}
 
         <EmergencyBanner
-          text="SUNCOACH · MINIMAP PROPORTIONS V2"
-          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · schéma = tes 8 points · reposition approx · poignées 28px'}
+          text="SUNCOACH · NETTOYAGE V3 — DOCS + DEBUG"
+          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · schéma warp 8 points · reposition continu · ?debug=1'}
           severity="info"
           visible
         />
@@ -115,7 +115,7 @@ function HomeScreen({ error, onStart }) {
         >
           100 % LOCAL — LA VIDÉO NE QUITTE JAMAIS TON APPAREIL
           <br />
-          BUILD {typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?'} — MINIMAP PROPORTIONS V2
+          BUILD {typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?'} — NETTOYAGE V3
         </p>
       </div>
     </div>
@@ -312,6 +312,10 @@ function SessionScreen({ onAbort, onError, onDone }) {
   const [adjustPayload, setAdjustPayload] = useState(null);
 
   useEffect(() => {
+    if (minimapRef.current) setupMinimapCanvas(minimapRef.current);
+  }, []);
+
+  useEffect(() => {
     const engine = new SunCoachEngine({
       video: videoRef.current,
       overlay: overlayRef.current,
@@ -395,8 +399,6 @@ function SessionScreen({ onAbort, onError, onDone }) {
         <div className="pointer-events-none absolute bottom-3 right-3 flex flex-col items-center gap-1">
           <canvas
             ref={minimapRef}
-            width={220}
-            height={300}
             style={{ width: 110, height: 150, display: 'block' }}
           />
           <span
@@ -486,28 +488,21 @@ function DoneScreen({ result, onRestart }) {
     drawPath(result.paths.gauche, '#00FFFF');
     drawPath(result.paths.droite, '#FF00FF');
 
-    // Contour de la silhouette du dos.
-    const halfW = (v) => {
-      let hw = backHalfWidth(v);
-      if (v < 0.06) hw = Math.min(hw, 0.42 + (v / 0.06) * 0.1);
-      return hw;
-    };
-    c.beginPath();
-    const STEPS = 40;
-    for (let i = 0; i <= STEPS; i++) {
-      const v = i / STEPS;
-      const x = toX(0.5 - halfW(v)), y = toY(v);
-      if (i === 0) c.moveTo(x, y);
-      else c.lineTo(x, y);
+    // Contour du dos (warp 8 points ou silhouette figée).
+    const outline = result.outline;
+    if (outline?.length >= 4) {
+      c.beginPath();
+      outline.forEach((p, i) => {
+        const x = toX(p.u);
+        const y = toY(p.v);
+        if (i === 0) c.moveTo(x, y);
+        else c.lineTo(x, y);
+      });
+      c.closePath();
+      c.strokeStyle = 'rgba(0, 255, 0, 0.8)';
+      c.lineWidth = 1.5;
+      c.stroke();
     }
-    for (let i = STEPS; i >= 0; i--) {
-      const v = i / STEPS;
-      c.lineTo(toX(0.5 + halfW(v)), toY(v));
-    }
-    c.closePath();
-    c.strokeStyle = 'rgba(0, 255, 0, 0.8)';
-    c.lineWidth = 1.5;
-    c.stroke();
 
     // Contours des zones anatomiques.
     for (const z of ANATOMICAL_ZONES) {

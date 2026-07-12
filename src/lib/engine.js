@@ -3,12 +3,13 @@
  * silhouette morphologique, zones anatomiques avec gestes animés.
  */
 import { Voice, Beeper } from './voice.js';
-import { PoseTracker, LM, isBackTurned, OneEuro, BackOrientation, contactPointsFromHand, palmFromHand } from './pose.js';
+import { PoseTracker, LM, isBackTurned, OneEuro, BackOrientation, palmFromHand } from './pose.js';
 import {
-  CoverageGrid, torsoFrame, zoneName, backHalfWidth,
+  CoverageGrid, torsoFrame, backHalfWidth,
   toBack, nearBackShape, coverageHeatRGBA, setShapeScale,
-  setTracedContour, customBackOutlineUV, setCustomBackAnchors, getTracedContour,
-  toCanonicalUV, setMinimapLayout, getMinimapLayout, backToPx,
+  setTracedContour, customBackOutlineUV, setCustomBackAnchors,
+  setMinimapLayout, getMinimapLayout, backToPx, paintUvFromWarpedPixel,
+  getBackWarp,
   HEAT_W, HEAT_H, ZONE_COUNT, ANATOMICAL_ZONES, MIN_COVERAGE_SEC,
 } from './coverage.js';
 import {
@@ -17,12 +18,14 @@ import {
 import { gapMessage, gapShort, calibrationVoice } from './tips.js';
 import { MaskLockAccumulator, LOCK_FRAMES } from './maskLock.js';
 import { warpToLocked, cloneFrame } from './backTemplate.js';
-import { credibleBackHand, crediblePoseWrist, elbowBackContact, handContactPixels, ContactVelocityGate } from './handGate.js';
 import {
-  defaultAnchorsPx, pixelsToBackAnchors, buildMinimapLayout, pixelToLayoutUv,
-  capturePoseSignature, comparePoseSignature,
+  defaultAnchorsPx,
+  capturePoseSignature, comparePoseSignature, shouldEnterCoverage,
 } from './anchorShape.js';
-import { CALIBRATION_STEPS, anchorAssistedContacts } from './backCalibration.js';
+import { applyCalibration } from './sessionCore.js';
+import { isDebugMinimap, minimapDebugInfo, setupMinimapCanvas, MINIMAP_CSS_W, MINIMAP_CSS_H } from './minimapCanvas.js';
+import { credibleBackHand, crediblePoseWrist, elbowBackContact, handContactPixels, ContactVelocityGate, handConfidence, updateCoachMode } from './handGate.js';
+import { anchorAssistedContacts } from './backCalibration.js';
 import {
   buildBackSilhouette, buildFallbackSilhouette, buildBackSilhouetteFromBytes,
   traceBackContour, drawBackSegmentationOverlay,
@@ -83,6 +86,13 @@ export class SunCoachEngine {
     this.onHud(0, 'DÉMARRAGE DE LA CAMÉRA…');
     await this.tracker.startCamera();
 
+    if (this.minimap) {
+      const setup = setupMinimapCanvas(this.minimap);
+      this.minimapCtx = setup.ctx;
+      this.minimapLogicalW = setup.logicalW;
+      this.minimapLogicalH = setup.logicalH;
+    }
+
     this.overlay.width = this.video.videoWidth;
     this.overlay.height = this.video.videoHeight;
     this.grid.reset();
@@ -95,21 +105,17 @@ export class SunCoachEngine {
     this.maskLock = null;
     this.lockStartedAt = 0;
     this.calibrationAnchors = {};
-    this.calibrationGhost = null;
     this.draftAnchorsPx = null;
     this.frozenPoseP = null;
     this.lockedPoseSignature = null;
     this.snapshotDataUrl = null;
     this.snapshotW = 0;
     this.snapshotH = 0;
-    this.repositionOkSince = 0;
-    this.repositionStartedAt = 0;
+    this.coachMode = 'precise';
+    this.repositionStableFrames = 0;
     this.lastTs = 0;
     this.placementOkSince = 0;
     this.lastMilestone = 0;
-    this.currentTargetIdx = null;
-    this.tipSaidForZone = new Set();
-    this.coveredZones = new Set();
     this.paths = { gauche: [], droite: [] };
     this.lastPathTs = { gauche: 0, droite: 0 };
     this.smFrame = null;
@@ -460,11 +466,8 @@ export class SunCoachEngine {
 
   confirmAdjustment() {
     if (this.state !== 'adjusting' || !this.draftAnchorsPx || !this.calibrationFrame) return;
-    this.calibrationAnchors = pixelsToBackAnchors(this.draftAnchorsPx, this.calibrationFrame);
-    const layout = buildMinimapLayout(this.draftAnchorsPx);
-    setTracedContour(null);
-    setMinimapLayout(layout);
-    setCustomBackAnchors(this.calibrationAnchors);
+    const { calibrationAnchors } = applyCalibration(this.draftAnchorsPx, this.calibrationFrame);
+    this.calibrationAnchors = calibrationAnchors;
     this.voice.say(calibrationVoice('done'), { interrupt: true });
     this._startReposition();
   }
@@ -495,6 +498,7 @@ export class SunCoachEngine {
   _startReposition() {
     this.state = 'reposition';
     this.repositionOkSince = 0;
+    this.repositionStableFrames = 0;
     this.repositionStartedAt = performance.now();
     this.onHud(0, 'REPLACE-TOI (APPROX. OK)');
     this.voice.say(calibrationVoice('reposition_intro'), { interrupt: true });
@@ -503,58 +507,51 @@ export class SunCoachEngine {
 
   _repositionTick(P, ts, W) {
     const locked = this.calibrationFrame;
-    const fail = (msg, id, status) => {
-      this.repositionOkSince = 0;
-      this.onHud(0, status);
-      this.voice.say(msg, { id, cooldown: 7000 });
-    };
 
     if (!P || !locked || !this.lockedPoseSignature) {
-      return fail(
-        'Je ne te vois pas. Replace-toi dos à la caméra.',
-        'repo:novis', 'REPOSITION…'
-      );
+      this.repositionStableFrames = 0;
+      this.onHud(0, 'REPOSITION…');
+      this.voice.say('Je ne te vois pas. Replace-toi dos à la caméra.', { id: 'repo:novis', cooldown: 7000 });
+      return;
     }
 
     const ls = P[LM.L_SHOULDER], rs = P[LM.R_SHOULDER];
     if (ls.visibility < 0.45 || rs.visibility < 0.45) {
-      return fail('Montre tes épaules à la caméra.', 'repo:sh', 'ÉPAULES NON VISIBLES');
+      this.repositionStableFrames = 0;
+      this.onHud(0, 'ÉPAULES NON VISIBLES');
+      this.voice.say('Montre tes épaules à la caméra.', { id: 'repo:sh', cooldown: 7000 });
+      return;
     }
     if (!isBackTurned(P, W)) {
-      return fail(calibrationVoice('reposition_turn'), 'repo:turn', 'TOURNE-TOI');
+      this.repositionStableFrames = 0;
+      this.onHud(0, 'TOURNE-TOI');
+      this.voice.say(calibrationVoice('reposition_turn'), { id: 'repo:turn', cooldown: 7000 });
+      return;
     }
 
     const frame = torsoFrame(P);
     const liveSig = capturePoseSignature(P, frame ?? locked);
     const cmp = comparePoseSignature(liveSig, this.lockedPoseSignature);
-    const elapsed = performance.now() - (this.repositionStartedAt || 0);
-
-    if (!cmp.ok && !cmp.approxOk) {
-      const msg = calibrationVoice(cmp.hint) || calibrationVoice('reposition_shift');
-      return fail(msg, 'repo:' + (cmp.hint || 'shift'), cmp.status);
-    }
+    const enter = shouldEnterCoverage(cmp.score ?? cmp.pct ?? 0, this.repositionStableFrames);
+    this.repositionStableFrames = enter.stableFrames;
 
     this.onHud(cmp.pct ?? 0, cmp.status);
-    if (!this.repositionOkSince) this.repositionOkSince = ts;
+    if (cmp.hint) {
+      this.voice.say(calibrationVoice(cmp.hint) || calibrationVoice('reposition_shift'), {
+        id: 'repo:' + cmp.hint,
+        cooldown: 5000,
+      });
+    }
 
-    const stable = ts - this.repositionOkSince;
-    if (cmp.ok && stable > 1200) {
-      this.voice.say(calibrationVoice('reposition_ok'), { interrupt: true });
-      this._startCoverage();
-    } else if (cmp.approxOk && stable > 2500) {
-      this.voice.say(calibrationVoice('reposition_approx_ok'), { interrupt: true });
-      this._startCoverage();
-    } else if (elapsed > 12000 && cmp.approxOk) {
-      this.voice.say(calibrationVoice('reposition_approx_ok'), { interrupt: true });
+    if (enter.entered) {
+      this.voice.say(cmp.ok ? calibrationVoice('reposition_ok') : calibrationVoice('reposition_approx_ok'), { interrupt: true });
       this._startCoverage();
     }
   }
 
-  /** Contact → repère schéma (layout) figé au moment de la photo. */
+  /** Contact → repère schéma unifié (backWarp → UV générique). */
   _toPaintUv(warpedPx, backU, backV) {
-    const layout = getMinimapLayout();
-    if (layout && warpedPx) return pixelToLayoutUv(warpedPx.x, warpedPx.y, layout);
-    return toCanonicalUV(backU, backV);
+    return paintUvFromWarpedPixel(warpedPx, backU, backV, getMinimapLayout());
   }
 
   _startCoverage() {
@@ -562,6 +559,7 @@ export class SunCoachEngine {
     this.backOrient.reset();
     this.orientWarnTs = 0;
     this.contactGate.reset();
+    this.coachMode = 'precise';
     this.filters.gauche.u.reset();
     this.filters.gauche.v.reset();
     this.filters.droite.u.reset();
@@ -593,48 +591,6 @@ export class SunCoachEngine {
       localY >= -frame.height * 0.38 &&
       localY <= frame.height * 1.08
     );
-  }
-
-  /**
-   * Projection 2D image → repère torse (u, v). Plus fiable que le monde 3D
-   * quand on frotte le dos dos à la caméra.
-   */
-  _getContactPoints2D(track, P, frame, W, H, ts, { forCalibration = false } = {}) {
-    const out = [];
-    const defs = [
-      { hand: track.leftHand2D, poseWrist: LM.L_WRIST, name: 'gauche' },
-      { hand: track.rightHand2D, poseWrist: LM.R_WRIST, name: 'droite' },
-    ];
-    const margin = forCalibration ? 0.72 : 0.58;
-
-    for (const d of defs) {
-      let points = [];
-      if (d.hand?.length >= 21) {
-        const handPx = d.hand.map((p) => ({
-          x: p.x * W,
-          y: p.y * H,
-          visibility: p.visibility ?? p.presence ?? 0,
-        }));
-        points = contactPointsFromHand(handPx);
-      }
-      if (!points.length && P) {
-        const w = P[d.poseWrist];
-        if (w && w.visibility >= 0.45) points = [w];
-      }
-
-      const f = this.filters[d.name];
-      for (const p of points) {
-        if (!forCalibration && !this._pointNearTorso(p, frame)) continue;
-        if (forCalibration && !this._pointNearTorsoWide(p, frame, margin)) continue;
-        const raw = toBack(p, frame);
-        out.push({
-          name: d.name,
-          u: forCalibration ? raw.u : f.u.filter(raw.u, ts),
-          v: forCalibration ? raw.v : f.v.filter(raw.v, ts),
-        });
-      }
-    }
-    return out;
   }
 
   /**
@@ -694,20 +650,9 @@ export class SunCoachEngine {
     return out;
   }
 
-  _pointNearTorsoWide(p, frame, marginRatio = 0.72) {
-    const dx = p.x - frame.origin.x;
-    const dy = p.y - frame.origin.y;
-    const localX = dx * frame.ex.x + dy * frame.ex.y;
-    const localY = dx * frame.ey.x + dy * frame.ey.y;
-    return (
-      Math.abs(localX) <= frame.width * marginRatio &&
-      localY >= -frame.height * 0.28 &&
-      localY <= frame.height * 1.12
-    );
-  }
-
   _coverageTick(P, track, frame, ts, dt) {
     const W = this.overlay.width;
+    const H = this.overlay.height;
 
     if (!P || !frame) {
       this.beeper.setPaintActivity('off');
@@ -724,11 +669,22 @@ export class SunCoachEngine {
 
     const paintFrame = this.calibrationFrame || frame;
     const contacts = this._getCoverageContacts(
-      track, P, frame, paintFrame, W, this.overlay.height, ts
+      track, P, frame, paintFrame, W, H, ts
     );
+
+    const confL = handConfidence(track.leftHand2D, P, LM.L_WRIST, LM.L_ELBOW);
+    const confR = handConfidence(track.rightHand2D, P, LM.R_WRIST, LM.R_ELBOW);
+    this.coachMode = updateCoachMode(Math.max(confL, confR), this.coachMode);
+
     const painting = contacts.filter((h) => nearBackShape(h.u, h.v));
 
-    const { added, crossed } = this.grid.update(painting, dt);
+    let added = 0, crossed = 0;
+    if (this.coachMode === 'degraded' && painting.length > 0) {
+      const near = this.grid.nearestZone(painting[0].u, painting[0].v);
+      if (near) ({ added, crossed } = this.grid.paintZone(near.idx, dt));
+    } else {
+      ({ added, crossed } = this.grid.update(painting, dt));
+    }
 
     if (crossed > 0 || added > dt * 0.25) this.lastPaintTs.new = ts;
     else if (painting.length > 0) this.lastPaintTs.old = ts;
@@ -770,6 +726,7 @@ export class SunCoachEngine {
     const painted = this.grid.paintedRatio;
     const pct = Math.round(painted * 100);
     const gap = this.grid.biggestGap();
+    const modeLabel = this.coachMode === 'degraded' ? ' · ZONE APPROX' : '';
 
     if (pct >= 0.5 && this.lastMilestone < 0.5) {
       this.lastMilestone = 0.5;
@@ -781,7 +738,7 @@ export class SunCoachEngine {
       if (elapsedSec >= MIN_COVERAGE_SEC) return this._finish();
     }
 
-    this.onHud(painted, gap ? gapShort(gap) : `${pct} % COUVERT`);
+    this.onHud(painted, (gap ? gapShort(gap) : `${pct} % COUVERT`) + modeLabel);
 
     const elapsed = ts - this.freePaintSince;
     if (
@@ -806,6 +763,7 @@ export class SunCoachEngine {
       zonesTotal: ZONE_COUNT,
       heat: this.grid.snapshot(),
       paths: this.paths,
+      outline: customBackOutlineUV(),
     };
   }
 
@@ -904,7 +862,8 @@ export class SunCoachEngine {
   _drawMinimap(ts) {
     if (!this.minimapCtx) return;
     const c = this.minimapCtx;
-    const W = this.minimap.width, H = this.minimap.height;
+    const W = this.minimapLogicalW ?? this.minimap.width;
+    const H = this.minimapLogicalH ?? this.minimap.height;
     c.clearRect(0, 0, W, H);
     c.fillStyle = 'rgba(0, 0, 0, 0.78)';
     c.fillRect(0, 0, W, H);
@@ -998,6 +957,18 @@ export class SunCoachEngine {
       c.lineWidth = 3;
       c.strokeText(pct + '%', cx, H - 6);
       c.fillText(pct + '%', cx, H - 6);
+    }
+
+    if (isDebugMinimap()) {
+      c.font = '7px Fira Code, monospace';
+      c.fillStyle = 'rgba(255, 255, 0, 0.95)';
+      c.textAlign = 'left';
+      const dbg = [
+        minimapDebugInfo(this.minimap),
+        `state ${this.state} · coach ${this.coachMode}`,
+        `warp ${getBackWarp() ? 'on' : 'off'} · body ${this.grid.heat.length}`,
+      ];
+      dbg.forEach((line, i) => c.fillText(line, 4, 10 + i * 9));
     }
   }
 

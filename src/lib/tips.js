@@ -1,8 +1,7 @@
 /**
- * Messages vocaux pour les zones manquantes.
+ * Messages vocaux pour les zones manquantes et le flux de calibration.
  */
 import { ANATOMICAL_ZONES } from './zones.js';
-import { CALIBRATION_STEPS, CALIBRATION_STEP_COUNT } from './backCalibration.js';
 
 export function gapMessage(gap) {
   if (!gap) return '';
@@ -24,33 +23,7 @@ export function gapShort(gap) {
   return gap ? `MANQUE : ${gap.zone.short}` : '';
 }
 
-export function zoneName(idx) {
-  return ANATOMICAL_ZONES[idx]?.name ?? '';
-}
-
 const CALIBRATION_VOICES = {
-  intro:
-    'Calibrage de ton dos sur la photo figée. Huit points sur le contour : ' +
-    'à chaque étape, fais le geste indiqué et reste immobile quand les bips accélèrent.',
-  nuque:
-    'Point un, la nuque. Main droite : passe ton bras par-dessus ton épaule droite, ' +
-    'coude vers le haut, paume sur la nuque. Reste immobile.',
-  epaule_g:
-    'Point deux, épaule gauche. Main gauche par en dessous, touche le bord gauche en haut du dos.',
-  epaule_d:
-    'Point trois, épaule droite. Main droite par en dessous, bord droit en haut du dos.',
-  milieu_g:
-    'Point quatre, milieu gauche. Main gauche sur le bord externe, au milieu du dos.',
-  milieu_d:
-    'Point cinq, milieu droit. Main droite, bord externe à droite, au milieu du dos.',
-  bas:
-    'Point six, bas du dos. Une main au centre, tout en bas du dos.',
-  rein_g:
-    'Point sept, rein gauche. Main gauche à plat, bord gauche au niveau des reins.',
-  rein_d:
-    'Point huit, rein droit. Main droite à plat, bord droit au niveau des reins.',
-  gesture_ok: 'Je vois ton geste, reste immobile.',
-  next: 'Parfait ! Point suivant.',
   done:
     'Calibrage terminé. Prends la crème, puis replace-toi dos à la caméra. ' +
     'Je te guide pour retrouver la même position.',
@@ -74,19 +47,8 @@ const CALIBRATION_VOICES = {
   adjust_intro:
     'Photo prise ! Les points verts sont sur tes épaules et ta nuque. ' +
     'Glisse chaque point sur le contour de ton dos, puis valide.',
-  no_gesture:
-    'Je ne vois pas le bon geste. Écoute bien l’instruction et recommence.',
-  nuque_hint:
-    'Pour la nuque : main droite, bras par-dessus l’épaule droite, coude bien levé.',
 };
 
 export function calibrationVoice(id) {
   return CALIBRATION_VOICES[id] ?? '';
-}
-
-/** Annonce complète d'une étape (évite file d'attente voix + message négatif). */
-export function calibrationStepAnnounce(stepIndex) {
-  const step = CALIBRATION_STEPS[stepIndex];
-  if (!step) return '';
-  return `Point ${stepIndex + 1} sur ${CALIBRATION_STEP_COUNT}, ${step.label}. ${calibrationVoice(step.id)}`;
 }

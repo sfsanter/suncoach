@@ -103,6 +103,26 @@ export function elbowBackContact(P, side) {
   };
 }
 
+/** Score confiance continu 0–1 pour mode dégradé. */
+export function handConfidence(handLandmarks, poseLandmarks, wristIdx, elbowIdx) {
+  const wristVis = poseLandmarks?.[wristIdx]?.visibility ?? 0;
+  const elbowVis = poseLandmarks?.[elbowIdx]?.visibility ?? 0;
+  if (handLandmarks?.length >= 21) {
+    const avg = handLandmarks.reduce((s, l) => s + (l.visibility ?? l.presence ?? 0), 0) / handLandmarks.length;
+    return avg;
+  }
+  return wristVis * 0.6 + elbowVis * 0.4;
+}
+
+const CONF_HIGH = 0.6;
+const CONF_LOW = 0.35;
+
+export function updateCoachMode(confidence, currentMode) {
+  if (currentMode === 'precise' && confidence < CONF_LOW) return 'degraded';
+  if (currentMode === 'degraded' && confidence > CONF_HIGH) return 'precise';
+  return currentMode;
+}
+
 /** Ramène les points contact d'une main (coords normalisées 0–1). */
 export function handContactPixels(handNorm, W, H) {
   if (!handNorm?.length) return [];

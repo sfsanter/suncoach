@@ -3,8 +3,8 @@
  * Cascade : poignet pose → paume Holistic → estimation coude.
  * 8 repères dont reins en 7 et 8.
  */
-import { LM, contactPointsFromHand, palmFromHand } from './pose.js';
-import { toBack, backToPx } from './coverage.js';
+import { LM, palmFromHand } from './pose.js';
+import { toBack } from './coverage.js';
 
 export const CALIBRATION_STEP_COUNT = 8;
 
@@ -18,9 +18,6 @@ export const CALIBRATION_STEPS = [
   { id: 'rein_g', label: 'REIN G.', side: 'gauche', gesture: 'lateral_waist' },
   { id: 'rein_d', label: 'REIN D.', side: 'droite', gesture: 'lateral_waist' },
 ];
-
-const STABLE_MS = 900;
-const STABLE_UV_EPS = 0.045;
 
 function vis(p) {
   return p?.visibility ?? 0;
@@ -166,129 +163,9 @@ export function getCalibrationContact(stepId, track, P, frame, W, H) {
   return uv ? { ...uv, source: sideKey } : null;
 }
 
-/**
- * Évalue l'étape courante : geste + stabilité → repère validé.
- */
-export function evaluateCalibrationStep(stepIndex, track, P, frame, W, H, ts, state = {}) {
-  const step = CALIBRATION_STEPS[stepIndex];
-  if (!step) return { gesture: false, progress: 0, done: false, anchor: null, screen: null };
-
-  const gesture = detectCalibrationGesture(step.id, P, frame);
-  const contact = gesture ? getCalibrationContact(step.id, track, P, frame, W, H) : null;
-
-  if (!gesture || !contact) {
-    return {
-      gesture: false,
-      progress: 0,
-      done: false,
-      anchor: null,
-      screen: null,
-      stableSince: 0,
-    };
-  }
-
-  const last = state.lastUv;
-  const jumped = last && Math.hypot(contact.u - last.u, contact.v - last.v) > STABLE_UV_EPS * 2.5;
-  let stableSince = state.stableSince || 0;
-  if (!stableSince || jumped) stableSince = ts;
-
-  const elapsed = ts - stableSince;
-  const progress = Math.min(1, elapsed / STABLE_MS);
-  const done = elapsed >= STABLE_MS;
-  const screen = backToPx(contact.u, contact.v, frame);
-
-  return {
-    gesture: true,
-    progress,
-    done,
-    anchor: done ? { u: contact.u, v: contact.v } : null,
-    screen,
-    stableSince,
-    lastUv: { u: contact.u, v: contact.v },
-    source: contact.source,
-  };
-}
-
 const ANCHOR_ORDER = ['nuque', 'epaule_g', 'milieu_g', 'rein_g', 'bas', 'rein_d', 'milieu_d', 'epaule_d'];
 
 export { ANCHOR_ORDER };
-
-/** 8 repères pré-positionnés sur le contour IA. */
-export function ghostAnchorsFromContour(contour) {
-  const fallback = {
-    nuque: { u: 0.5, v: 0.08 },
-    epaule_g: { u: 0.22, v: 0.18 },
-    epaule_d: { u: 0.78, v: 0.18 },
-    milieu_g: { u: 0.18, v: 0.42 },
-    milieu_d: { u: 0.82, v: 0.42 },
-    bas: { u: 0.5, v: 0.92 },
-    rein_g: { u: 0.22, v: 0.72 },
-    rein_d: { u: 0.78, v: 0.72 },
-  };
-  if (!contour?.valid) return { ...fallback };
-
-  const { left, right, valid, vTop, vBot, bins } = contour;
-  const span = Math.max(0.12, vBot - vTop);
-
-  const atSide = (v, side) => {
-    const idx = Math.max(0, Math.min(bins - 1, Math.round(v * bins)));
-    if (!valid[idx]) return null;
-    return { u: side === 'left' ? left[idx] : right[idx], v: (idx + 0.5) / bins };
-  };
-  const center = (v) => {
-    const l = atSide(v, 'left');
-    const r = atSide(v, 'right');
-    if (!l || !r) return null;
-    return { u: (l.u + r.u) / 2, v: (l.v + r.v) / 2 };
-  };
-
-  return {
-    nuque: center(vTop + 0.02) ?? fallback.nuque,
-    epaule_g: atSide(vTop + span * 0.1, 'left') ?? fallback.epaule_g,
-    epaule_d: atSide(vTop + span * 0.1, 'right') ?? fallback.epaule_d,
-    milieu_g: atSide(vTop + span * 0.38, 'left') ?? fallback.milieu_g,
-    milieu_d: atSide(vTop + span * 0.38, 'right') ?? fallback.milieu_d,
-    bas: center(vBot - 0.02) ?? fallback.bas,
-    rein_g: atSide(vTop + span * 0.68, 'left') ?? fallback.rein_g,
-    rein_d: atSide(vTop + span * 0.68, 'right') ?? fallback.rein_d,
-  };
-}
-
-export function drawCalibrationAnchors(ctx, anchors, frame, { ghost = null, activeId = null } = {}) {
-  if (!frame) return;
-  const merged = { ...ghost, ...anchors };
-  const pts = ANCHOR_ORDER
-    .map((id) => merged[id] && { id, ...backToPx(merged[id].u, merged[id].v, frame), done: !!anchors[id] })
-    .filter(Boolean);
-  if (pts.length < 2) return;
-
-  ctx.save();
-  ctx.strokeStyle = 'rgba(80, 255, 120, 0.75)';
-  ctx.lineWidth = 2;
-  ctx.setLineDash([6, 4]);
-  ctx.beginPath();
-  ctx.moveTo(pts[0].x, pts[0].y);
-  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
-  ctx.closePath();
-  ctx.stroke();
-  ctx.setLineDash([]);
-
-  for (const p of pts) {
-    const active = p.id === activeId;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, active ? 12 : 8, 0, Math.PI * 2);
-    ctx.fillStyle = p.done
-      ? 'rgba(40, 255, 100, 0.95)'
-      : active
-        ? 'rgba(255, 200, 50, 0.9)'
-        : 'rgba(80, 255, 120, 0.45)';
-    ctx.fill();
-    ctx.strokeStyle = active ? '#FFD700' : '#fff';
-    ctx.lineWidth = active ? 3 : 2;
-    ctx.stroke();
-  }
-  ctx.restore();
-}
 
 /** Peinture haut du dos : geste reconnu + repère calibré (82 % ancre). */
 export function anchorAssistedContacts(P, track, lockedFrame, anchors, W, H) {
@@ -305,25 +182,4 @@ export function anchorAssistedContacts(P, track, lockedFrame, anchors, W, H) {
     out.push({ name, u, v, anchor: step.id });
   }
   return out;
-}
-
-export function drawCalibrationFeedback(ctx, screen, ts, { gesture = false, progress = 0 } = {}) {
-  if (!screen) return;
-  ctx.save();
-  if (gesture) {
-    const r = 16 + progress * 10;
-    ctx.beginPath();
-    ctx.arc(screen.x, screen.y, r, 0, Math.PI * 2);
-    ctx.strokeStyle = `rgba(80, 255, 140, ${0.5 + progress * 0.5})`;
-    ctx.lineWidth = 3;
-    ctx.stroke();
-    if (progress > 0) {
-      ctx.beginPath();
-      ctx.arc(screen.x, screen.y, r + 8, -Math.PI / 2, -Math.PI / 2 + progress * Math.PI * 2);
-      ctx.strokeStyle = 'rgba(120, 255, 180, 0.95)';
-      ctx.lineWidth = 4;
-      ctx.stroke();
-    }
-  }
-  ctx.restore();
 }

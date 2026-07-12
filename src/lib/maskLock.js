@@ -2,7 +2,7 @@
  * Verrouillage du contour dos depuis masque IA (moyenne sur plusieurs frames).
  */
 import { toBack } from './coverage.js';
-import { TRACE_BINS } from './contourTrace.js';
+import { TRACE_BINS } from './coverage.js';
 
 export const LOCK_FRAMES = 20;
 

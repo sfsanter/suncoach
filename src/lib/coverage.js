@@ -5,10 +5,11 @@
 import { LM } from './pose.js';
 import { ANATOMICAL_ZONES, ZONE_COUNT } from './zones.js';
 import { buildCanonicalShape, canonicalToBackUv, backUvToCanonical, insideLayoutShape } from './anchorShape.js';
+import { getBackWarp } from './backWarp.js';
+
+export { setBackWarp, getBackWarp, paintUvFromWarpedPixel } from './backWarp.js';
 
 export { ANATOMICAL_ZONES, ZONE_COUNT };
-export const ROWS = 4;
-export const COLS = 3;
 
 export const HEAT_W = 36;
 export const HEAT_H = 48;
@@ -20,7 +21,7 @@ const SIGMA = 0.085;
 export const DONE_PAINTED_RATIO = 0.94;
 export const MIN_COVERAGE_SEC = 50;
 
-const TRACE_BINS = 32;
+export const TRACE_BINS = 32;
 
 let shapeScale = 1.0;
 let bodyMask = new Uint8Array(HEAT_W * HEAT_H);
@@ -117,6 +118,8 @@ let minimapLayout = null;
 
 /** Contour minimap : proportions exactes des 8 points manuels. */
 export function customBackOutlineUV() {
+  const warp = getBackWarp();
+  if (warp?.outline?.length >= 4) return warp.outline;
   if (minimapLayout?.outline?.length >= 4) return minimapLayout.outline;
   if (canonicalShape?.outline?.length >= 4) {
     return canonicalShape.outline.map((p) => ({ u: p.u, v: p.v }));
@@ -136,10 +139,6 @@ export function setMinimapLayout(layout) {
   rebuildBodyMask();
 }
 
-export function getCanonicalShape() {
-  return canonicalShape;
-}
-
 export function toCanonicalUV(u, v) {
   return canonicalShape ? backUvToCanonical(u, v, canonicalShape) : { u, v };
 }
@@ -157,16 +156,14 @@ export function setTracedContour(contour) {
   rebuildBodyMask();
 }
 
-export function getTracedContour() {
-  return tracedContour;
-}
-
 export function getCustomBackAnchors() {
   return customAnchors;
 }
 
 /** Marge élargie pour accepter une main légèrement hors silhouette. */
 export function nearBackShape(u, v, margin = 0.06) {
+  const warp = getBackWarp();
+  if (warp) return warp.insideGeneric(u, v);
   if (minimapLayout) return insideLayoutShape(u, v, minimapLayout);
   if (tracedContour || customAnchors) return insideBackShape(u, v);
   if (v < -0.05 || v > 1.05) return false;
@@ -180,7 +177,10 @@ function rebuildBodyMask() {
       const i = y * HEAT_W + x;
       const u = (x + 0.5) / HEAT_W;
       const v = (y + 0.5) / HEAT_H;
-      if (minimapLayout) {
+      const warp = getBackWarp();
+      if (warp) {
+        bodyMask[i] = warp.insideGeneric(u, v) ? 1 : 0;
+      } else if (minimapLayout) {
         bodyMask[i] = insideLayoutShape(u, v, minimapLayout) ? 1 : 0;
       } else if (canonicalShape && customAnchors) {
         const { u: bu, v: bv } = canonicalToBackUv(u, v, canonicalShape);
@@ -197,15 +197,7 @@ export function setShapeScale(scale) {
   rebuildBodyMask();
 }
 
-export function getShapeScale() {
-  return shapeScale;
-}
-
 rebuildBodyMask();
-
-export function zoneName(zoneIdx) {
-  return ANATOMICAL_ZONES[zoneIdx]?.name ?? '';
-}
 
 export function torsoFrame(P) {
   const ls = P[LM.L_SHOULDER], rs = P[LM.R_SHOULDER];
@@ -288,10 +280,6 @@ export function coverageHeatRGBA(f) {
   ];
 }
 
-export function mapBackPoint(p, f) {
-  return toBack(p, f);
-}
-
 export function backToPx(u, v, f) {
   const m = mapBackUV(u, v);
   const du = (m.u - 0.5) * f.width;
@@ -299,52 +287,6 @@ export function backToPx(u, v, f) {
   return {
     x: f.origin.x + f.ex.x * du + f.ey.x * dv,
     y: f.origin.y + f.ex.y * du + f.ey.y * dv,
-  };
-}
-
-const v3 = {
-  sub: (a, b) => ({ x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }),
-  mid: (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, z: (a.z + b.z) / 2 }),
-  dot: (a, b) => a.x * b.x + a.y * b.y + a.z * b.z,
-  cross: (a, b) => ({
-    x: a.y * b.z - a.z * b.y,
-    y: a.z * b.x - a.x * b.z,
-    z: a.x * b.y - a.y * b.x,
-  }),
-  len: (a) => Math.hypot(a.x, a.y, a.z),
-  norm: (a) => {
-    const l = Math.hypot(a.x, a.y, a.z) || 1;
-    return { x: a.x / l, y: a.y / l, z: a.z / l };
-  },
-};
-
-export function torsoFrame3D(W) {
-  const ls = W[LM.L_SHOULDER], rs = W[LM.R_SHOULDER];
-  const lh = W[LM.L_HIP], rh = W[LM.R_HIP];
-  if ([ls, rs, lh, rh].some((p) => p.visibility < 0.4)) return null;
-
-  const origin = v3.mid(ls, rs);
-  const hipMid = v3.mid(lh, rh);
-  const shoulderVec = v3.sub(rs, ls);
-  const downVec = v3.sub(hipMid, origin);
-
-  const width = v3.len(shoulderVec) * 1.15;
-  const height = v3.len(downVec) * 1.08;
-  if (width < 0.05 || height < 0.05) return null;
-
-  const ex = v3.norm(shoulderVec);
-  const ey = v3.norm(downVec);
-  const ez = v3.norm(v3.cross(ex, ey));
-
-  return { origin, ex, ey, ez, width, height };
-}
-
-export function toBack3D(p, f) {
-  const d = v3.sub(p, f.origin);
-  return {
-    u: v3.dot(d, f.ex) / f.width + 0.5,
-    v: v3.dot(d, f.ey) / f.height,
-    w: v3.dot(d, f.ez),
   };
 }
 
@@ -362,6 +304,7 @@ export class CoverageGrid {
     this.heat.fill(0);
     setShapeScale(1.0);
     setMinimapLayout(null);
+    setBackWarp(null);
     setCustomBackAnchors(null);
     setTracedContour(null);
     canonicalShape = null;
@@ -415,6 +358,43 @@ export class CoverageGrid {
 
   biggestGap() {
     return this.missingZones()[0] ?? null;
+  }
+
+  nearestZone(u, v) {
+    let best = null;
+    for (let i = 0; i < ANATOMICAL_ZONES.length; i++) {
+      const z = ANATOMICAL_ZONES[i];
+      const cx = (z.u0 + z.u1) / 2;
+      const cy = (z.v0 + z.v1) / 2;
+      const d = Math.hypot(u - cx, v - cy);
+      if (!best || d < best.d) best = { idx: i, d, zone: z };
+    }
+    return best;
+  }
+
+  /** Mode dégradé : peindre toute une zone anatomique. */
+  paintZone(zoneIdx, dt) {
+    const z = ANATOMICAL_ZONES[zoneIdx];
+    if (!z) return { added: 0, crossed: 0 };
+    let added = 0, crossed = 0;
+    const step = Math.min(dt, 0.04);
+    for (let y = 0; y < HEAT_H; y++) {
+      const v = (y + 0.5) / HEAT_H;
+      if (v < z.v0 || v > z.v1) continue;
+      for (let x = 0; x < HEAT_W; x++) {
+        const u = (x + 0.5) / HEAT_W;
+        if (u < z.u0 || u > z.u1) continue;
+        const i = y * HEAT_W + x;
+        if (bodyMask[i] === 0) continue;
+        const before = this.heat[i];
+        if (before < PIXEL_NEED) {
+          this.heat[i] = before + step;
+          added += step;
+          if (this.heat[i] >= PIXEL_NEED) crossed++;
+        }
+      }
+    }
+    return { added, crossed };
   }
 
   update(hands, dt) {
@@ -502,30 +482,6 @@ export class CoverageGrid {
   get done() {
     if (this.paintedRatio >= DONE_PAINTED_RATIO) return true;
     return this.missingZones().length === 0;
-  }
-
-  nextTarget() {
-    for (let i = 0; i < ZONE_COUNT; i++) if (!this.isCovered(i)) return i;
-    return null;
-  }
-
-  coldestPoint(zoneIdx) {
-    const z = ANATOMICAL_ZONES[zoneIdx];
-    if (!z) return { u: 0.5, v: 0.5 };
-    let best = null;
-    for (let y = 0; y < HEAT_H; y++) {
-      const v = (y + 0.5) / HEAT_H;
-      for (let x = 0; x < HEAT_W; x++) {
-        const u = (x + 0.5) / HEAT_W;
-        if (!inZone(u, v, z)) continue;
-        const i = y * HEAT_W + x;
-        if (bodyMask[i] === 0) continue;
-        const val = this.heat[i];
-        if (!best || val < best.val) best = { val, x, y };
-      }
-    }
-    if (!best) return { u: (z.u0 + z.u1) / 2, v: (z.v0 + z.v1) / 2 };
-    return { u: (best.x + 0.5) / HEAT_W, v: (best.y + 0.5) / HEAT_H };
   }
 
   snapshot() {

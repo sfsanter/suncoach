@@ -202,7 +202,10 @@ export function capturePoseSignature(P, frame) {
 
 export function comparePoseSignature(live, locked) {
   if (!live || !locked) {
-    return { ok: false, approxOk: false, hint: 'reposition_shift', status: 'REPOSITION…', pct: 0 };
+    return {
+      ok: false, approxOk: false, score: 0,
+      hint: 'reposition_shift', status: 'REPOSITION…', pct: 0,
+    };
   }
 
   const scale = live.shoulderW / locked.shoulderW;
@@ -212,41 +215,36 @@ export function comparePoseSignature(live, locked) {
   const depth = dx * locked.ey.x + dy * locked.ey.y;
   const w = locked.shoulderW;
 
-  const score = 1 - Math.min(1,
-    Math.abs(scale - 1) / 0.35 * 0.5 +
-    Math.abs(lateral) / (0.2 * w) * 0.35 +
-    Math.abs(depth) / (0.16 * w) * 0.15
-  );
-  const pct = Math.max(0, Math.round(score * 100));
+  const scaleErr = Math.abs(scale - 1) / 0.35;
+  const latErr = Math.abs(lateral) / (0.22 * w);
+  const depErr = Math.abs(depth) / (0.18 * w);
+  const score = Math.max(0, Math.min(1, 1 - (scaleErr * 0.45 + latErr * 0.35 + depErr * 0.2)));
+  const pct = Math.round(score * 100);
 
-  const approxOk = scale >= 0.68 && scale <= 1.45 &&
-    Math.abs(lateral) <= 0.2 * w && Math.abs(depth) <= 0.16 * w;
+  let hint = null;
+  let status = `ALIGNEMENT ${pct} %`;
+  if (scale < 0.68) { hint = 'reposition_far'; status = 'TROP LOIN'; }
+  else if (scale > 1.45) { hint = 'reposition_close'; status = 'TROP PRÈS'; }
+  else if (lateral < -0.2 * w) { hint = 'reposition_left'; status = '→ DROITE'; }
+  else if (lateral > 0.2 * w) { hint = 'reposition_right'; status = '→ GAUCHE'; }
+  else if (depth < -0.16 * w) { hint = 'reposition_back'; status = 'RECULE UN PEU'; }
+  else if (depth > 0.16 * w) { hint = 'reposition_forward'; status = 'AVANCE UN PEU'; }
 
-  if (scale < 0.68) {
-    return { ok: false, approxOk, hint: 'reposition_far', status: 'TROP LOIN', pct: pct / 100 };
-  }
-  if (scale > 1.45) {
-    return { ok: false, approxOk, hint: 'reposition_close', status: 'TROP PRÈS', pct: pct / 100 };
-  }
-  if (lateral < -0.2 * w) {
-    return { ok: false, approxOk, hint: 'reposition_left', status: '→ DROITE', pct: pct / 100 };
-  }
-  if (lateral > 0.2 * w) {
-    return { ok: false, approxOk, hint: 'reposition_right', status: '→ GAUCHE', pct: pct / 100 };
-  }
-  if (depth < -0.16 * w) {
-    return { ok: false, approxOk, hint: 'reposition_back', status: 'RECULE UN PEU', pct: pct / 100 };
-  }
-  if (depth > 0.16 * w) {
-    return { ok: false, approxOk, hint: 'reposition_forward', status: 'AVANCE UN PEU', pct: pct / 100 };
-  }
+  const approxOk = score >= 0.42;
+  const ok = score >= 0.55;
 
-  const ok = pct >= 55;
   return {
     ok,
     approxOk,
-    hint: ok ? null : 'reposition_approx',
-    status: ok ? `POSITION ${pct} %` : `APPROX. ${pct} %`,
+    score,
+    hint,
+    status,
     pct: pct / 100,
   };
+}
+
+/** Entrée coverage quand score stable au-dessus du seuil. */
+export function shouldEnterCoverage(score, stableFrames, framesRequired = 15) {
+  const next = score > 0.5 ? stableFrames + 1 : 0;
+  return { entered: next >= framesRequired, stableFrames: next };
 }
