@@ -146,6 +146,16 @@ const server = http.createServer(async (req, res) => {
   res.end('Not found');
 });
 
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`\nPort ${PORT} déjà utilisé — le récepteur tourne peut-être déjà.`);
+    console.error('Vérifie : curl http://127.0.0.1:' + PORT + '/');
+    console.error('Pour arrêter l\'ancien : kill $(lsof -t -i :' + PORT + ')\n');
+    process.exit(1);
+  }
+  throw err;
+});
+
 server.listen(PORT, '0.0.0.0', () => {
   console.log('=== SunCoach test receiver ===');
   console.log(`Écoute 0.0.0.0:${PORT}`);

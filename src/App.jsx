@@ -19,17 +19,20 @@ import TestPage from './TestPage.jsx';
 const testMode = isTestMode();
 
 export default function App() {
-  const [screen, setScreen] = useState('home'); // home | session | done | test
+  const [screen, setScreen] = useState(testMode ? 'test' : 'home');
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
   const [sessionRunning, setSessionRunning] = useState(false);
+  const [modelStatus, setModelStatus] = useState('loading');
   const engineRef = useRef(null);
 
-  // Télécharge WASM + modèle de pose dès l'accueil : quand l'utilisateur
-  // appuie sur "Commencer", tout est déjà prêt (fini le chargement qui traîne).
   useEffect(() => {
-    preloadPose().catch(() => { /* sera retenté au lancement de la session */ });
+    let cancelled = false;
+    preloadPose()
+      .then(() => { if (!cancelled) setModelStatus('ok'); })
+      .catch(() => { if (!cancelled) setModelStatus('fail'); });
     preloadBodySegmenter().catch(() => { /* chargé au scan IA */ });
+    return () => { cancelled = true; };
   }, []);
 
   return (
@@ -38,16 +41,27 @@ export default function App() {
         <HomeScreen
           error={error}
           testMode={testMode}
+          modelStatus={modelStatus}
           onStart={() => { setError(null); setSessionRunning(true); setScreen('session'); }}
-          onOpenTest={() => setScreen('test')}
+          onOpenTest={() => { setError(null); setScreen('test'); }}
         />
       )}
       {screen === 'test' && testMode && (
         <TestPage
           engine={engineRef.current}
           sessionActive={sessionRunning}
+          modelStatus={modelStatus}
+          lastError={error}
           onBack={() => setScreen(sessionRunning ? 'session' : 'home')}
-          onStartSession={() => { setError(null); setSessionRunning(true); setScreen('session'); }}
+          onStartSession={() => {
+            if (modelStatus !== 'ok') {
+              setError('MODÈLE IA PAS ENCORE CHARGÉ — ATTENDS OU VÉRIFIE LA 4G/WIFI.');
+              return;
+            }
+            setError(null);
+            setSessionRunning(true);
+            setScreen('session');
+          }}
         />
       )}
       {(screen === 'session' || (screen === 'test' && sessionRunning)) && (
@@ -56,8 +70,8 @@ export default function App() {
           engineRef={engineRef}
           testMode={testMode}
           onOpenTest={() => setScreen('test')}
-          onAbort={() => { setSessionRunning(false); setScreen('home'); }}
-          onError={(msg) => { setError(msg); setSessionRunning(false); setScreen('home'); }}
+          onAbort={() => { setSessionRunning(false); setScreen(testMode ? 'test' : 'home'); }}
+          onError={(msg) => { setError(msg); setSessionRunning(false); setScreen(testMode ? 'test' : 'home'); }}
           onDone={(res) => { setResult(res); setSessionRunning(false); setScreen('done'); }}
         />
         </div>
@@ -80,7 +94,7 @@ const BRIEFING = [
   '06. REPLACE-TOI (VOIX) → FROTTE — ORANGE → VERT.',
 ];
 
-function HomeScreen({ error, onStart, testMode, onOpenTest }) {
+function HomeScreen({ error, onStart, testMode, onOpenTest, modelStatus }) {
   return (
     <div className="relative min-h-full overflow-hidden">
       <HexGridBackground color="#FF9900" opacity={0.07} />
@@ -137,14 +151,27 @@ function HomeScreen({ error, onStart, testMode, onOpenTest }) {
           />
         </Card>
 
+        {testMode && (
+          <>
+            <Button variant="primary" size="lg" fullWidth onClick={onOpenTest}>
+              OUVRIR PANNEAU TEST (IP + ENVOI MAC)
+            </Button>
+            <Button variant="ghost" size="lg" fullWidth onClick={onStart} disabled={modelStatus !== 'ok'}>
+              {modelStatus === 'ok' ? 'SESSION SANS PANNEAU TEST' : modelStatus === 'fail' ? 'MODÈLE IA INDISPONIBLE' : 'CHARGEMENT MODÈLE…'}
+            </Button>
+          </>
+        )}
+
+        {!testMode && (
         <Button variant="primary" size="lg" fullWidth onClick={onStart}>
           COMMENCER LE PROTOCOLE
         </Button>
+        )}
 
         {testMode && (
-          <Button variant="ghost" size="lg" fullWidth onClick={onOpenTest}>
-            PANNEAU TEST DEBUG
-          </Button>
+          <p className="text-center text-[10px] text-nerv-orange/80" style={{ fontFamily: 'var(--font-nerv-mono)' }}>
+            Mode test : commence par le panneau test pour configurer l’IP Mac.
+          </p>
         )}
 
         <p
@@ -373,11 +400,13 @@ function SessionScreen({ onAbort, onError, onDone, engineRef, testMode, onOpenTe
       .then(() => { if (!cancelled) setReady(true); })
       .catch((err) => {
         if (cancelled) return;
-        onError(
-          err && err.name === 'NotAllowedError'
-            ? 'ACCÈS CAMÉRA REFUSÉ. AUTORISE LA CAMÉRA DANS LES RÉGLAGES DU NAVIGATEUR.'
-            : 'CAMÉRA OU MODÈLE DE POSE INDISPONIBLE. VÉRIFIE TA CONNEXION ET RÉESSAIE.'
-        );
+        const msg =
+          err?.name === 'NotAllowedError'
+            ? 'ACCÈS CAMÉRA REFUSÉ — AUTORISE LA CAMÉRA POUR SAFARI/CHROME DANS RÉGLAGES iOS.'
+            : /fetch|network|Failed to load|Load failed|wasm|model/i.test(String(err?.message || err))
+              ? 'MODÈLE IA NON TÉLÉCHARGÉ — VÉRIFIE LA 4G/WIFI (besoin internet 1ère fois, ~15 Mo).'
+              : 'CAMÉRA OU MODÈLE INDISPONIBLE — RÉESSAIE APRÈS CHARGEMENT DU MODÈLE.';
+        onError(msg);
       });
     return () => {
       cancelled = true;
@@ -455,7 +484,7 @@ function SessionScreen({ onAbort, onError, onDone, engineRef, testMode, onOpenTe
       <div className="flex flex-wrap justify-center gap-3 border-t border-nerv-orange/30 bg-nerv-panel px-4 py-3">
         {testMode && (
           <Button variant="ghost" onClick={onOpenTest}>
-            TEST
+            ENVOI MAC
           </Button>
         )}
         {phase !== 'adjusting' && (

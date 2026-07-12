@@ -4,16 +4,16 @@ import {
   DEFAULT_RECEIVER_PORT,
   loadReceiverConfig,
   saveReceiverConfig,
+  normalizeIpInput,
 } from './lib/testMode.js';
 import { minimapDebugInfo } from './lib/minimapCanvas.js';
 
 const INSTRUCTIONS = [
-  '01. SUR LE MAC : node test-receiver.mjs',
-  '02. NOTE L’IP AFFICHÉE (ex. 192.168.1.42).',
-  '03. SAISIS-LA CI-DESSOUS + PORT 39281.',
-  '04. LANCE UNE SESSION, PUIS « CAPTURER ÉTAT DEBUG ».',
-  '05. « ENVOYER AU MAC » — OU COPIER / TÉLÉCHARGER LE JSON.',
-  '06. SUR LE MAC : DOSSIER test-captures/',
+  '01. SUR LE MAC : node test-receiver.mjs (déjà actif si curl OK).',
+  '02. IP MAC : 172.20.10.9 si partage iPhone (voir curl sur Mac).',
+  '03. SAISIS L’IP CI-DESSOUS — ou ajoute &mac=172.20.10.9 dans l’URL.',
+  '04. ATTENDS « MODÈLE IA : PRÊT » puis LANCE LA SESSION.',
+  '05. APRÈS TEST : CAPTURER → ENVOYER AU MAC.',
 ];
 
 function staticMeta() {
@@ -51,7 +51,7 @@ export function buildCapturePayload(engine) {
   };
 }
 
-export default function TestPage({ engine, onBack, onStartSession, sessionActive }) {
+export default function TestPage({ engine, onBack, onStartSession, sessionActive, modelStatus, lastError }) {
   const initial = useMemo(() => loadReceiverConfig(), []);
   const [macIp, setMacIp] = useState(initial.ip);
   const [macPort, setMacPort] = useState(initial.port || DEFAULT_RECEIVER_PORT);
@@ -141,6 +141,10 @@ export default function TestPage({ engine, onBack, onStartSession, sessionActive
           <TerminalDisplay lines={INSTRUCTIONS} color="orange" prompt=">" title="PROCÉDURE" />
         </Card>
 
+        {lastError && (
+          <EmergencyBanner text="DERNIÈRE ERREUR SESSION" subtext={lastError} severity="warning" visible />
+        )}
+
         <div
           className="rounded border border-nerv-orange/30 bg-nerv-panel p-3 text-xs text-nerv-green/90"
           style={{ fontFamily: 'var(--font-nerv-mono)' }}
@@ -153,6 +157,7 @@ export default function TestPage({ engine, onBack, onStartSession, sessionActive
               ? `${minimap.width}×${minimap.height} buf · ${minimap.style?.width}×${minimap.style?.height} css`
               : '— (pas de session)'}
           </div>
+          <div>MODÈLE IA : {modelStatus === 'ok' ? 'PRÊT' : modelStatus === 'fail' ? 'ÉCHEC — vérifie 4G/WiFi' : 'CHARGEMENT…'}</div>
           <div>SESSION : {sessionActive ? (engine?.state ?? 'active') : 'inactive'}</div>
         </div>
 
@@ -165,13 +170,21 @@ export default function TestPage({ engine, onBack, onStartSession, sessionActive
           </label>
           <input
             type="text"
-            inputMode="decimal"
-            placeholder="192.168.1.42"
+            inputMode="text"
+            autoComplete="off"
+            autoCorrect="off"
+            spellCheck={false}
+            lang="en"
+            placeholder="172.20.10.9"
             value={macIp}
-            onChange={(e) => setMacIp(e.target.value)}
-            className="rounded border border-nerv-orange/40 bg-black px-3 py-2 text-sm text-nerv-green outline-none focus:border-nerv-orange"
+            onChange={(e) => setMacIp(normalizeIpInput(e.target.value))}
+            className="rounded border border-nerv-orange/40 bg-black px-3 py-2 text-lg tracking-wider text-nerv-green outline-none focus:border-nerv-orange"
             style={{ fontFamily: 'var(--font-nerv-mono)' }}
           />
+          <p className="text-[10px] text-nerv-white/50" style={{ fontFamily: 'var(--font-nerv-mono)' }}>
+            Astuce : tape les points via la barre de suggestions, ou ouvre
+            {' '}<span className="text-nerv-orange">?test=1&amp;mac=172.20.10.9</span>
+          </p>
           <label
             className="text-xs tracking-wider text-nerv-orange/80"
             style={{ fontFamily: 'var(--font-nerv-mono)' }}
@@ -179,10 +192,11 @@ export default function TestPage({ engine, onBack, onStartSession, sessionActive
             PORT (défaut {DEFAULT_RECEIVER_PORT})
           </label>
           <input
-            type="number"
+            type="text"
+            inputMode="numeric"
             value={macPort}
-            onChange={(e) => setMacPort(e.target.value)}
-            className="rounded border border-nerv-orange/40 bg-black px-3 py-2 text-sm text-nerv-green outline-none focus:border-nerv-orange"
+            onChange={(e) => setMacPort(normalizeIpInput(e.target.value))}
+            className="rounded border border-nerv-orange/40 bg-black px-3 py-2 text-lg text-nerv-green outline-none focus:border-nerv-orange"
             style={{ fontFamily: 'var(--font-nerv-mono)' }}
           />
         </div>
@@ -214,8 +228,14 @@ export default function TestPage({ engine, onBack, onStartSession, sessionActive
         </div>
 
         {!sessionActive && onStartSession && (
-          <Button variant="terminal" size="lg" fullWidth onClick={onStartSession}>
-            LANCER UNE SESSION
+          <Button
+            variant="terminal"
+            size="lg"
+            fullWidth
+            onClick={onStartSession}
+            disabled={modelStatus !== 'ok'}
+          >
+            {modelStatus === 'ok' ? 'LANCER UNE SESSION TEST' : modelStatus === 'fail' ? 'MODÈLE IA INDISPONIBLE' : 'CHARGEMENT MODÈLE…'}
           </Button>
         )}
 
