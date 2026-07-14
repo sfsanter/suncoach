@@ -4,7 +4,8 @@
  * 8 repères dont reins en 7 et 8.
  */
 import { LM, palmFromHand } from './pose.js';
-import { toBack } from './coverage.js';
+import { toBack, backToPx } from './coverage.js';
+import { BACK_ANCHOR_ORDER, getBackWarp } from './backWarp.js';
 
 export const CALIBRATION_STEP_COUNT = 8;
 
@@ -163,23 +164,36 @@ export function getCalibrationContact(stepId, track, P, frame, W, H) {
   return uv ? { ...uv, source: sideKey } : null;
 }
 
-const ANCHOR_ORDER = ['nuque', 'epaule_g', 'milieu_g', 'rein_g', 'bas', 'rein_d', 'milieu_d', 'epaule_d'];
-
-export { ANCHOR_ORDER };
+export const ANCHOR_ORDER = BACK_ANCHOR_ORDER;
 
 /** Peinture haut du dos : geste reconnu + repère calibré (82 % ancre). */
 export function anchorAssistedContacts(P, track, lockedFrame, anchors, W, H) {
   if (!P || !lockedFrame || !anchors) return [];
+  const warp = getBackWarp();
   const out = [];
   for (const step of CALIBRATION_STEPS) {
     if (!anchors[step.id]) continue;
     if (!detectCalibrationGesture(step.id, P, lockedFrame)) continue;
     const contact = getCalibrationContact(step.id, track, P, lockedFrame, W, H);
     const a = anchors[step.id];
-    const u = contact ? a.u * 0.82 + contact.u * 0.18 : a.u;
-    const v = contact ? a.v * 0.82 + contact.v * 0.18 : a.v;
+    let u = a.u;
+    let v = a.v;
+    // Ancres = UV générique (warp). Convertir le contact toBack → générique avant blend.
+    if (contact) {
+      if (warp) {
+        const px = backToPx(contact.u, contact.v, lockedFrame);
+        const g = warp.toGenericUv(px);
+        if (g) {
+          u = a.u * 0.82 + g.u * 0.18;
+          v = a.v * 0.82 + g.v * 0.18;
+        }
+      } else {
+        u = a.u * 0.82 + contact.u * 0.18;
+        v = a.v * 0.82 + contact.v * 0.18;
+      }
+    }
     const name = step.side === 'gauche' ? 'gauche' : step.side === 'droite' ? 'droite' : 'gauche';
-    out.push({ name, u, v, anchor: step.id });
+    out.push({ name, u, v, anchor: step.id, generic: !!warp });
   }
   return out;
 }

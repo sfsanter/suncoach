@@ -29,6 +29,13 @@ export function warpToLocked(p, liveFrame, lockedFrame) {
   return fromLocal(lx, ly, lockedFrame);
 }
 
+/** Projeté un point du scan figé dans l'image live (accroche dos B). */
+export function warpToLive(p, lockedFrame, liveFrame) {
+  if (!p || !liveFrame || !lockedFrame) return p;
+  const { lx, ly } = toLocal(p, lockedFrame);
+  return fromLocal(lx, ly, liveFrame);
+}
+
 export function cloneFrame(f) {
   if (!f) return null;
   return {

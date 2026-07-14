@@ -1,7 +1,17 @@
 /**
  * Warp affine par morceaux (éventail) : unifie pixels photo ↔ UV générique (zones, heatmap).
  */
-import { ANCHOR_ORDER } from './backCalibration.js';
+
+export const BACK_ANCHOR_ORDER = [
+  'nuque',
+  'epaule_g',
+  'milieu_g',
+  'rein_g',
+  'bas',
+  'rein_d',
+  'milieu_d',
+  'epaule_d',
+];
 
 export const GENERIC_UV_ANCHORS = {
   nuque: { x: 0.50, y: 0.04 },
@@ -21,8 +31,8 @@ function centroid(points) {
 }
 
 function buildFanTriangles(anchorsByName) {
-  const ordered = ANCHOR_ORDER.map((name) => anchorsByName[name]).filter(Boolean);
-  if (ordered.length < 4) return [];
+  const ordered = BACK_ANCHOR_ORDER.map((name) => anchorsByName?.[name]);
+  if (ordered.some((p) => !p || !Number.isFinite(p.x) || !Number.isFinite(p.y))) return [];
   const c = centroid(ordered);
   const triangles = [];
   for (let i = 0; i < ordered.length; i++) {
@@ -58,14 +68,35 @@ function pointInTriangle(p, [a, b, c]) {
   return !(hasNeg && hasPos);
 }
 
-function mapVia(triSetA, triSetB, point) {
-  for (let i = 0; i < triSetA.length; i++) {
-    if (pointInTriangle(point, triSetA[i])) {
-      const warp = affineFromTriangle(triSetA[i], triSetB[i]);
-      if (warp) return warp(point);
+function buildMappers(srcTriangles, dstTriangles) {
+  return srcTriangles.map((triangle, index) => ({
+    triangle,
+    map: affineFromTriangle(triangle, dstTriangles[index]),
+  }));
+}
+
+function mapVia(mappers, point) {
+  for (const mapper of mappers) {
+    if (mapper.map && pointInTriangle(point, mapper.triangle)) {
+      return mapper.map(point);
     }
   }
   return null;
+}
+
+function bounds(points) {
+  const xs = points.map((p) => p.x);
+  const ys = points.map((p) => p.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  return {
+    minX,
+    minY,
+    width: Math.max(1e-6, maxX - minX),
+    height: Math.max(1e-6, maxY - minY),
+  };
 }
 
 /** Pixels photo → UV générique (0–1, même espace que ANATOMICAL_ZONES). */
@@ -74,21 +105,53 @@ export function buildBackWarp(pxAnchorsByName, genericAnchorsByName = GENERIC_UV
   const genericTris = buildFanTriangles(genericAnchorsByName);
   if (!customTris.length || customTris.length !== genericTris.length) return null;
 
-  const outline = ANCHOR_ORDER
-    .map((id) => genericAnchorsByName[id])
-    .filter(Boolean)
-    .map((p) => ({ u: p.x, v: p.y }));
+  const customOrdered = BACK_ANCHOR_ORDER.map((id) => pxAnchorsByName[id]);
+  const customBounds = bounds(customOrdered);
+  const customToGeneric = buildMappers(customTris, genericTris);
+  const genericToCustom = buildMappers(genericTris, customTris);
+  const pixelToDisplayUv = (point) => ({
+    u: (point.x - customBounds.minX) / customBounds.width,
+    v: (point.y - customBounds.minY) / customBounds.height,
+  });
+  const displayUvToPixel = (point) => ({
+    x: customBounds.minX + point.u * customBounds.width,
+    y: customBounds.minY + point.v * customBounds.height,
+  });
+
+  const outline = customOrdered.map(pixelToDisplayUv);
+  const displayAnchors = Object.fromEntries(
+    BACK_ANCHOR_ORDER.map((id, index) => [id, {
+      x: outline[index].u,
+      y: outline[index].v,
+    }]),
+  );
+  const genericOutline = BACK_ANCHOR_ORDER.map((id) => {
+    const p = genericAnchorsByName[id];
+    return { u: p.x, v: p.y };
+  });
 
   return {
     toGenericUv: (pixelPoint) => {
-      const m = mapVia(customTris, genericTris, pixelPoint);
+      const m = mapVia(customToGeneric, pixelPoint);
       return m ? { u: m.x, v: m.y } : null;
     },
     fromGenericUv: (uvPoint) => {
-      const m = mapVia(genericTris, customTris, { x: uvPoint.u, y: uvPoint.v });
+      const m = mapVia(genericToCustom, { x: uvPoint.u, y: uvPoint.v });
       return m ? { x: m.x, y: m.y } : null;
     },
+    genericToDisplayUv(uvPoint) {
+      const pixel = mapVia(genericToCustom, { x: uvPoint.u, y: uvPoint.v });
+      return pixel ? pixelToDisplayUv(pixel) : null;
+    },
+    displayToGenericUv(displayPoint) {
+      const pixel = displayUvToPixel(displayPoint);
+      const generic = mapVia(customToGeneric, pixel);
+      return generic ? { u: generic.x, v: generic.y } : null;
+    },
+    displayAspect: customBounds.width / customBounds.height,
+    displayAnchors,
     outline,
+    genericOutline,
     insideGeneric(u, v) {
       const p = { x: u, y: v };
       for (const tri of genericTris) {
@@ -109,10 +172,14 @@ export function getBackWarp() {
   return activeWarp;
 }
 
+/**
+ * Pixel figé → UV peinture (même espace que heatmap / zones).
+ * Si warp actif : uniquement toGenericUv (pas de fallback mapBackUV, espace différent).
+ * @returns {{u:number,v:number}|null}
+ */
 export function paintUvFromWarpedPixel(warpedPx, backU, backV, layout) {
   if (activeWarp && warpedPx) {
-    const g = activeWarp.toGenericUv(warpedPx);
-    if (g) return g;
+    return activeWarp.toGenericUv(warpedPx);
   }
   if (layout && warpedPx) {
     return {
@@ -120,5 +187,6 @@ export function paintUvFromWarpedPixel(warpedPx, backU, backV, layout) {
       v: (warpedPx.y - layout.minY) / layout.bh,
     };
   }
+  if (backU == null || backV == null) return null;
   return { u: backU, v: backV };
 }

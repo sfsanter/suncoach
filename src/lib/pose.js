@@ -31,6 +31,16 @@ const MODEL_URL =
 
 let landmarkerPromise = null;
 
+/** Prefer CPU on weak / old GPUs (replay Mac) — ?cpu=1 force, sinon GPU puis CPU. */
+function preferCpuDelegate() {
+  if (typeof window === 'undefined') return false;
+  try {
+    return new URLSearchParams(window.location.search).has('cpu');
+  } catch {
+    return false;
+  }
+}
+
 async function createLandmarker() {
   const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
   const options = (delegate) => ({
@@ -40,6 +50,9 @@ async function createLandmarker() {
     minHandLandmarksConfidence: 0.5,
     outputPoseSegmentationMasks: true,
   });
+  if (preferCpuDelegate()) {
+    return await HolisticLandmarker.createFromOptions(fileset, options('CPU'));
+  }
   try {
     return await HolisticLandmarker.createFromOptions(fileset, options('GPU'));
   } catch {
@@ -55,6 +68,42 @@ export function preloadPose() {
     });
   }
   return landmarkerPromise;
+}
+
+let imageLandmarkerPromise = null;
+
+async function createImageLandmarker() {
+  const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
+  const options = (delegate) => ({
+    baseOptions: { modelAssetPath: MODEL_URL, delegate },
+    runningMode: 'IMAGE',
+    minPosePresenceConfidence: 0.6,
+    minHandLandmarksConfidence: 0.5,
+  });
+  if (preferCpuDelegate()) {
+    return await HolisticLandmarker.createFromOptions(fileset, options('CPU'));
+  }
+  try {
+    return await HolisticLandmarker.createFromOptions(fileset, options('GPU'));
+  } catch {
+    return await HolisticLandmarker.createFromOptions(fileset, options('CPU'));
+  }
+}
+
+export function preloadImagePose() {
+  if (!imageLandmarkerPromise) {
+    imageLandmarkerPromise = createImageLandmarker().catch((err) => {
+      imageLandmarkerPromise = null;
+      throw err;
+    });
+  }
+  return imageLandmarkerPromise;
+}
+
+/** Détection Holistic sur image figée (labo frames). */
+export async function detectHolisticOnImage(imageSource) {
+  const landmarker = await preloadImagePose();
+  return landmarker.detect(imageSource);
 }
 
 export { preloadBodySegmenter } from './bodySegmenter.js';
@@ -95,20 +144,30 @@ export function contactPointsFromHand(hand) {
 }
 
 /**
- * Dos à la caméra : épaules visibles et assez écartées.
- * On évite les faux positifs « tourne-toi » quand les bras bougent.
+ * Dos à la caméra — détection par pose (PAS par timecode).
+ * Ne pas utiliser la visibilité du nez seule : MediaPipe l’hallucine souvent de dos.
  */
 export function isBackTurned(P, imageWidth = 1) {
   const ls = P[LM.L_SHOULDER], rs = P[LM.R_SHOULDER];
-  const lh = P[LM.L_HIP], rh = P[LM.R_HIP];
-  if ([ls, rs, lh, rh].some((p) => p.visibility < 0.35)) return false;
+  if (!ls || !rs) return false;
+  if (ls.visibility < 0.35 || rs.visibility < 0.35) return false;
 
   const shoulderW = Math.abs(rs.x - ls.x);
   const minW = imageWidth > 100 ? 0.06 * imageWidth : 0.06;
   if (shoulderW < minW) return false;
 
-  // De dos : épaule gauche de la personne à gauche de l'image (x plus petit).
-  return ls.x < rs.x;
+  // Face claire : nez + oreilles devant (indices Pose 0, 7, 8).
+  const nose = P[LM.NOSE];
+  const lear = P[7];
+  const rear = P[8];
+  const noseVis = nose?.visibility ?? 0;
+  const earVis = Math.max(lear?.visibility ?? 0, rear?.visibility ?? 0);
+  if (noseVis > 0.85 && noseVis > earVis + 0.2) return false;
+
+  // De dos : épaule gauche personne à gauche de l'image.
+  // Si MediaPipe inverse L/R, accepter aussi un nez peu crédible + épaules larges.
+  if (ls.x < rs.x) return true;
+  return noseVis < 0.45 && shoulderW > minW * 1.2;
 }
 
 /** Moyenne glissante pour ne pas couper la peinture sur une frame bruitée. */
@@ -152,32 +211,160 @@ export class PoseTracker {
     } catch {
       this.landmarker = await preloadPose();
     }
-    await this.bodySegmenter.init();
+    // Optionnel : le masque Holistic sert de repli, donc ne pas bloquer la session.
+    this.bodySegmenter.init().catch((err) => {
+      console.warn('[SunCoach] Body segmenter init failed (non-fatal):', err);
+    });
   }
 
-  async startCamera(facing = this.facing) {
+  /** Source fichier vidéo (replay debug) — remplace getUserMedia. */
+  async startVideoFile(src, { loop = false } = {}) {
     this.stopCamera();
-    const request = navigator.mediaDevices.getUserMedia({
-      video: { facingMode: facing, width: { ideal: 960 }, height: { ideal: 720 } },
-      audio: false,
+    this.video.srcObject = null;
+    this.video.src = src;
+    // Pas de boucle : revenir à 0:00 (face) casse placement / coverage.
+    this.video.loop = loop;
+    this.video.muted = true;
+    this.video.playsInline = true;
+    await new Promise((resolve, reject) => {
+      const fallback = setTimeout(() => {
+        cleanup();
+        reject(Object.assign(new Error('video dimensions unavailable'), { name: 'VideoLoadError' }));
+      }, 15000);
+
+      const cleanup = () => {
+        clearTimeout(fallback);
+        this.video.removeEventListener('loadedmetadata', onMeta);
+        this.video.removeEventListener('error', onErr);
+      };
+
+      const onErr = () => {
+        cleanup();
+        const code = this.video.error?.code;
+        const decode = code === 4;
+        const e = new Error(decode ? 'video decode failed' : 'video load failed');
+        e.name = decode ? 'VideoDecodeError' : 'VideoLoadError';
+        reject(e);
+      };
+
+      const onMeta = () => {
+        this.video.play()
+          .then(() => this._waitForVideoReady(this.video, 15000))
+          .then(() => { cleanup(); resolve(); })
+          .catch((err) => { cleanup(); reject(err); });
+      };
+
+      this.video.addEventListener('loadedmetadata', onMeta, { once: true });
+      this.video.addEventListener('error', onErr, { once: true });
+      this.video.load();
     });
+  }
+
+  async _getUserMediaWithTimeout(constraints, ms = 20000) {
+    const request = navigator.mediaDevices.getUserMedia(constraints);
     const timeout = new Promise((_, reject) =>
       setTimeout(() => {
         const e = new Error('camera timeout');
         e.name = 'CameraTimeoutError';
         reject(e);
-      }, 20000)
+      }, ms)
     );
-    this.stream = await Promise.race([request, timeout]);
-    this.facing = facing;
-    this.video.srcObject = this.stream;
-    await new Promise((resolve) => {
-      const fallback = setTimeout(resolve, 8000);
-      this.video.onloadedmetadata = () => {
-        clearTimeout(fallback);
-        this.video.play().then(resolve, resolve);
+    return Promise.race([request, timeout]);
+  }
+
+  /** AbortError transitoire : une relance suffit souvent. */
+  async _requestCamera(constraints, ms = 20000) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await this._getUserMediaWithTimeout(constraints, ms);
+      } catch (e) {
+        if (e?.name === 'AbortError' && attempt === 0) {
+          await new Promise((r) => setTimeout(r, 350));
+          continue;
+        }
+        throw e;
+      }
+    }
+  }
+
+  /** Attend des dimensions vidéo réelles avant de démarrer MediaPipe. */
+  async _waitForVideoReady(video, timeoutMs = 12000) {
+    if (video.videoWidth > 0 && video.videoHeight > 0) return;
+
+    await new Promise((resolve, reject) => {
+      let raf = 0;
+      const deadline = Date.now() + timeoutMs;
+
+      const cleanup = () => {
+        cancelAnimationFrame(raf);
+        video.removeEventListener('loadedmetadata', onMeta);
+        video.removeEventListener('resize', tick);
       };
+
+      const tick = () => {
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          cleanup();
+          resolve();
+          return;
+        }
+        if (Date.now() >= deadline) {
+          cleanup();
+          const e = new Error(
+            `camera dimensions unavailable (${video.videoWidth}×${video.videoHeight})`
+          );
+          e.name = 'CameraError';
+          reject(e);
+          return;
+        }
+        raf = requestAnimationFrame(tick);
+      };
+
+      const onMeta = () => {
+        video.play().catch(() => {});
+        tick();
+      };
+
+      video.addEventListener('loadedmetadata', onMeta);
+      video.addEventListener('resize', tick);
+      video.play().catch(() => {});
+      tick();
     });
+  }
+
+  async _tryCameraConstraints(constraints, facing) {
+    const stream = await this._requestCamera(constraints);
+    this.facing = facing;
+    this.stream = stream;
+    this.video.srcObject = stream;
+    await this._waitForVideoReady(this.video);
+  }
+
+  /** Téléphone d'abord, puis contraintes relâchées pour desktop. */
+  async startCamera(facing = this.facing) {
+    this.stopCamera();
+    this.video.removeAttribute('src');
+
+    const attempts = [
+      { video: { facingMode: facing, width: { ideal: 960 }, height: { ideal: 720 } }, audio: false },
+      { video: { width: { ideal: 960 }, height: { ideal: 720 } }, audio: false },
+      { video: true, audio: false },
+    ];
+
+    let lastErr;
+    for (const constraints of attempts) {
+      try {
+        await this._tryCameraConstraints(constraints, facing);
+        return;
+      } catch (e) {
+        lastErr = e;
+        if (this.stream) {
+          this.stream.getTracks().forEach((t) => t.stop());
+          this.stream = null;
+        }
+        this.video.srcObject = null;
+      }
+    }
+    throw lastErr || Object.assign(new Error('camera unavailable'), { name: 'CameraError' });
   }
 
   async switchCamera() {
@@ -194,14 +381,27 @@ export class PoseTracker {
       this.stream.getTracks().forEach((t) => t.stop());
       this.stream = null;
     }
+    if (this.video?.src && !this.video.srcObject) {
+      this.video.pause();
+      // Le blob appartient à App : seul son créateur doit le révoquer.
+      this.video.removeAttribute('src');
+      this.video.load();
+    }
   }
 
   start(onFrame) {
     const loop = () => {
       this._raf = requestAnimationFrame(loop);
       if (!this.landmarker || this.video.readyState < 2) return;
-      if (this.video.currentTime === this._lastVideoTime) return;
-      this._lastVideoTime = this.video.currentTime;
+      if (this.video.ended) return;
+      const t = this.video.currentTime;
+      // Saut arrière (loop / seek) : ignorer la frame pour ne pas casser la session.
+      if (this._lastVideoTime >= 0 && t < this._lastVideoTime - 0.35) {
+        this._lastVideoTime = t;
+        return;
+      }
+      if (t === this._lastVideoTime) return;
+      this._lastVideoTime = t;
       const ts = performance.now();
       let result;
       try {

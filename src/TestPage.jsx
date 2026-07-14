@@ -123,7 +123,7 @@ export default function TestPage({ engine, onBack, onStartSession, sessionActive
     a.href = url;
     a.download = `suncoach-debug-${Date.now()}.json`;
     a.click();
-    URL.revokeObjectURL(url);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
     setStatus('JSON téléchargé.');
   }, [payload]);
 

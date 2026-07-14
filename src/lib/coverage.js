@@ -5,7 +5,7 @@
 import { LM } from './pose.js';
 import { ANATOMICAL_ZONES, ZONE_COUNT } from './zones.js';
 import { buildCanonicalShape, canonicalToBackUv, backUvToCanonical, insideLayoutShape } from './anchorShape.js';
-import { getBackWarp } from './backWarp.js';
+import { getBackWarp, setBackWarp } from './backWarp.js';
 
 export { setBackWarp, getBackWarp, paintUvFromWarpedPixel } from './backWarp.js';
 
@@ -14,7 +14,10 @@ export { ANATOMICAL_ZONES, ZONE_COUNT };
 export const HEAT_W = 36;
 export const HEAT_H = 48;
 
-const PIXEL_NEED = 0.2;
+/** Seuil « pixel validé / vert » — plus haut = plusieurs passages requis. */
+export const DEFAULT_PIXEL_NEED = 0.2;
+/** Labo / mode exigeant : ~3–4× plus de frottement avant validation. */
+export const THOROUGH_PIXEL_NEED = 0.7;
 const ZONE_RATIO = 0.58;
 /** Pinceau : une paume couvre une zone visible sur la minimap. */
 const SIGMA = 0.085;
@@ -234,7 +237,8 @@ export function toBack(p, f) {
  * Sans ce flip, frotter en haut-gauche peignait en bas-droite sur la minimap.
  */
 export function mapBackUV(u, v) {
-  return { u: 1 - u, v: 1 - v };
+  // Un miroir caméra inverse gauche/droite, jamais haut/bas.
+  return { u: 1 - u, v };
 }
 
 /**
@@ -295,9 +299,9 @@ function inZone(u, v, z) {
 }
 
 export class CoverageGrid {
-  constructor() {
+  constructor(need = DEFAULT_PIXEL_NEED) {
     this.heat = new Float32Array(HEAT_W * HEAT_H);
-    this.need = PIXEL_NEED;
+    this.need = need;
   }
 
   reset() {
@@ -315,7 +319,7 @@ export class CoverageGrid {
   }
 
   pixelFraction(i) {
-    return Math.min(1, this.heat[i] / PIXEL_NEED);
+    return Math.min(1, this.heat[i] / this.need);
   }
 
   /** Interpolation bilinéaire — entrée en repère dos, stockage canonique si 8 points. */
@@ -387,10 +391,10 @@ export class CoverageGrid {
         const i = y * HEAT_W + x;
         if (bodyMask[i] === 0) continue;
         const before = this.heat[i];
-        if (before < PIXEL_NEED) {
+        if (before < this.need) {
           this.heat[i] = before + step;
           added += step;
-          if (this.heat[i] >= PIXEL_NEED) crossed++;
+          if (this.heat[i] >= this.need) crossed++;
         }
       }
     }
@@ -424,11 +428,11 @@ export class CoverageGrid {
           const wgt = Math.exp(-(du * du + dv * dv) / (2 * SIGMA * SIGMA));
           if (wgt <= 0.03) continue;
           const before = this.heat[i];
-          if (before < PIXEL_NEED) {
+          if (before < this.need) {
             const step = Math.min(dt, 0.035) * wgt;
             this.heat[i] = before + step;
             added += step;
-            if (this.heat[i] >= PIXEL_NEED) crossed++;
+            if (this.heat[i] >= this.need) crossed++;
           }
         }
       }
@@ -448,7 +452,7 @@ export class CoverageGrid {
         const i = y * HEAT_W + x;
         if (bodyMask[i] === 0) continue;
         body++;
-        if (this.heat[i] >= PIXEL_NEED) painted++;
+        if (this.heat[i] >= this.need) painted++;
       }
     }
     if (body === 0) return 1;
@@ -469,12 +473,25 @@ export class CoverageGrid {
     return sum / ZONE_COUNT;
   }
 
+  /** % pixels « touchés » (un passage léger) — pas encore validés. */
+  get touchedRatio() {
+    let touched = 0, body = 0;
+    const tip = this.need * 0.08;
+    for (let i = 0; i < this.heat.length; i++) {
+      if (bodyMask[i] === 0) continue;
+      body++;
+      if (this.heat[i] >= tip) touched++;
+    }
+    return body ? touched / body : 0;
+  }
+
+  /** % pixels validés (plusieurs passages / seuil need). */
   get paintedRatio() {
     let painted = 0, body = 0;
     for (let i = 0; i < this.heat.length; i++) {
       if (bodyMask[i] === 0) continue;
       body++;
-      if (this.heat[i] >= PIXEL_NEED) painted++;
+      if (this.heat[i] >= this.need) painted++;
     }
     return body ? painted / body : 0;
   }
@@ -488,7 +505,7 @@ export class CoverageGrid {
     return {
       w: HEAT_W,
       h: HEAT_H,
-      need: PIXEL_NEED,
+      need: this.need,
       data: Float32Array.from(this.heat),
       body: Uint8Array.from(bodyMask),
       shapeScale,

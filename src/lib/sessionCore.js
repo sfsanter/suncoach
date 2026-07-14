@@ -1,18 +1,33 @@
 /**
  * Logique session testable hors DOM (harness Node) — pas de canvas ni MediaPipe.
  */
-import { buildMinimapLayout, pixelsToBackAnchors } from './anchorShape.js';
+import { buildMinimapLayout } from './anchorShape.js';
 import { buildBackWarp, setBackWarp } from './backWarp.js';
 import { setMinimapLayout, setCustomBackAnchors, setTracedContour } from './coverage.js';
 
+/**
+ * Ancres en UV générique (même espace que zones / heatmap / warp).
+ * Plus de mapBackUV ici — ça combattait le warp.
+ */
+export function anchorsToGenericUv(pxAnchors, warp) {
+  const out = {};
+  if (!warp) return out;
+  for (const [id, p] of Object.entries(pxAnchors || {})) {
+    if (!p) continue;
+    const g = warp.toGenericUv(p);
+    if (g) out[id] = g;
+  }
+  return out;
+}
+
 /** Applique calibration 8 points (photo figée) — même effet que confirmAdjustment. */
 export function applyCalibration(pxAnchors, calibrationFrame) {
-  const calibrationAnchors = pixelsToBackAnchors(pxAnchors, calibrationFrame);
   const layout = buildMinimapLayout(pxAnchors);
   const warp = buildBackWarp(pxAnchors);
   setTracedContour(null);
   setMinimapLayout(layout);
   setBackWarp(warp);
+  const calibrationAnchors = anchorsToGenericUv(pxAnchors, warp);
   setCustomBackAnchors(calibrationAnchors);
   return { calibrationAnchors, layout, warp };
 }

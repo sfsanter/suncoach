@@ -8,7 +8,7 @@ import {
   CoverageGrid, torsoFrame, backHalfWidth,
   toBack, nearBackShape, coverageHeatRGBA, setShapeScale,
   setTracedContour, customBackOutlineUV, setCustomBackAnchors,
-  setMinimapLayout, getMinimapLayout, backToPx, paintUvFromWarpedPixel,
+  setMinimapLayout, getMinimapLayout, paintUvFromWarpedPixel,
   getBackWarp,
   HEAT_W, HEAT_H, ZONE_COUNT, ANATOMICAL_ZONES, MIN_COVERAGE_SEC,
 } from './coverage.js';
@@ -25,14 +25,20 @@ import {
 import { applyCalibration } from './sessionCore.js';
 import { isDebugMinimap, minimapDebugInfo, setupMinimapCanvas, MINIMAP_CSS_W, MINIMAP_CSS_H } from './minimapCanvas.js';
 import { credibleBackHand, crediblePoseWrist, elbowBackContact, handContactPixels, ContactVelocityGate, handConfidence, updateCoachMode } from './handGate.js';
-import { anchorAssistedContacts } from './backCalibration.js';
+import { BACK_ANCHOR_ORDER } from './backWarp.js';
+import {
+  drawMinimapScene,
+  drawMappedHeatCells,
+  strokeMappedPath,
+  strokeMappedZone,
+} from './minimapRender.js';
 import {
   buildBackSilhouette, buildFallbackSilhouette, buildBackSilhouetteFromBytes,
   traceBackContour, drawBackSegmentationOverlay,
 } from './segmentation.js';
 
 export class SunCoachEngine {
-  constructor({ video, overlay, minimap, onHud, onDone, onPhase }) {
+  constructor({ video, overlay, minimap, onHud, onDone, onPhase, replaySource = null }) {
     this.video = video;
     this.overlay = overlay;
     this.ctx = overlay.getContext('2d');
@@ -41,6 +47,8 @@ export class SunCoachEngine {
     this.onHud = onHud;
     this.onDone = onDone;
     this.onPhase = onPhase || (() => {});
+    this.replaySource = replaySource;
+    this.replayMode = !!replaySource;
 
     this.voice = new Voice();
     this.beeper = new Beeper();
@@ -79,12 +87,18 @@ export class SunCoachEngine {
   }
 
   async start() {
+    this._released = false;
     this.voice.unlock();
     this.beeper.unlock();
     this.onHud(0, 'TÉLÉCHARGEMENT DU MODÈLE…');
     if (!this.tracker.landmarker) await this.tracker.init();
-    this.onHud(0, 'DÉMARRAGE DE LA CAMÉRA…');
-    await this.tracker.startCamera();
+    if (this.replaySource) {
+      this.onHud(0, 'CHARGEMENT DE LA VIDÉO…');
+      await this.tracker.startVideoFile(this.replaySource, { loop: false });
+    } else {
+      this.onHud(0, 'DÉMARRAGE DE LA CAMÉRA…');
+      await this.tracker.startCamera();
+    }
 
     if (this.minimap) {
       const setup = setupMinimapCanvas(this.minimap);
@@ -111,6 +125,8 @@ export class SunCoachEngine {
     this.snapshotDataUrl = null;
     this.snapshotW = 0;
     this.snapshotH = 0;
+    this.lockPoseP = null;
+    this.lockSnapshotDone = false;
     this.coachMode = 'precise';
     this.repositionStableFrames = 0;
     this.lastTs = 0;
@@ -137,7 +153,7 @@ export class SunCoachEngine {
     this._acquireWakeLock();
     document.addEventListener('visibilitychange', this._onVisibility);
     this.voice.say(
-      'Bienvenue ! Pose le téléphone sur un support, puis mets-toi dos à la caméra, à environ deux mètres.',
+      'Bienvenue ! Mets-toi dos à la caméra, à environ deux mètres.',
       { interrupt: true }
     );
     this.tracker.start((track, ts) => this._onFrame(track, ts));
@@ -158,6 +174,7 @@ export class SunCoachEngine {
   }
 
   async flip() {
+    if (this.replayMode) return;
     await this.tracker.switchCamera();
     this.overlay.width = this.video.videoWidth;
     this.overlay.height = this.video.videoHeight;
@@ -325,7 +342,11 @@ export class SunCoachEngine {
       return fail('Tu es un peu loin. Approche-toi.', 'toofar', 'DISTANCE : TROP LOIN');
     }
     if (!isBackTurned(P, W)) {
-      return fail('Tourne-toi, dos à la caméra.', 'turn', 'ORIENTATION : FACE — TOURNE-TOI');
+      return fail(
+        'Tourne-toi, dos à la caméra.',
+        'turn',
+        'ORIENTATION : PAS ENCORE DOS — ATTENDS / AVANCE LA VIDÉO',
+      );
     }
 
     const distM = estimateSubjectDistance(shoulderW, W);
@@ -342,6 +363,8 @@ export class SunCoachEngine {
     this.state = 'locking';
     this.lockStartedAt = performance.now();
     this.calibrationFrame = frame ? cloneFrame(frame) : null;
+    this.lockPoseP = null;
+    this.lockSnapshotDone = false;
     const W = this.overlay.width;
     const H = this.overlay.height;
     this.maskLock = new MaskLockAccumulator(W, H);
@@ -383,16 +406,29 @@ export class SunCoachEngine {
       return;
     }
 
+    // Photo + ancres = dos visible. Sinon on scanne trop tard (face / crème).
+    if (!isBackTurned(P, W)) {
+      this.onHud(lock.count / LOCK_FRAMES, 'SCAN — TOURNE LE DOS, RESTE IMMOBILE');
+      return;
+    }
+
+    if (!this.lockPoseP) {
+      this.lockPoseP = P.map((p) => ({ x: p.x, y: p.y, visibility: p.visibility }));
+      this._captureSnapshot();
+      this.lockSnapshotDone = true;
+    }
+
     const bytes = track.aiPersonMask
       ?? this._holisticMaskBytes(track.segmentationMask, P, W, H);
     if (bytes) lock.push(bytes);
 
-    const pct = Math.min(100, Math.round((lock.count / LOCK_FRAMES) * 100));
-    this.onHud(lock.count / LOCK_FRAMES, `SCAN IA ${pct} %`);
+    const need = LOCK_FRAMES;
+    const pct = Math.min(100, Math.round((lock.count / need) * 100));
+    this.onHud(lock.count / need, `SCAN IA ${pct} %`);
 
     const timedOut = performance.now() - this.lockStartedAt > 8000;
-    if (lock.count >= LOCK_FRAMES || (timedOut && lock.count >= 8)) {
-      this._finalizeLock(calFrame, P, W, H);
+    if (lock.count >= need || (timedOut && lock.count >= 6)) {
+      this._finalizeLock(calFrame, this.lockPoseP || P, W, H);
     } else if (timedOut) {
       this.voice.say(
         'Je n’arrive pas à bien te voir. Vérifie la lumière et reste dos à la caméra.',
@@ -484,13 +520,15 @@ export class SunCoachEngine {
   }
 
   _startAdjusting(P, W, H) {
-    this._captureSnapshot();
+    // Photo déjà prise au 1er frame « dos » pendant le scan (évite décalage).
+    if (!this.lockSnapshotDone || !this.snapshotDataUrl) this._captureSnapshot();
     this.state = 'adjusting';
-    this.draftAnchorsPx = defaultAnchorsPx(P, W, H)
+    const pose = this.lockPoseP || P || this.frozenPoseP;
+    this.draftAnchorsPx = defaultAnchorsPx(pose, W, H)
       ?? defaultAnchorsPx(this.frozenPoseP, W, H)
       ?? {};
     this.calibrationAnchors = {};
-    this.onHud(0, 'AJUSTE LES 8 POINTS SUR TA PHOTO');
+    this.onHud(0, 'VIDÉO EN PAUSE — GLISSE LES 8 POINTS SUR LE BORD DU DOS');
     this.voice.say(calibrationVoice('adjust_intro'), { interrupt: true });
     this._notifyPhase();
   }
@@ -507,6 +545,15 @@ export class SunCoachEngine {
 
   _repositionTick(P, ts, W) {
     const locked = this.calibrationFrame;
+    const elapsed = performance.now() - this.repositionStartedAt;
+    const fallbackMs = 12000;
+
+    // Le repositionnement guide mais ne doit jamais bloquer la couverture.
+    if (elapsed >= fallbackMs) {
+      this.voice.say(calibrationVoice('reposition_approx_ok'), { interrupt: true });
+      this._startCoverage();
+      return;
+    }
 
     if (!P || !locked || !this.lockedPoseSignature) {
       this.repositionStableFrames = 0;
@@ -549,7 +596,7 @@ export class SunCoachEngine {
     }
   }
 
-  /** Contact → repère schéma unifié (backWarp → UV générique). */
+  /** Contact → UV peinture (warp générique si actif). null = hors silhouette. */
   _toPaintUv(warpedPx, backU, backV) {
     return paintUvFromWarpedPixel(warpedPx, backU, backV, getMinimapLayout());
   }
@@ -593,26 +640,10 @@ export class SunCoachEngine {
     );
   }
 
-  /**
-   * Contacts pour la couverture : repère figé au scan + filtre anti-hallucination.
-   * Pas de repli poignet pose (trop de faux positifs dos tourné).
-   */
+  /** Contacts live projetés dans le repère figé du scan. */
   _getCoverageContacts(track, P, liveFrame, lockedFrame, W, H, ts) {
     if (!lockedFrame || !P) return [];
     const out = [];
-
-    const anchorPts = anchorAssistedContacts(
-      P, track, lockedFrame, this.calibrationAnchors, W, H
-    );
-    const anchorUsed = new Set();
-    for (const pt of anchorPts) {
-      const f = this.filters[pt.name];
-      const px = backToPx(pt.u, pt.v, lockedFrame);
-      const layoutUv = this._toPaintUv(px, pt.u, pt.v);
-      const sm = this.contactGate.clamp(pt.name, f.u.filter(layoutUv.u, ts), f.v.filter(layoutUv.v, ts));
-      out.push({ name: pt.name, u: sm.u, v: sm.v });
-      anchorUsed.add(pt.anchor);
-    }
 
     const defs = [
       { hand: track.leftHand2D, poseWrist: LM.L_WRIST, name: 'gauche' },
@@ -642,8 +673,8 @@ export class SunCoachEngine {
         if (!this._pointNearTorso(warped, lockedFrame)) continue;
         const raw = toBack(warped, lockedFrame);
         const layoutUv = this._toPaintUv(warped, raw.u, raw.v);
+        if (!layoutUv) continue;
         const sm = this.contactGate.clamp(d.name, f.u.filter(layoutUv.u, ts), f.v.filter(layoutUv.v, ts));
-        if (sm.v < 0.42 && anchorUsed.size > 0) continue;
         out.push({ name: d.name, u: sm.u, v: sm.v });
       }
     }
@@ -660,11 +691,19 @@ export class SunCoachEngine {
       return;
     }
 
-    const backOk = this.backOrient.update(P, W);
-    if (!backOk && ts - this.orientWarnTs > 15000) {
-      this.orientWarnTs = ts;
-      this.onHud(this.grid.paintedRatio, 'ORIENTATION : VÉRIFIE LE DOS');
-      this.voice.say('Reste bien dos à la caméra.', { id: 'stayback', cooldown: 15000 });
+    const backNow = isBackTurned(P, W);
+    const backStable = this.backOrient.update(P, W);
+    if (!backNow || !backStable) {
+      this.beeper.setPaintActivity('off');
+      this.onHud(this.grid.paintedRatio, 'TOURNE LE DOS — PEINTURE EN PAUSE');
+      if (ts - this.orientWarnTs > 7000) {
+        this.orientWarnTs = ts;
+        this.voice.say(
+          'Tourne le dos à la caméra. La couverture est en pause.',
+          { id: 'stayback', cooldown: 7000 },
+        );
+      }
+      return;
     }
 
     const paintFrame = this.calibrationFrame || frame;
@@ -678,13 +717,9 @@ export class SunCoachEngine {
 
     const painting = contacts.filter((h) => nearBackShape(h.u, h.v));
 
-    let added = 0, crossed = 0;
-    if (this.coachMode === 'degraded' && painting.length > 0) {
-      const near = this.grid.nearestZone(painting[0].u, painting[0].v);
-      if (near) ({ added, crossed } = this.grid.paintZone(near.idx, dt));
-    } else {
-      ({ added, crossed } = this.grid.update(painting, dt));
-    }
+    // Même avec une confiance faible, ne jamais colorier une zone anatomique
+    // entière : seule la position estimée de la main alimente le pinceau.
+    const { added, crossed } = this.grid.update(painting, dt);
 
     if (crossed > 0 || added > dt * 0.25) this.lastPaintTs.new = ts;
     else if (painting.length > 0) this.lastPaintTs.old = ts;
@@ -726,7 +761,7 @@ export class SunCoachEngine {
     const painted = this.grid.paintedRatio;
     const pct = Math.round(painted * 100);
     const gap = this.grid.biggestGap();
-    const modeLabel = this.coachMode === 'degraded' ? ' · ZONE APPROX' : '';
+    const modeLabel = this.coachMode === 'degraded' ? ' · MAIN ESTIMÉE' : '';
 
     if (pct >= 0.5 && this.lastMilestone < 0.5) {
       this.lastMilestone = 0.5;
@@ -755,6 +790,7 @@ export class SunCoachEngine {
   _buildResult(aborted) {
     let zonesCovered = 0;
     for (let i = 0; i < ZONE_COUNT; i++) if (this.grid.isCovered(i)) zonesCovered++;
+    const warp = getBackWarp();
     return {
       aborted,
       seconds: Math.round((performance.now() - this.coverageStartedAt) / 1000),
@@ -764,6 +800,7 @@ export class SunCoachEngine {
       heat: this.grid.snapshot(),
       paths: this.paths,
       outline: customBackOutlineUV(),
+      displayAnchors: warp?.displayAnchors ?? null,
     };
   }
 
@@ -787,6 +824,8 @@ export class SunCoachEngine {
       coachMode: this.coachMode,
       paintedRatio: this.grid?.paintedRatio ?? 0,
       warpActive: !!warp,
+      outlineSpace: 'display_uv',
+      calibrationAnchorSpace: 'generic_uv',
       outlinePointCount: outline?.length ?? 0,
       outline: outline?.map((p) => ({ u: p.u, v: p.v })) ?? null,
       draftAnchorsPx: this.draftAnchorsPx ? { ...this.draftAnchorsPx } : null,
@@ -806,7 +845,16 @@ export class SunCoachEngine {
             debugInfo: minimapDebugInfo(this.minimap),
           }
         : null,
-      bodyPixelCount: this.grid?.heat?.length ?? 0,
+      snapshotSize: this.snapshotW && this.snapshotH
+        ? { w: this.snapshotW, h: this.snapshotH }
+        : null,
+      calibrationFrame: this.calibrationFrame
+        ? {
+            origin: { ...this.calibrationFrame.origin },
+            width: this.calibrationFrame.width,
+            height: this.calibrationFrame.height,
+          }
+        : null,
       zonesCovered: (() => {
         let n = 0;
         for (let i = 0; i < ZONE_COUNT; i++) if (this.grid?.isCovered?.(i)) n++;
@@ -873,11 +921,12 @@ export class SunCoachEngine {
 
   _minimapViewport(W, H) {
     const layout = getMinimapLayout();
+    const warp = getBackWarp();
     const pad = 6;
     const labelH = 14;
     const availW = W - 2 * pad;
     const availH = H - 2 * pad - labelH;
-    const aspect = layout?.aspect ?? 0.55;
+    const aspect = warp?.displayAspect ?? layout?.aspect ?? 0.55;
 
     let mapW, mapH;
     if (availW / availH > aspect) {
@@ -893,7 +942,7 @@ export class SunCoachEngine {
       mapW, mapH, ox, oy,
       toX: (u) => ox + u * mapW,
       toY: (v) => oy + v * mapH,
-      customShape: !!layout,
+      customShape: !!(warp || layout),
     };
   }
 
@@ -902,6 +951,66 @@ export class SunCoachEngine {
     const c = this.minimapCtx;
     const W = this.minimapLogicalW ?? this.minimap.width;
     const H = this.minimapLogicalH ?? this.minimap.height;
+    const activeWarp = getBackWarp();
+
+    if (activeWarp) {
+      const gap = this.state === 'coverage' ? this.grid.biggestGap() : null;
+      const scene = drawMinimapScene(c, {
+        width: W,
+        height: H,
+        warp: activeWarp,
+        heat: {
+          w: HEAT_W,
+          h: HEAT_H,
+          isBody: (index) => this.grid.isBody(index),
+          fractionAt: (index) => this.grid.pixelFraction(index),
+        },
+        colorForFraction: coverageHeatRGBA,
+        paths: {
+          gauche: this.paths.gauche.slice(-50),
+          droite: this.paths.droite.slice(-50),
+        },
+        gapZone: gap?.zone ?? null,
+      });
+
+      const cx = W / 2;
+      if (this.state === 'reposition') {
+        c.font = 'bold 12px Fira Code, monospace';
+        c.textAlign = 'center';
+        c.fillStyle = '#FF9900';
+        c.fillText('REPLACE-TOI', cx, H - 5);
+      } else if (this.state === 'coverage') {
+        const pct = Math.round(this.grid.paintedRatio * 100);
+        c.font = 'bold 18px Fira Code, monospace';
+        c.textAlign = 'center';
+        c.fillStyle = '#00FF00';
+        c.strokeStyle = 'rgba(0,0,0,0.9)';
+        c.lineWidth = 3;
+        c.strokeText(pct + '%', cx, H - 5);
+        c.fillText(pct + '%', cx, H - 5);
+      }
+
+      if (isDebugMinimap() && scene) {
+        c.font = '7px Fira Code, monospace';
+        c.fillStyle = '#FFFF00';
+        c.textAlign = 'left';
+        [
+          minimapDebugInfo(this.minimap),
+          `state ${this.state} · coach ${this.coachMode}`,
+          `warp on · body ${this.grid.heat.length}`,
+        ].forEach((line, index) => c.fillText(line, 3, 9 + index * 8));
+        activeWarp.outline.forEach((point, index) => {
+          const x = scene.toX(point.u);
+          const y = scene.toY(point.v);
+          c.beginPath();
+          c.arc(x, y, 2, 0, Math.PI * 2);
+          c.fill();
+          c.fillText(BACK_ANCHOR_ORDER[index], x + 3, y);
+        });
+      }
+      return;
+    }
+
     c.clearRect(0, 0, W, H);
     c.fillStyle = 'rgba(0, 0, 0, 0.78)';
     c.fillRect(0, 0, W, H);
@@ -919,25 +1028,35 @@ export class SunCoachEngine {
       c.fillRect(cx - headH * 0.13, headH * 0.7, headH * 0.26, headH * 0.35);
     }
 
-    this._renderMiniHeat();
-
     c.save();
     this._traceBackPath(c, toX, toY);
     c.clip();
-    c.imageSmoothingEnabled = true;
-    c.drawImage(this.miniCanvas, vp.ox, vp.oy, vp.mapW, vp.mapH);
+    const warp = getBackWarp();
+    if (warp) {
+      drawMappedHeatCells(
+        c,
+        {
+          w: HEAT_W,
+          h: HEAT_H,
+          isBody: (index) => this.grid.isBody(index),
+          fractionAt: (index) => this.grid.pixelFraction(index),
+        },
+        warp,
+        toX,
+        toY,
+        coverageHeatRGBA,
+      );
+    } else {
+      this._renderMiniHeat();
+      c.imageSmoothingEnabled = true;
+      c.drawImage(this.miniCanvas, vp.ox, vp.oy, vp.mapW, vp.mapH);
+    }
 
     if (this.paths) {
       const trail = (path, color) => {
         const pts = path.slice(-50);
-        if (pts.length < 2) return;
-        c.beginPath();
-        c.moveTo(toX(pts[0].u), toY(pts[0].v));
-        for (let i = 1; i < pts.length; i++) c.lineTo(toX(pts[i].u), toY(pts[i].v));
-        c.strokeStyle = color;
-        c.lineWidth = 2;
         c.globalAlpha = 0.85;
-        c.stroke();
+        strokeMappedPath(c, pts, warp, toX, toY, color, 2);
         c.globalAlpha = 1;
       };
       trail(this.paths.gauche, '#00FFFF');
@@ -978,12 +1097,8 @@ export class SunCoachEngine {
       if (gap) {
         const z = gap.zone;
         c.save();
-        c.strokeStyle = 'rgba(255, 50, 50, 0.95)';
-        c.lineWidth = 2.5;
         c.setLineDash([4, 3]);
-        c.beginPath();
-        c.rect(toX(z.u0), toY(z.v0), toX(z.u1) - toX(z.u0), toY(z.v1) - toY(z.v0));
-        c.stroke();
+        strokeMappedZone(c, z, warp, toX, toY, 'rgba(255, 50, 50, 0.95)', 2.5);
         c.restore();
       }
 
@@ -1007,6 +1122,17 @@ export class SunCoachEngine {
         `warp ${getBackWarp() ? 'on' : 'off'} · body ${this.grid.heat.length}`,
       ];
       dbg.forEach((line, i) => c.fillText(line, 4, 10 + i * 9));
+      if (warp?.outline?.length === BACK_ANCHOR_ORDER.length) {
+        warp.outline.forEach((point, index) => {
+          const x = toX(point.u);
+          const y = toY(point.v);
+          c.beginPath();
+          c.arc(x, y, 2, 0, Math.PI * 2);
+          c.fillStyle = '#FFFF00';
+          c.fill();
+          c.fillText(BACK_ANCHOR_ORDER[index], x + 3, y);
+        });
+      }
     }
   }
 
@@ -1045,7 +1171,11 @@ export class SunCoachEngine {
 
     if (!frame && !mask) return;
 
-    if (mask) {
+    const canShowCoverage = this.state !== 'coverage'
+      || (P && isBackTurned(P, W));
+    // En couverture, le masque est figé au scan et ne suit pas le corps live :
+    // l'afficher sur la vidéo serait trompeur. La couverture vit sur la minimap.
+    if (mask && canShowCoverage && this.state !== 'coverage') {
       drawBackSegmentationOverlay(ctx, mask, W, H, {
         contour: this.backContour,
         grid: this.state === 'coverage' ? this.grid : null,

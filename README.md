@@ -9,7 +9,7 @@ suit tes mains, découpe ton dos en 7 zones anatomiques, et te dit où il manque
 ## Flux réel (Holistic + Segmenter)
 
 1. **Placement** — distance ~2 m, dos à la caméra, épaules et hanches visibles.
-2. **Scan IA** — `HolisticLandmarker` + `BodySegmenter` : photo figée, masque dos moyenné (~30 frames).
+2. **Scan IA** — `HolisticLandmarker` + segmenter optionnel : photo figée, masque dos moyenné.
 3. **Ajustement** — 8 points glissables sur la photo (épaules/nuque au départ → contour du dos).
 4. **Reposition** — retour dos caméra ; score de pose continu (pas de seuil binaire).
 5. **Couverture libre** — frotte tout le dos ; heatmap orange → vert, bips radar, voix sur les zones manquantes.
@@ -31,6 +31,10 @@ Tout tourne **100 % dans le navigateur** (WASM/GPU). La vidéo ne quitte jamais 
 - **Warp** : les 8 points photo → UV générique (zones anatomiques + heatmap).
 - **Mode dégradé** : si confiance main basse, peinture par zone via `grid.paintZone`.
 - **Debug** : `?debug=1` sur l'URL, ou `node debug-harness.mjs` (voir `docs/DEBUG.md`).
+- **Labos** :
+  - `?lab=1` — minimap image fixe + 8 points
+  - `?vidhands=1` — vidéo : tracking dos/mains + couverture (voir `AGENTS.md` → prochaine session)
+  - `?frames=1` — frames Hands figées
 
 ## Développement
 
@@ -38,9 +42,16 @@ Tout tourne **100 % dans le navigateur** (WASM/GPU). La vidéo ne quitte jamais 
 npm install
 npm run build          # dist/
 node debug-harness.mjs # logique session sans DOM
+npm run preview        # ouvre ensuite le port affiché
 ```
 
-La caméra exige HTTPS ou `localhost` — utilise `npm run dev` en local uniquement.
+La caméra exige HTTPS ou `localhost`. Pour le diagnostic Mac, utilise le bouton
+**CHOISIR UNE VIDÉO** avec un MP4 H.264. Les repères temporels affichés sont une
+légende : les phases sont déclenchées uniquement par la pose détectée.
+
+Le fichier vidéo ne modifie pas les règles du protocole : il remplace seulement
+la source caméra. Pour travailler uniquement sur la forme du dos, utilise le
+labo minimap plutôt que le replay complet.
 
 ## Déploiement
 

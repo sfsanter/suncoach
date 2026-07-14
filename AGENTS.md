@@ -69,3 +69,38 @@ Voir section **phase0-tel-validate** dans le résumé de livraison agent :
 - Français pour voix / HUD utilisateur
 - Imports ESM `.js` explicites
 - Pas de sur-abstraction : diff minimal, réutiliser `applyCalibration` partout
+
+## Prochaine session — attaque directe
+
+**État validé (labo `?vidhands=1`) — ne pas casser :**
+- Play/Pause · Tracer 8 points · Start tracking (lock une fois)
+- Suivi dos : `torsoAffine.js` (similarité d’abord, garde anti-tube vertical)
+- Hands : `handLandmarker.js` (VIDEO) + UV via `toWarpPixel = xf.inv`
+- Couverture : `CoverageGrid(THOROUGH_PIXEL_NEED)` · heat live + minimap · % touché / validé
+
+**Entrée de travail :**
+```
+npm run build && npm run preview
+→ http://localhost:…/?vidhands=1
+```
+Vidéo test locale : `public/IMG_3805.mp4` (gitignorée — H.264). Sinon bouton VIDÉO.
+Accueil : bouton labo vidéo / `?frames=1` / `?lab=1`.
+
+**Prochaine brique (demandée, pas encore faite) :**
+> Contour **progressif** assez **haut** sur le **haut du dos** (nuque / trapèzes) —
+> aujourd’hui le polygone / masque coupe trop bas ou trop plat en haut.
+> Pistes : outline `backWarp` / ancres nuque-épaules, `SHAPE_KNOTS` haut, bodyMask top,
+> éventuellement demi-lunes ou falloff au-dessus de la ligne épaules.
+> Valider dans `VideoHandLab` (overlay + minimap) avant de porter dans `engine.js`.
+
+**Hors scope immédiat :** brancher Hands+affine+couverture dans la session produit (`engine.js` Holistic) — uniquement après OK labo haut du dos.
+
+**Fichiers clés labo :**
+| Fichier | Rôle |
+|---------|------|
+| `src/VideoHandLab.jsx` | UI + tick tracking/peinture |
+| `src/lib/torsoAffine.js` | attach dos MediaPipe |
+| `src/lib/handLandmarker.js` | Hands VIDEO |
+| `src/lib/coverage.js` | heat, `THOROUGH_PIXEL_NEED` |
+| `src/lib/poseVideo.js` | PoseLandmarker VIDEO |
+| `src/lib/backWarp.js` | UV ↔ pixels (contour) |

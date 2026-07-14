@@ -2,3 +2,7 @@ node_modules/
 dist/
 .DS_Store
 test-captures/
+*.MOV
+*.mov
+*.MP4
+*.mp4

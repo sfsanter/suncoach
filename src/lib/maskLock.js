@@ -44,7 +44,9 @@ export class MaskLockAccumulator {
       for (let x = 0; x < this.W; x++) {
         if (mask[row * this.W + x] < 128) continue;
         const uv = toBack({ x, y: row, visibility: 1 }, frame);
-        const bi = Math.max(0, Math.min(bins - 1, Math.floor(uv.v * bins)));
+        // Ne pas rabattre les pixels hors torse dans les bins extrêmes.
+        if (uv.v < 0 || uv.v >= 1) continue;
+        const bi = Math.floor(uv.v * bins);
         counts[bi]++;
         if (!valid[bi] || uv.u < left[bi]) left[bi] = uv.u;
         if (!valid[bi] || uv.u > right[bi]) right[bi] = uv.u;

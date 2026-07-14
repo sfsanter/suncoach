@@ -47,6 +47,8 @@ const CALIBRATION_VOICES = {
   adjust_intro:
     'Photo prise ! Les points verts sont sur tes épaules et ta nuque. ' +
     'Glisse chaque point sur le contour de ton dos, puis valide.',
+  degraded_hint:
+    'Je vois mal ta main. Frotte largement la zone indiquée, sans viser un point précis.',
 };
 
 export function calibrationVoice(id) {

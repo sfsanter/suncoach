@@ -2,7 +2,14 @@
  * Segmentation MediaPipe → silhouette dorsale live + couverture lissée (sans grille).
  */
 import { LM } from './pose.js';
-import { backHalfWidth, nearBackShape, toBack, coverageHeatRGBA } from './coverage.js';
+import {
+  backHalfWidth,
+  nearBackShape,
+  toBack,
+  coverageHeatRGBA,
+  getMinimapLayout,
+  paintUvFromWarpedPixel,
+} from './coverage.js';
 
 const MASK_THRESH = 0.28;
 const BLEND = 0.38;
@@ -188,9 +195,10 @@ function paintCoverageOnSilhouette(ctx, alpha, W, H, grid, frame) {
     for (let x = 0; x < W; x += step) {
       const i = y * W + x;
       if (alpha[i] < 70) continue;
-      const { u, v } = toBack({ x, y }, frame);
-      if (!nearBackShape(u, v, 0.08)) continue;
-      const f = grid.sample(u, v);
+      const raw = toBack({ x, y }, frame);
+      const uv = paintUvFromWarpedPixel({ x, y }, raw.u, raw.v, getMinimapLayout());
+      if (!uv || !nearBackShape(uv.u, uv.v, 0.08)) continue;
+      const f = grid.sample(uv.u, uv.v);
       const [r, g, b, a] = coverageHeatRGBA(f);
       for (let dy = 0; dy < step && y + dy < H; dy++) {
         for (let dx = 0; dx < step && x + dx < W; dx++) {

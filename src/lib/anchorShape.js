@@ -2,8 +2,7 @@
  * Repères en pixels image (placement tactile) + forme canonique minimap depuis 8 points.
  */
 import { LM } from './pose.js';
-import { toBack } from './coverage.js';
-import { ANCHOR_ORDER } from './backCalibration.js';
+import { BACK_ANCHOR_ORDER as ANCHOR_ORDER } from './backWarp.js';
 
 /** Positions initiales visibles sur la photo (épaules / hanches), pas le masque IA. */
 export function defaultAnchorsPx(P, W, H) {
@@ -106,16 +105,6 @@ export function insideLayoutShape(u, v, layout) {
   const left = layout.boundaryAt(v, 'left');
   const right = layout.boundaryAt(v, 'right');
   return u >= left - 0.02 && u <= right + 0.02;
-}
-
-/** Pixels image → repère dos (u, v) pour la heatmap. */
-export function pixelsToBackAnchors(pxAnchors, frame) {
-  const out = {};
-  for (const [id, p] of Object.entries(pxAnchors)) {
-    if (!p) continue;
-    out[id] = toBack({ x: p.x, y: p.y, visibility: 1 }, frame);
-  }
-  return out;
 }
 
 /** Métriques pour déplier le dos en rectangle minimap (évite l'écrasement). */

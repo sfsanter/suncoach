@@ -12,28 +12,111 @@ import { SunCoachEngine, ZONE_COUNT, ANATOMICAL_ZONES } from './lib/engine.js';
 import { setupMinimapCanvas } from './lib/minimapCanvas.js';
 import { CALIBRATION_STEPS, ANCHOR_ORDER } from './lib/backCalibration.js';
 import { strokeZoneOutline } from './lib/zones.js';
-import { preloadPose, preloadBodySegmenter } from './lib/pose.js';
+import { buildBackWarp } from './lib/backWarp.js';
+import {
+  drawMappedHeatCells,
+  strokeMappedPath,
+  strokeMappedZone,
+} from './lib/minimapRender.js';
+import { preloadPose } from './lib/pose.js';
 import { isTestMode } from './lib/testMode.js';
+import {
+  isReplayMode,
+  tryAutoLoadDefaultVideo,
+  REPLAY_SCENARIO,
+  DEFAULT_REPLAY_FILE,
+  isLocalDevHost,
+} from './lib/replayMode.js';
+import { isDebugMinimap } from './lib/minimapCanvas.js';
+import { buildDebugPayload, downloadDebugJson } from './lib/debugExport.js';
 import TestPage from './TestPage.jsx';
+import MinimapLab from './MinimapLab.jsx';
+import FrameLab from './FrameLab.jsx';
+import VideoHandLab from './VideoHandLab.jsx';
 
-const testMode = isTestMode();
+const videoHandLabMode = typeof window !== 'undefined'
+  && new URLSearchParams(window.location.search).has('vidhands');
+const frameLabMode = !videoHandLabMode && typeof window !== 'undefined'
+  && new URLSearchParams(window.location.search).has('frames');
+const minimapLabMode = !videoHandLabMode && !frameLabMode && typeof window !== 'undefined'
+  && new URLSearchParams(window.location.search).has('lab');
+const replayMode = !videoHandLabMode && !frameLabMode && !minimapLabMode && isReplayMode();
+const testMode = !videoHandLabMode && !frameLabMode && !minimapLabMode && !replayMode && isTestMode();
+
+function formatSessionStartError(err, isReplay) {
+  const msg = String(err?.message || err);
+  const name = err?.name || '';
+  const detail = msg ? ` (détail: ${msg.slice(0, 120)})` : '';
+  if (isReplay) {
+    if (name === 'VideoDecodeError' || /decode|MEDIA_DECODE|DECODE_ERR|AppleVTDecoder/i.test(msg)) {
+      return 'VIDÉO .MOV IPHONE (HEVC) NON LISIBLE DANS FIREFOX — CHOISIS IMG_3783.mp4 OU UTILISE CHROME/SAFARI.';
+    }
+    if (/video load|VideoLoadError|dimensions unavailable/i.test(msg)) {
+      return 'VIDÉO ILLISIBLE — ESSAIE UN FICHIER .MP4 H.264 (PAS .MOV HEVC IPHONE).';
+    }
+    if (/fetch|network|Failed to load|Load failed|wasm|model/i.test(msg)) {
+      return 'MODÈLE IA NON TÉLÉCHARGÉ — VÉRIFIE LA CONNEXION (1ère fois ~15 Mo).';
+    }
+    return 'REPLAY IMPOSSIBLE — VÉRIFIE LE FICHIER VIDÉO.';
+  }
+  if (name === 'NotAllowedError') {
+    return 'ACCÈS CAMÉRA REFUSÉ — AUTORISE LA CAMÉRA POUR SAFARI/CHROME (Réglages système sur Mac).';
+  }
+  if (/fetch|network|Failed to load|Load failed|wasm|model/i.test(msg)) {
+    return 'MODÈLE IA NON TÉLÉCHARGÉ — VÉRIFIE LA 4G/WIFI (besoin internet 1ère fois, ~15 Mo).';
+  }
+  if (
+    name === 'CameraTimeoutError' ||
+    name === 'OverconstrainedError' ||
+    name === 'NotFoundError' ||
+    name === 'NotReadableError' ||
+    name === 'CameraError' ||
+    name === 'AbortError' ||
+    name === 'SecurityError' ||
+    /camera|getUserMedia|videoinput|dimensions unavailable|videoWidth/i.test(msg)
+  ) {
+    return 'CAMÉRA INDISPONIBLE — AUTORISE LA CAMÉRA DANS LE NAVIGATEUR.';
+  }
+  return 'DÉMARRAGE IMPOSSIBLE — RECHARGE LA PAGE ET RÉESSAIE.' + detail;
+}
 
 export default function App() {
-  const [screen, setScreen] = useState(testMode ? 'test' : 'home');
+  const [screen, setScreen] = useState(replayMode ? 'replay' : testMode ? 'test' : 'home');
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
   const [sessionRunning, setSessionRunning] = useState(false);
   const [modelStatus, setModelStatus] = useState('loading');
+  const [replaySource, setReplaySource] = useState(null);
+  const [replayLabel, setReplayLabel] = useState('');
+  const replayBlobRef = useRef(null);
   const engineRef = useRef(null);
 
+  useEffect(() => () => {
+    if (replayBlobRef.current) URL.revokeObjectURL(replayBlobRef.current);
+  }, []);
+
+  const pickVideoFile = (file) => {
+    if (!file) return;
+    if (replayBlobRef.current) URL.revokeObjectURL(replayBlobRef.current);
+    const url = URL.createObjectURL(file);
+    replayBlobRef.current = url;
+    setReplaySource(url);
+    setReplayLabel(file.name);
+    setError(null);
+  };
+
   useEffect(() => {
+    if (minimapLabMode) return undefined;
     let cancelled = false;
     preloadPose()
       .then(() => { if (!cancelled) setModelStatus('ok'); })
       .catch(() => { if (!cancelled) setModelStatus('fail'); });
-    preloadBodySegmenter().catch(() => { /* chargé au scan IA */ });
     return () => { cancelled = true; };
   }, []);
+
+  if (videoHandLabMode) return <VideoHandLab />;
+  if (frameLabMode) return <FrameLab />;
+  if (minimapLabMode) return <MinimapLab />;
 
   return (
     <div className="h-full bg-nerv-black">
@@ -42,8 +125,60 @@ export default function App() {
           error={error}
           testMode={testMode}
           modelStatus={modelStatus}
-          onStart={() => { setError(null); setSessionRunning(true); setScreen('session'); }}
+          replayLabel={replayLabel}
+          onPickVideo={pickVideoFile}
+          onStart={() => {
+            setError(null);
+            setReplaySource(null);
+            setReplayLabel('');
+            if (replayBlobRef.current) {
+              URL.revokeObjectURL(replayBlobRef.current);
+              replayBlobRef.current = null;
+            }
+            setSessionRunning(true);
+            setScreen('session');
+          }}
+          onStartVideo={() => {
+            if (!replaySource) {
+              setError('CHOISIS D’ABORD UNE VIDÉO (.MOV ou .MP4).');
+              return;
+            }
+            if (modelStatus !== 'ok') {
+              setError('MODÈLE IA PAS ENCORE CHARGÉ — ATTENDS OU VÉRIFIE LA CONNEXION.');
+              return;
+            }
+            setError(null);
+            setSessionRunning(true);
+            setScreen('session');
+          }}
           onOpenTest={() => { setError(null); setScreen('test'); }}
+        />
+      )}
+      {screen === 'replay' && replayMode && (
+        <ReplayHomeScreen
+          error={error}
+          modelStatus={modelStatus}
+          replayLabel={replayLabel}
+          onPickFile={(src, label) => {
+            if (replayBlobRef.current) URL.revokeObjectURL(replayBlobRef.current);
+            replayBlobRef.current = src.startsWith('blob:') ? src : null;
+            setReplaySource(src);
+            setReplayLabel(label);
+            setError(null);
+          }}
+          onStart={() => {
+            if (!replaySource) {
+              setError('CHOISIS D’ABORD UNE VIDÉO (.MOV ou .MP4).');
+              return;
+            }
+            if (modelStatus !== 'ok') {
+              setError('MODÈLE IA PAS ENCORE CHARGÉ — ATTENDS OU VÉRIFIE LA CONNEXION.');
+              return;
+            }
+            setError(null);
+            setSessionRunning(true);
+            setScreen('session');
+          }}
         />
       )}
       {screen === 'test' && testMode && (
@@ -70,15 +205,201 @@ export default function App() {
           engineRef={engineRef}
           testMode={testMode}
           onOpenTest={() => setScreen('test')}
-          onAbort={() => { setSessionRunning(false); setScreen(testMode ? 'test' : 'home'); }}
-          onError={(msg) => { setError(msg); setSessionRunning(false); setScreen(testMode ? 'test' : 'home'); }}
+          onAbort={() => {
+            setSessionRunning(false);
+            setScreen(replaySource ? 'home' : replayMode ? 'replay' : testMode ? 'test' : 'home');
+          }}
+          onError={(msg) => {
+            setError(msg);
+            setSessionRunning(false);
+            setScreen(replaySource ? 'home' : replayMode ? 'replay' : testMode ? 'test' : 'home');
+          }}
           onDone={(res) => { setResult(res); setSessionRunning(false); setScreen('done'); }}
+          replayMode={!!replaySource}
+          replaySource={replaySource}
         />
         </div>
       )}
       {screen === 'done' && (
-        <DoneScreen result={result} onRestart={() => setScreen('home')} />
+        <DoneScreen
+          result={result}
+          onRestart={() => setScreen(replayMode ? 'replay' : 'home')}
+        />
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------- replay (vidéo fichier)
+
+function ReplayHomeScreen({ error, modelStatus, replayLabel, onPickFile, onStart }) {
+  const fileRef = useRef(null);
+  const [autoStatus, setAutoStatus] = useState('checking');
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!isLocalDevHost()) {
+      setAutoStatus('manual');
+      return undefined;
+    }
+    tryAutoLoadDefaultVideo().then((url) => {
+      if (cancelled) return;
+      if (url) {
+        onPickFile(url, DEFAULT_REPLAY_FILE + ' (auto)');
+        setAutoStatus('loaded');
+      } else {
+        setAutoStatus('missing');
+      }
+    });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- auto-load une seule fois au montage
+  }, []);
+
+  const handleFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    onPickFile(url, file.name);
+    setAutoStatus('picked');
+    e.target.value = '';
+  };
+
+  return (
+    <div className="relative min-h-full overflow-hidden">
+      <HexGridBackground color="#00FFFF" opacity={0.06} />
+      <div className="relative mx-auto flex min-h-screen max-w-md flex-col justify-center gap-4 px-4 py-8">
+        <EmergencyBanner
+          text="MODE REPLAY — VIDÉO FICHIER"
+          subtext="Injection locale pour debug Mac · pas de caméra live"
+          severity="info"
+          visible
+        />
+
+        {error && (
+          <EmergencyBanner text="ERREUR" subtext={error} severity="warning" visible />
+        )}
+
+        <Card
+          eyebrow="NERV // REPLAY DEBUG"
+          title="Rejouer une vidéo enregistrée sur iPhone"
+          variant="default"
+        >
+          <TerminalDisplay
+            lines={[
+              '1. Transfère la vidéo (.MOV) sur le Mac.',
+              '2. Choisis le fichier ci-dessous (ou auto si ' + DEFAULT_REPLAY_FILE + ' à la racine).',
+              '3. Lance le replay — même pipeline que la session réelle.',
+              '4. Option : ?debug=1 pour overlay technique.',
+            ]}
+            color="cyan"
+            prompt=">"
+            title="WORKFLOW"
+          />
+        </Card>
+
+        <input
+          ref={fileRef}
+          type="file"
+          accept="video/*,.mov,.mp4"
+          className="hidden"
+          onChange={handleFile}
+        />
+
+        <Button variant="ghost" size="lg" fullWidth onClick={() => fileRef.current?.click()}>
+          CHOISIR UNE VIDÉO
+        </Button>
+
+        {replayLabel && (
+          <p className="text-center text-xs text-nerv-cyan" style={{ fontFamily: 'var(--font-nerv-mono)' }}>
+            Fichier : {replayLabel}
+          </p>
+        )}
+
+        {autoStatus === 'checking' && (
+          <p className="text-center text-[10px] text-nerv-white/40" style={{ fontFamily: 'var(--font-nerv-mono)' }}>
+            Recherche {DEFAULT_REPLAY_FILE} sur ce serveur…
+          </p>
+        )}
+        {autoStatus === 'loaded' && (
+          <p className="text-center text-[10px] text-nerv-green/80" style={{ fontFamily: 'var(--font-nerv-mono)' }}>
+            {DEFAULT_REPLAY_FILE} chargé automatiquement (serveur local).
+          </p>
+        )}
+        {autoStatus === 'missing' && isLocalDevHost() && (
+          <p className="text-center text-[10px] text-nerv-orange/70" style={{ fontFamily: 'var(--font-nerv-mono)' }}>
+            Pas de {DEFAULT_REPLAY_FILE} à la racine — utilise le sélecteur de fichier.
+          </p>
+        )}
+
+        <Button
+          variant="primary"
+          size="lg"
+          fullWidth
+          onClick={onStart}
+          disabled={!replayLabel || modelStatus !== 'ok'}
+        >
+          {modelStatus === 'ok' ? 'LANCER LE REPLAY' : modelStatus === 'fail' ? 'MODÈLE IA INDISPONIBLE' : 'CHARGEMENT MODÈLE…'}
+        </Button>
+
+        <ReplayScenarioLegend />
+      </div>
+    </div>
+  );
+}
+
+function ReplayScenarioLegend() {
+  return (
+    <div className="rounded border border-nerv-cyan/30 bg-nerv-panel/80 px-3 py-2">
+      <div className="text-[10px] font-bold tracking-wider text-nerv-cyan" style={{ fontFamily: 'var(--font-nerv-mono)' }}>
+        REPÈRES VIDÉO (légende seule — pas de déclenchement auto)
+      </div>
+      <ul className="mt-1 space-y-0.5 text-[9px] text-nerv-white/60" style={{ fontFamily: 'var(--font-nerv-mono)' }}>
+        {REPLAY_SCENARIO.map((m) => (
+          <li key={m.t}>
+            {String(m.t).padStart(2, '0')}s — {m.label} ({m.phase})
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function ReplayTimeline({ videoRef, duration }) {
+  const [current, setCurrent] = useState(0);
+
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return undefined;
+    const tick = () => setCurrent(v.currentTime);
+    v.addEventListener('timeupdate', tick);
+    return () => v.removeEventListener('timeupdate', tick);
+  }, [videoRef, duration]);
+
+  if (!duration || !Number.isFinite(duration)) return null;
+  const pct = (t) => Math.min(100, (t / duration) * 100);
+
+  return (
+    <div className="pointer-events-none absolute inset-x-0 bottom-16 px-3">
+      <div className="relative h-2 rounded bg-black/60">
+        {REPLAY_SCENARIO.map((m) => (
+          <div
+            key={m.t}
+            className="absolute top-0 h-full w-px bg-nerv-cyan/70"
+            style={{ left: `${pct(m.t)}%` }}
+            title={`${m.t}s ${m.label}`}
+          />
+        ))}
+        <div
+          className="absolute top-0 h-full w-0.5 bg-nerv-orange"
+          style={{ left: `${Math.min(100, (current / duration) * 100)}%` }}
+        />
+      </div>
+      <div className="mt-1 flex justify-between text-[8px] text-nerv-cyan/80" style={{ fontFamily: 'var(--font-nerv-mono)' }}>
+        {REPLAY_SCENARIO.filter((_, i) => i % 2 === 0).map((m) => (
+          <span key={m.t}>{m.t}s</span>
+        ))}
+        <span>{Math.floor(current)}s</span>
+      </div>
     </div>
   );
 }
@@ -94,7 +415,17 @@ const BRIEFING = [
   '06. REPLACE-TOI (VOIX) → FROTTE — ORANGE → VERT.',
 ];
 
-function HomeScreen({ error, onStart, testMode, onOpenTest, modelStatus }) {
+function HomeScreen({
+  error, onStart, onStartVideo, onPickVideo, replayLabel, testMode, onOpenTest, modelStatus,
+}) {
+  const fileRef = useRef(null);
+
+  const handleFile = (e) => {
+    const file = e.target.files?.[0];
+    if (file) onPickVideo(file);
+    e.target.value = '';
+  };
+
   return (
     <div className="relative min-h-full overflow-hidden">
       <HexGridBackground color="#FF9900" opacity={0.07} />
@@ -132,8 +463,8 @@ function HomeScreen({ error, onStart, testMode, onOpenTest, modelStatus }) {
         )}
 
         <EmergencyBanner
-          text="SUNCOACH · NETTOYAGE V3 — DOCS + DEBUG"
-          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · schéma warp 8 points · reposition continu · ?debug=1'}
+          text="SUNCOACH · REPLAY MP4 + WARP UV"
+          subtext={'BUILD ' + (typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?') + ' · upload vidéo · ?debug=1 · ?cpu=1 si GPU lent'}
           severity="info"
           visible
         />
@@ -164,8 +495,70 @@ function HomeScreen({ error, onStart, testMode, onOpenTest, modelStatus }) {
 
         {!testMode && (
         <Button variant="primary" size="lg" fullWidth onClick={onStart}>
-          COMMENCER LE PROTOCOLE
+          COMMENCER LE PROTOCOLE (CAMÉRA)
         </Button>
+        )}
+
+        {!testMode && (
+        <>
+          <div
+            className="text-center text-[10px] tracking-[0.3em] text-nerv-cyan/70"
+            style={{ fontFamily: 'var(--font-nerv-mono)' }}
+          >
+            — OU TESTER AVEC UNE VIDÉO (MAC) —
+          </div>
+          <p className="text-center text-[9px] text-nerv-orange/80" style={{ fontFamily: 'var(--font-nerv-mono)' }}>
+            Firefox : préfère .mp4 H.264 (pas .MOV iPhone). Fichier prêt : IMG_3783.mp4
+          </p>
+          <input
+            ref={fileRef}
+            type="file"
+            accept="video/*,.mov,.mp4"
+            className="hidden"
+            onChange={handleFile}
+          />
+          <Button variant="ghost" size="lg" fullWidth onClick={() => fileRef.current?.click()}>
+            CHOISIR UNE VIDÉO
+          </Button>
+          {replayLabel && (
+            <p className="text-center text-xs text-nerv-cyan" style={{ fontFamily: 'var(--font-nerv-mono)' }}>
+              Fichier : {replayLabel}
+            </p>
+          )}
+          <Button
+            variant="primary"
+            size="lg"
+            fullWidth
+            onClick={onStartVideo}
+            disabled={!replayLabel || modelStatus !== 'ok'}
+          >
+            {modelStatus === 'ok' ? 'LANCER AVEC VIDÉO' : modelStatus === 'fail' ? 'MODÈLE IA INDISPONIBLE' : 'CHARGEMENT MODÈLE…'}
+          </Button>
+          <Button
+            variant="ghost"
+            size="lg"
+            fullWidth
+            onClick={() => { window.location.href = `${window.location.pathname}?vidhands=1`; }}
+          >
+            LABO VIDÉO MAINS LIVE (8 PTS FIGÉS)
+          </Button>
+          <Button
+            variant="ghost"
+            size="lg"
+            fullWidth
+            onClick={() => { window.location.href = `${window.location.pathname}?frames=1`; }}
+          >
+            LABO 3 CAPTURES (TEST MINIMAL)
+          </Button>
+          <Button
+            variant="ghost"
+            size="lg"
+            fullWidth
+            onClick={() => { window.location.href = `${window.location.pathname}?lab=1`; }}
+          >
+            OUVRIR LE LABO MINIMAP (SANS IA)
+          </Button>
+        </>
         )}
 
         {testMode && (
@@ -223,7 +616,7 @@ function clientToImagePx(clientX, clientY, imgEl, videoW, videoH) {
   };
 }
 
-function PointAdjustScreen({ payload, engine }) {
+function PointAdjustScreen({ payload, engine, debugMode }) {
   const imgRef = useRef(null);
   const boxRef = useRef(null);
   const { fit, refresh } = useImageFit(imgRef, boxRef);
@@ -295,7 +688,7 @@ function PointAdjustScreen({ payload, engine }) {
       >
         <div className="text-sm font-bold tracking-[0.2em] text-nerv-orange">AJUSTE TON DOS</div>
         <div className="mt-1 text-xs text-nerv-green/80">
-          Points sur épaules/nuque au départ · glisse sur le bord du dos
+          Photo figée · glisse les points verts sur le bord de ton dos · puis VALIDER
         </div>
       </div>
 
@@ -353,7 +746,17 @@ function PointAdjustScreen({ payload, engine }) {
         </div>
       </div>
 
-      <div className="border-t border-nerv-orange/30 bg-nerv-panel px-4 py-3">
+      <div className="border-t border-nerv-orange/30 bg-nerv-panel px-4 py-3 space-y-2">
+        {debugMode && (
+          <Button
+            variant="ghost"
+            size="lg"
+            fullWidth
+            onClick={() => engine.confirmAdjustment()}
+          >
+            PASSER SANS AJUSTER (DEBUG)
+          </Button>
+        )}
         <Button variant="primary" size="lg" fullWidth onClick={() => engine.confirmAdjustment()}>
           VALIDER LES 8 POINTS
         </Button>
@@ -364,7 +767,10 @@ function PointAdjustScreen({ payload, engine }) {
 
 // ---------------------------------------------------------------- session
 
-function SessionScreen({ onAbort, onError, onDone, engineRef, testMode, onOpenTest }) {
+function SessionScreen({
+  onAbort, onError, onDone, engineRef, testMode, onOpenTest,
+  replayMode, replaySource,
+}) {
   const videoRef = useRef(null);
   const overlayRef = useRef(null);
   const minimapRef = useRef(null);
@@ -372,12 +778,29 @@ function SessionScreen({ onAbort, onError, onDone, engineRef, testMode, onOpenTe
   const [hud, setHud] = useState({ pct: 0, status: 'INITIALISATION…' });
   const [muted, setMuted] = useState(false);
   const [ready, setReady] = useState(false);
+  const [videoDuration, setVideoDuration] = useState(0);
+  const [videoPaused, setVideoPaused] = useState(false);
 
   const [phase, setPhase] = useState('placement');
   const [adjustPayload, setAdjustPayload] = useState(null);
+  const debugOverlay = isDebugMinimap();
 
   useEffect(() => {
     if (minimapRef.current) setupMinimapCanvas(minimapRef.current);
+  }, []);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return undefined;
+    const syncPaused = () => setVideoPaused(video.paused);
+    video.addEventListener('play', syncPaused);
+    video.addEventListener('pause', syncPaused);
+    video.addEventListener('ended', syncPaused);
+    return () => {
+      video.removeEventListener('play', syncPaused);
+      video.removeEventListener('pause', syncPaused);
+      video.removeEventListener('ended', syncPaused);
+    };
   }, []);
 
   useEffect(() => {
@@ -385,6 +808,7 @@ function SessionScreen({ onAbort, onError, onDone, engineRef, testMode, onOpenTe
       video: videoRef.current,
       overlay: overlayRef.current,
       minimap: minimapRef.current,
+      replaySource: replaySource || null,
       onHud: (pct, status) => setHud({ pct, status }),
       onDone,
       onPhase: (p, data) => {
@@ -397,16 +821,16 @@ function SessionScreen({ onAbort, onError, onDone, engineRef, testMode, onOpenTe
     let cancelled = false;
     engine
       .start()
-      .then(() => { if (!cancelled) setReady(true); })
+      .then(() => {
+        if (cancelled) return;
+        setReady(true);
+        if (replayMode && videoRef.current) {
+          setVideoDuration(videoRef.current.duration || 0);
+        }
+      })
       .catch((err) => {
         if (cancelled) return;
-        const msg =
-          err?.name === 'NotAllowedError'
-            ? 'ACCÈS CAMÉRA REFUSÉ — AUTORISE LA CAMÉRA POUR SAFARI/CHROME DANS RÉGLAGES iOS.'
-            : /fetch|network|Failed to load|Load failed|wasm|model/i.test(String(err?.message || err))
-              ? 'MODÈLE IA NON TÉLÉCHARGÉ — VÉRIFIE LA 4G/WIFI (besoin internet 1ère fois, ~15 Mo).'
-              : 'CAMÉRA OU MODÈLE INDISPONIBLE — RÉESSAIE APRÈS CHARGEMENT DU MODÈLE.';
-        onError(msg);
+        onError(formatSessionStartError(err, replayMode));
       });
     return () => {
       cancelled = true;
@@ -421,6 +845,28 @@ function SessionScreen({ onAbort, onError, onDone, engineRef, testMode, onOpenTe
     const m = !muted;
     engine()?.setMuted(m);
     setMuted(m);
+  };
+
+  const toggleVideoPause = async () => {
+    const v = videoRef.current;
+    if (!v || v.error || !Number.isFinite(v.duration)) return;
+    if (v.paused) {
+      try {
+        await v.play();
+        setVideoPaused(false);
+      } catch {
+        onError('LECTURE VIDÉO IMPOSSIBLE — ESSAIE IMG_3783.mp4 (H.264) OU CHROME/SAFARI.');
+      }
+    } else {
+      v.pause();
+      setVideoPaused(true);
+    }
+  };
+
+  const seekVideo = (seconds) => {
+    const v = videoRef.current;
+    if (!v || !Number.isFinite(v.duration)) return;
+    v.currentTime = Math.max(0, Math.min(v.duration, seconds));
   };
 
   return (
@@ -446,7 +892,11 @@ function SessionScreen({ onAbort, onError, onDone, engineRef, testMode, onOpenTe
         )}
 
         {phase === 'adjusting' && adjustPayload && engine() && (
-          <PointAdjustScreen payload={adjustPayload} engine={engine()} />
+          <PointAdjustScreen
+            payload={adjustPayload}
+            engine={engine()}
+            debugMode={debugOverlay}
+          />
         )}
 
         {phase !== 'adjusting' && (
@@ -462,14 +912,30 @@ function SessionScreen({ onAbort, onError, onDone, engineRef, testMode, onOpenTe
           >
             {hud.status}
           </div>
+          {replayMode && (
+            <div
+              className="mt-1 text-center text-[10px] tracking-wider text-nerv-cyan/90"
+              style={{ fontFamily: 'var(--font-nerv-mono)' }}
+            >
+              REPLAY · phase {phase}
+              {debugOverlay && ` · ${Math.round(hud.pct * 100)}%`}
+            </div>
+          )}
         </div>
         )}
 
-        {phase !== 'adjusting' && (
-        <div className="pointer-events-none absolute bottom-3 right-3 flex flex-col items-center gap-1">
+        {replayMode && phase !== 'adjusting' && (
+          <ReplayTimeline videoRef={videoRef} duration={videoDuration} />
+        )}
+
+        <div
+          className={`pointer-events-none absolute bottom-3 right-3 z-30 flex flex-col items-center gap-1 rounded border border-nerv-green/40 bg-black/90 p-1 ${
+            phase === 'adjusting' ? 'invisible' : ''
+          }`}
+        >
           <canvas
             ref={minimapRef}
-            style={{ width: 110, height: 150, display: 'block' }}
+            style={{ display: 'block' }}
           />
           <span
             className="text-[10px] tracking-[0.25em] text-nerv-green/80"
@@ -478,7 +944,6 @@ function SessionScreen({ onAbort, onError, onDone, engineRef, testMode, onOpenTe
             SCHÉMA DOS · {typeof __BUILD_ID__ !== 'undefined' ? __BUILD_ID__ : '?'}
           </span>
         </div>
-        )}
       </div>
 
       <div className="flex flex-wrap justify-center gap-3 border-t border-nerv-orange/30 bg-nerv-panel px-4 py-3">
@@ -487,7 +952,17 @@ function SessionScreen({ onAbort, onError, onDone, engineRef, testMode, onOpenTe
             ENVOI MAC
           </Button>
         )}
-        {phase !== 'adjusting' && (
+        {replayMode && (
+          <>
+            <Button variant="ghost" onClick={toggleVideoPause}>
+              {videoPaused ? '▶ LECTURE' : '⏸ PAUSE'}
+            </Button>
+            <Button variant="ghost" onClick={() => seekVideo(0)}>
+              ↺ DÉBUT
+            </Button>
+          </>
+        )}
+        {!replayMode && phase !== 'adjusting' && (
         <Button variant="ghost" onClick={() => engine()?.flip()}>
           CAMÉRA
         </Button>
@@ -529,35 +1004,49 @@ function DoneScreen({ result, onRestart }) {
     const mapW = W - 2 * pad, mapH = H - 2 * pad;
     const toX = (u) => pad + u * mapW;
     const toY = (v) => pad + v * mapH;
+    const displayWarp = result.displayAnchors
+      ? buildBackWarp(result.displayAnchors)
+      : null;
 
     // Heatmap fine détourée à la silhouette : hors du corps, rien ;
     // sur le corps, du sombre (raté) au vert (couvert).
     const { w, h, need, data, body } = result.heat;
-    const cw = mapW / w, ch = mapH / h;
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        const i = y * w + x;
-        if (body && body[i] < 0.5) continue;
-        const f = Math.min(1, data[i] / need);
-        c.fillStyle = f >= 1
-          ? 'rgba(0, 255, 0, 0.85)'
-          : f > 0.02
-            ? `rgba(255, ${Math.round(60 + f * 140)}, 0, ${0.25 + f * 0.6})`
-            : 'rgba(255, 255, 255, 0.10)';
-        c.fillRect(toX(x / w), toY(y / h), cw + 0.5, ch + 0.5);
+    const doneColor = (f) => {
+      if (f >= 1) return [0, 255, 0, 217];
+      if (f > 0.02) return [255, Math.round(60 + f * 140), 0, Math.round((0.25 + f * 0.6) * 255)];
+      return [255, 255, 255, 26];
+    };
+    if (displayWarp) {
+      drawMappedHeatCells(
+        c,
+        {
+          w,
+          h,
+          isBody: (index) => !body || body[index] >= 0.5,
+          fractionAt: (index) => Math.min(1, data[index] / need),
+        },
+        displayWarp,
+        toX,
+        toY,
+        doneColor,
+      );
+    } else {
+      const cw = mapW / w, ch = mapH / h;
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const i = y * w + x;
+          if (body && body[i] < 0.5) continue;
+          const [r, g, b, a] = doneColor(Math.min(1, data[i] / need));
+          c.fillStyle = `rgba(${r}, ${g}, ${b}, ${a / 255})`;
+          c.fillRect(toX(x / w), toY(y / h), cw + 0.5, ch + 0.5);
+        }
       }
     }
 
     // Tracé du parcours des mains (gauche : cyan, droite : magenta).
     const drawPath = (path, color) => {
-      if (path.length < 2) return;
-      c.beginPath();
-      c.moveTo(toX(path[0].u), toY(path[0].v));
-      for (let i = 1; i < path.length; i++) c.lineTo(toX(path[i].u), toY(path[i].v));
-      c.strokeStyle = color;
-      c.lineWidth = 1.5;
       c.globalAlpha = 0.7;
-      c.stroke();
+      strokeMappedPath(c, path, displayWarp, toX, toY, color, 1.5);
       c.globalAlpha = 1;
     };
     drawPath(result.paths.gauche, '#00FFFF');
@@ -581,7 +1070,11 @@ function DoneScreen({ result, onRestart }) {
 
     // Contours des zones anatomiques.
     for (const z of ANATOMICAL_ZONES) {
-      strokeZoneOutline(c, z, toX, toY, 'rgba(0, 255, 0, 0.35)', 1);
+      if (displayWarp) {
+        strokeMappedZone(c, z, displayWarp, toX, toY, 'rgba(0, 255, 0, 0.35)', 1);
+      } else {
+        strokeZoneOutline(c, z, toX, toY, 'rgba(0, 255, 0, 0.35)', 1);
+      }
     }
 
     c.fillStyle = '#00FF00';

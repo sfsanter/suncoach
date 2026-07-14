@@ -31,6 +31,11 @@ async function createSegmenter() {
     outputCategoryMask: true,
     outputConfidenceMasks: false,
   });
+  const forceCpu = typeof window !== 'undefined'
+    && new URLSearchParams(window.location.search).has('cpu');
+  if (forceCpu) {
+    return ImageSegmenter.createFromOptions(fileset, opts('CPU'));
+  }
   try {
     return await ImageSegmenter.createFromOptions(fileset, opts('GPU'));
   } catch {
