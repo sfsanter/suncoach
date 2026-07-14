@@ -89,11 +89,28 @@ Accueil : bouton labo vidéo / `?frames=1` / `?lab=1`.
 **Prochaine brique (demandée, pas encore faite) :**
 > Contour **progressif** assez **haut** sur le **haut du dos** (nuque / trapèzes) —
 > aujourd’hui le polygone / masque coupe trop bas ou trop plat en haut.
-> Pistes : outline `backWarp` / ancres nuque-épaules, `SHAPE_KNOTS` haut, bodyMask top,
-> éventuellement demi-lunes ou falloff au-dessus de la ligne épaules.
 > Valider dans `VideoHandLab` (overlay + minimap) avant de porter dans `engine.js`.
 
-**Hors scope immédiat :** brancher Hands+affine+couverture dans la session produit (`engine.js` Holistic) — uniquement après OK labo haut du dos.
+### Notes design (session 2026-07-14 — à retester, pas encore implémenté)
+
+**Couverture trop stricte (feedback Laurent)**  
+- `THOROUGH_PIXEL_NEED` (~×3,5 vs défaut) : le % **validé** reste à **0 %** longtemps alors que visuellement c’est déjà bien frotté.  
+- Le % **touché** est plus fidèle à ce qu’on voit ; le validé est un filtre dur (« mieux trop que pas »).  
+- **Action prochaine** : recalibrer aux tests (baisser un peu le seuil / pondérer touché vs validé / entre-deux). Ne pas toucher au produit Holistic tant que le labo n’a pas un réglage OK.
+
+**Segmentation dos**  
+- Segmenter **la personne** (MediaPipe-style) : possible, déjà exploré côté produit (`bodySegmenter`).  
+- Segmenter **uniquement la surface crème du dos** : pas de modèle léger fiable en navigateur → toujours **heuristique** (pose ∩ masque ∩ 8 points).  
+- Rôle utile : cadre / silhouette, pas remplacement des 8 points ni de la carte UV.
+
+**Couleur similaire pour les bords (piste retenue à mix)**  
+- Objectif : **affiner les bords** (nuque, flancs, haut du dos), pas remplacer le tracking.  
+- Mix : 8 points + warp = forme globale → bande de bord → pixels **proches en couleur** de la peau (échantillon figé au **lock**, Lab/HSV).  
+- Region growing / flood borné par polygone élargi, ou correcteur local sur le contour.  
+- Pièges : ombre, crème blanche, main qui passe, lumière qui change → **échantillon lock**, pas tracking couleur 60 fps.  
+- Bon combo cible pour la brique haut-du-dos : warp/8 pts + (option) mask personne + **couleur en correcteur de bord**.
+
+**Hors scope immédiat :** brancher Hands+affine+couverture dans la session produit (`engine.js` Holistic) — uniquement après OK labo haut du dos + seuil couverture.
 
 **Fichiers clés labo :**
 | Fichier | Rôle |
@@ -104,3 +121,4 @@ Accueil : bouton labo vidéo / `?frames=1` / `?lab=1`.
 | `src/lib/coverage.js` | heat, `THOROUGH_PIXEL_NEED` |
 | `src/lib/poseVideo.js` | PoseLandmarker VIDEO |
 | `src/lib/backWarp.js` | UV ↔ pixels (contour) |
+| `src/lib/bodySegmenter.js` | mask personne (piste, pas labo vidhands) |
