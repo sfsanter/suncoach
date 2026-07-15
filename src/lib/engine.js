@@ -60,6 +60,18 @@ function wantManualAdjust() {
   }
 }
 
+/** Overlay heat live = trop lourd sur Safari/Chrome mobile. */
+function preferLiteLiveOverlay() {
+  if (typeof window === 'undefined') return false;
+  try {
+    if (new URLSearchParams(window.location.search).has('liveheat')) return false;
+  } catch { /* ignore */ }
+  try {
+    if (window.matchMedia('(pointer: coarse)').matches) return true;
+  } catch { /* ignore */ }
+  return (navigator.maxTouchPoints > 0 && window.innerWidth < 920);
+}
+
 export class SunCoachEngine {
   constructor({ video, overlay, minimap, onHud, onDone, onPhase, replaySource = null }) {
     this.video = video;
@@ -1361,7 +1373,9 @@ export class SunCoachEngine {
   }
 
   /**
-   * Projection live (labo ?vidhands=1) : heat + contour accroché au dos via affine.
+   * Projection live : heat + contour accroché au dos via affine.
+   * Sur téléphone (pointer coarse) : contour + mains seulement — le fill heat
+   * grille entière tue Safari / Chrome mobile.
    */
   _drawCoverageLiveOverlay(P, W, H) {
     const ctx = this.ctx;
@@ -1376,7 +1390,11 @@ export class SunCoachEngine {
       ? srcOutline.map((p) => mapToLive(p)).filter((p) => p && Number.isFinite(p.x))
       : null;
 
-    if (outline?.length >= 4) {
+    const lite = preferLiteLiveOverlay();
+    this._liveHeatFrame = (this._liveHeatFrame || 0) + 1;
+    const drawHeat = !lite && this._liveHeatFrame % 2 === 0;
+
+    if (outline?.length >= 4 && drawHeat) {
       ctx.save();
       ctx.beginPath();
       outline.forEach((p, i) => {
@@ -1385,42 +1403,41 @@ export class SunCoachEngine {
       });
       ctx.closePath();
       ctx.clip();
-    }
 
-    // Sous-échantillon si énorme résolution (tél.) — sinon chaque cellule heat.
-    const step = (W * H > 900_000) ? 2 : 1;
-    for (let y = 0; y < HEAT_H; y += step) {
-      for (let x = 0; x < HEAT_W; x += step) {
-        const i = y * HEAT_W + x;
-        if (!this.grid.isBody(i)) continue;
-        const frac = this.grid.pixelFraction(i);
-        if (frac < 0.05) continue;
-        const u0 = x / HEAT_W;
-        const v0 = y / HEAT_H;
-        const u1 = Math.min(1, (x + step) / HEAT_W);
-        const v1 = Math.min(1, (y + step) / HEAT_H);
-        const corners = [
-          { u: u0, v: v0 },
-          { u: u1, v: v0 },
-          { u: u1, v: v1 },
-          { u: u0, v: v1 },
-        ].map((uv) => {
-          const locked = warp.fromGenericUv(uv);
-          return locked ? mapToLive(locked) : null;
-        });
-        if (corners.some((p) => !p)) continue;
-        const [r, g, b, a] = coverageHeatRGBA(frac);
-        ctx.beginPath();
-        ctx.moveTo(corners[0].x, corners[0].y);
-        for (let k = 1; k < 4; k++) ctx.lineTo(corners[k].x, corners[k].y);
-        ctx.closePath();
-        ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${(a / 255) * 0.7})`;
-        ctx.fill();
+      const step = (W * H > 500_000) ? 3 : 2;
+      for (let y = 0; y < HEAT_H; y += step) {
+        for (let x = 0; x < HEAT_W; x += step) {
+          const i = y * HEAT_W + x;
+          if (!this.grid.isBody(i)) continue;
+          const frac = this.grid.pixelFraction(i);
+          if (frac < 0.08) continue;
+          const u0 = x / HEAT_W;
+          const v0 = y / HEAT_H;
+          const u1 = Math.min(1, (x + step) / HEAT_W);
+          const v1 = Math.min(1, (y + step) / HEAT_H);
+          const corners = [
+            { u: u0, v: v0 },
+            { u: u1, v: v0 },
+            { u: u1, v: v1 },
+            { u: u0, v: v1 },
+          ].map((uv) => {
+            const locked = warp.fromGenericUv(uv);
+            return locked ? mapToLive(locked) : null;
+          });
+          if (corners.some((p) => !p)) continue;
+          const [r, g, b, a] = coverageHeatRGBA(frac);
+          ctx.beginPath();
+          ctx.moveTo(corners[0].x, corners[0].y);
+          for (let k = 1; k < 4; k++) ctx.lineTo(corners[k].x, corners[k].y);
+          ctx.closePath();
+          ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${(a / 255) * 0.65})`;
+          ctx.fill();
+        }
       }
+      ctx.restore();
     }
 
     if (outline?.length >= 4) {
-      ctx.restore();
       ctx.beginPath();
       outline.forEach((p, i) => {
         if (i === 0) ctx.moveTo(p.x, p.y);
@@ -1428,7 +1445,7 @@ export class SunCoachEngine {
       });
       ctx.closePath();
       ctx.strokeStyle = 'rgba(0, 255, 90, 0.95)';
-      ctx.lineWidth = 2.5;
+      ctx.lineWidth = lite ? 3 : 2.5;
       ctx.stroke();
     }
   }

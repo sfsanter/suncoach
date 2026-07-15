@@ -35,13 +35,13 @@ export function applyCalibration(pxAnchors, calibrationFrame) {
 /** Ancres synthétiques plausibles (720×1280 portrait). */
 export const SYNTHETIC_ANCHORS_PX = {
   nuque: { x: 360, y: 280 },
-  epaule_g: { x: 260, y: 340 },
-  epaule_d: { x: 460, y: 340 },
-  milieu_g: { x: 240, y: 520 },
-  milieu_d: { x: 480, y: 520 },
-  rein_g: { x: 280, y: 720 },
-  rein_d: { x: 440, y: 720 },
-  bas: { x: 360, y: 880 },
+  epaule_g: { x: 250, y: 340 },
+  epaule_d: { x: 470, y: 340 },
+  milieu_g: { x: 230, y: 520 },
+  milieu_d: { x: 490, y: 520 },
+  rein_g: { x: 260, y: 740 },
+  rein_d: { x: 460, y: 740 },
+  bas: { x: 360, y: 820 },
 };
 
 export const SYNTHETIC_FRAME = {

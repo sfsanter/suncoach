@@ -210,29 +210,30 @@ export function refineAnchorsBySkin(anchors, imageData, W, H, skin) {
     out[p.id] = best;
   }
 
-  // Soft blend (évite gros sauts)
+  // Soft blend — côtés : ne garder que le snap PLUS extérieur (vers le bord peau).
   const blended = {};
   const midX = ((anchors.epaule_g?.x ?? 0) + (anchors.epaule_d?.x ?? 0)) / 2;
   for (const id of BACK_ANCHOR_ORDER) {
     const a = anchors[id];
     const b = out[id];
     if (!a || !b) return null;
-    let x = a.x * 0.35 + b.x * 0.65;
-    let y = a.y * 0.35 + b.y * 0.65;
+    let x = a.x * 0.25 + b.x * 0.75;
+    let y = a.y * 0.25 + b.y * 0.75;
 
-    // Reins / milieux : interdire un snap vers la colonne (crée une pique bas-dos).
-    if (id === 'rein_g' || id === 'milieu_g') {
-      x = Math.min(x, a.x); // rester à gauche (ou égal)
-      const minOut = midX - sw * 0.16;
-      x = Math.min(x, minOut);
-    } else if (id === 'rein_d' || id === 'milieu_d') {
-      x = Math.max(x, a.x);
-      const maxOut = midX + sw * 0.16;
-      x = Math.max(x, maxOut);
+    if (id === 'rein_g' || id === 'milieu_g' || id === 'epaule_g') {
+      // Gauche = x plus petit = plus dehors
+      x = Math.min(a.x, b.x);
+      x = Math.min(x, midX - sw * 0.14);
+    } else if (id === 'rein_d' || id === 'milieu_d' || id === 'epaule_d') {
+      x = Math.max(a.x, b.x);
+      x = Math.max(x, midX + sw * 0.14);
     } else if (id === 'bas') {
-      // Garder le bas centré ; limiter tirage vertical bizarre.
-      x = midX * 0.5 + x * 0.5;
-      y = Math.max(y, a.y - sw * 0.04);
+      x = midX * 0.7 + x * 0.3;
+      // Ne pas allonger le triangle vers le bas.
+      const reinY = Math.max(anchors.rein_g?.y ?? a.y, anchors.rein_d?.y ?? a.y);
+      y = Math.min(Math.max(y, a.y), reinY + sw * 0.14);
+    } else if (id === 'nuque') {
+      y = Math.min(a.y, b.y);
     }
 
     blended[id] = { x, y };

@@ -4,7 +4,8 @@
 import { LM } from './pose.js';
 import { BACK_ANCHOR_ORDER as ANCHOR_ORDER } from './backWarp.js';
 
-/** Positions initiales sur la photo : silhouette dos naturelle (trapèze → taille). */
+/** Positions initiales : landmarks MediaPipe = centres d’articulation (trop « dedans »).
+ *  On pousse les côtés vers le bord peau, et on évite un bas en pointe. */
 export function defaultAnchorsPx(P, W, H) {
   const ls = P[LM.L_SHOULDER];
   const rs = P[LM.R_SHOULDER];
@@ -16,9 +17,13 @@ export function defaultAnchorsPx(P, W, H) {
   const midShoulderX = (ls.x + rs.x) / 2;
   const midHipX = (lh.x + rh.x) / 2;
   const topY = Math.min(ls.y, rs.y);
-  const out = sw * 0.02;
+  const botY = Math.max(lh.y, rh.y);
 
-  // Côtés = interpolaison épaule→hanche (rétrécit sans piquer au centre).
+  // Sortie peau (fraction largeur épaules) — volontairement généreux vs jointures.
+  const outSh = sw * 0.09;
+  const outMid = sw * 0.13;
+  const outRein = sw * 0.10;
+
   const sideAt = (t, outward) => {
     const lx = ls.x + (lh.x - ls.x) * t;
     const ly = ls.y + (lh.y - ls.y) * t;
@@ -29,22 +34,23 @@ export function defaultAnchorsPx(P, W, H) {
       d: { x: rx + outward, y: ry },
     };
   };
-  const mid = sideAt(0.38, out * 1.1);
-  const rein = sideAt(0.72, out * 0.35);
-  const botY = Math.max(lh.y, rh.y);
+
+  const mid = sideAt(0.40, outMid);
+  // Reins près des hanches, larges (pas vers la colonne) → bas moins « en pointe ».
+  const rein = sideAt(0.82, outRein);
+  const reinY = (rein.g.y + rein.d.y) / 2;
+  // Bas juste sous les reins (plat), pas un triangle long jusqu’aux hanches.
+  const basY = Math.min(botY + sw * 0.02, reinY + sw * 0.12);
 
   return {
-    nuque: { x: midShoulderX, y: topY - sw * 0.08 },
-    epaule_g: { x: ls.x - out, y: ls.y + sw * 0.02 },
-    epaule_d: { x: rs.x + out, y: rs.y + sw * 0.02 },
+    nuque: { x: midShoulderX, y: topY - sw * 0.06 },
+    epaule_g: { x: ls.x - outSh, y: ls.y + sw * 0.03 },
+    epaule_d: { x: rs.x + outSh, y: rs.y + sw * 0.03 },
     milieu_g: mid.g,
     milieu_d: mid.d,
     rein_g: rein.g,
     rein_d: rein.d,
-    bas: {
-      x: midHipX * 0.65 + midShoulderX * 0.35,
-      y: botY + sw * 0.015,
-    },
+    bas: { x: midHipX * 0.55 + midShoulderX * 0.45, y: basY },
   };
 }
 
