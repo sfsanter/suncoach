@@ -24,30 +24,37 @@ export const GENERIC_UV_ANCHORS = {
   bas: { x: 0.50, y: 0.96 },
 };
 
-/** Points intermédiaires nuque↔épaules (contour progressif trapèzes). */
-const UPPER_STEPS = 4;
-const OUTWARD_FRAC = 0.07;
-const LIFT_FRAC = 0.06;
+/** Points intermédiaires nuque↔épaules — lissage léger, sans « bosse » deltoïde. */
+const UPPER_STEPS = 3;
+/** Ancien 0.07 : trop bombé → protubérance surtout d’un côté. */
+const OUTWARD_FRAC = 0.012;
+const LIFT_FRAC = 0.03;
 
 function dist2(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
-function enrichUpperArc(from, to, steps, scale, sideSign) {
+/**
+ * Arc haut symétrique par rapport au milieu nuque (évite une bosse asymétrique
+ * due aux normales de chemin côté droit vs gauche).
+ */
+function enrichUpperArc(from, to, steps, midX, scale) {
   const pts = [];
   const outward = scale * OUTWARD_FRAC;
   const lift = scale * LIFT_FRAC;
   const dx = to.x - from.x;
   const dy = to.y - from.y;
-  const len = Math.hypot(dx, dy) || 1;
-  const nx = (-dy / len) * sideSign;
-  const ny = (dx / len) * sideSign;
   for (let i = 1; i < steps; i++) {
     const t = i / steps;
+    // sin: max au milieu du segment, 0 aux extrémités
     const s = Math.sin(t * Math.PI);
+    const x0 = from.x + t * dx;
+    const y0 = from.y + t * dy;
+    // Pousse hors du centre-dos (pas le long de la normale de chemin)
+    const away = x0 >= midX ? 1 : -1;
     pts.push({
-      x: from.x + t * dx + nx * outward * s,
-      y: from.y + t * dy + ny * outward * s - lift * s,
+      x: x0 + away * outward * s,
+      y: y0 - lift * s,
     });
   }
   return pts;
@@ -60,8 +67,9 @@ export function buildDensifiedPolygon(anchorsByName) {
   const epaule_d = anchorsByName?.epaule_d;
   if (!nuque || !epaule_g || !epaule_d) return null;
   const scale = dist2(epaule_g, epaule_d);
-  const leftArc = enrichUpperArc(nuque, epaule_g, UPPER_STEPS, scale, -1);
-  const rightArc = enrichUpperArc(epaule_d, nuque, UPPER_STEPS, scale, 1);
+  const midX = nuque.x;
+  const leftArc = enrichUpperArc(nuque, epaule_g, UPPER_STEPS, midX, scale);
+  const rightArc = enrichUpperArc(epaule_d, nuque, UPPER_STEPS, midX, scale);
   const body = BACK_ANCHOR_ORDER.slice(1).map((id) => anchorsByName[id]);
   if (body.some((p) => !p || !Number.isFinite(p.x))) return null;
   return [nuque, ...leftArc, ...body, ...rightArc];
