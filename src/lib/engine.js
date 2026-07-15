@@ -18,7 +18,7 @@ import {
   estimateSubjectDistance, touchDistanceForRange, formatDistance,
 } from './calibration.js';
 import { gapMessage, gapShort, calibrationVoice } from './tips.js';
-import { MaskLockAccumulator, LOCK_FRAMES } from './maskLock.js';
+import { LOCK_FRAMES } from './maskLock.js';
 import { cloneFrame } from './backTemplate.js';
 import {
   defaultAnchorsPx,
@@ -107,8 +107,8 @@ export class SunCoachEngine {
       this.onHud(0, 'DÉMARRAGE DE LA CAMÉRA…');
       await this.tracker.startCamera();
     }
-    // Segmenter lock (~16 Mo) en arrière-plan pendant le placement
-    this.tracker.prefetchSegmenter();
+    // Ne PAS charger BodySegmenter ici : 3e modèle WASM + GPU pendant la
+    // caméra fait planter Safari iPhone au moment du « Parfait / scan dos ».
 
     if (this.minimap) {
       const setup = setupMinimapCanvas(this.minimap);
@@ -378,12 +378,11 @@ export class SunCoachEngine {
     this.calibrationFrame = frame ? cloneFrame(frame) : null;
     this.lockPoseP = null;
     this.lockSnapshotDone = false;
-    const W = this.overlay.width;
-    const H = this.overlay.height;
-    this.maskLock = new MaskLockAccumulator(W, H);
-    this.tracker.aiSegEnabled = true;
-    this.tracker.prefetchSegmenter();
-    this.onHud(0, 'SCAN IA DU DOS… RESTE IMMOBILE');
+    // Pas de MaskLockAccumulator full-res (Float32 W×H) ni BodySegmenter :
+    // les deux saturent la RAM iOS. Contour = silhouette pose au finalize.
+    this.maskLock = null;
+    this.tracker.aiSegEnabled = false;
+    this.onHud(0, 'PHOTO DU DOS… RESTE IMMOBILE');
     this.voice.say(
       'Parfait. Reste immobile, je prends une photo et je scanne ton dos.',
       { interrupt: true },
@@ -413,43 +412,63 @@ export class SunCoachEngine {
 
   _lockingTick(P, track, frame, ts, W, H) {
     const calFrame = this.calibrationFrame || frame;
-    const lock = this.maskLock;
 
-    if (!P || !calFrame || !lock) {
-      this.onHud(0, 'SCAN IA… RESTE DANS LE CADRE');
+    if (!P || !calFrame) {
+      this.onHud(0, 'SCAN… RESTE DANS LE CADRE');
       return;
     }
 
     // Photo + ancres = dos visible. Sinon on scanne trop tard (face / crème).
     if (!isBackTurned(P, W)) {
-      this.onHud(lock.count / LOCK_FRAMES, 'SCAN — TOURNE LE DOS, RESTE IMMOBILE');
+      this.onHud(0.1, 'SCAN — TOURNE LE DOS, RESTE IMMOBILE');
       return;
     }
 
     if (!this.lockPoseP) {
       this.lockPoseP = P.map((p) => ({ x: p.x, y: p.y, visibility: p.visibility }));
-      this._captureSnapshot();
+      try {
+        this._captureSnapshot();
+      } catch (err) {
+        console.warn('[SunCoach] snapshot failed:', err);
+      }
       this.lockSnapshotDone = true;
     }
 
-    const bytes = track.aiPersonMask
-      ?? this._holisticMaskBytes(track.segmentationMask, P, W, H);
-    if (bytes) lock.push(bytes);
+    const elapsed = performance.now() - this.lockStartedAt;
+    const holdMs = 1100;
+    const pct = Math.min(1, elapsed / holdMs);
+    this.onHud(pct, `SCAN ${Math.round(pct * 100)} %`);
 
-    const need = LOCK_FRAMES;
-    const pct = Math.min(100, Math.round((lock.count / need) * 100));
-    this.onHud(lock.count / need, `SCAN IA ${pct} %`);
-
-    const timedOut = performance.now() - this.lockStartedAt > 8000;
-    if (lock.count >= need || (timedOut && lock.count >= 6)) {
-      this._finalizeLock(calFrame, this.lockPoseP || P, W, H);
-    } else if (timedOut) {
-      this.voice.say(
-        'Je n’arrive pas à bien te voir. Vérifie la lumière et reste dos à la caméra.',
-        { id: 'lock:fail', cooldown: 6000 },
-      );
-      this.lockStartedAt = performance.now();
+    if (elapsed >= holdMs) {
+      try {
+        this._finalizeLock(calFrame, this.lockPoseP || P, W, H);
+      } catch (err) {
+        console.error('[SunCoach] finalizeLock failed:', err);
+        this._emergencyAdjust(this.lockPoseP || P, W, H);
+      }
     }
+  }
+
+  /** Dernier recours : écran 8 points même si silhouette / masque plante. */
+  _emergencyAdjust(P, W, H) {
+    this.tracker.aiSegEnabled = false;
+    this.maskLock = null;
+    this.frozenMask = null;
+    this.smoothMask = null;
+    this.backContour = null;
+    if (P) {
+      this.frozenPoseP = P.map((p) => ({ x: p.x, y: p.y, visibility: p.visibility }));
+      const ls = P[LM.L_SHOULDER];
+      const rs = P[LM.R_SHOULDER];
+      if (ls && rs) {
+        this.lockedShoulderW = Math.hypot(rs.x - ls.x, rs.y - ls.y);
+        this.lockedMid = { x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2 };
+      }
+    }
+    try {
+      if (!this.lockSnapshotDone || !this.snapshotDataUrl) this._captureSnapshot();
+    } catch { /* ignore */ }
+    this._startAdjusting(P, W, H);
   }
 
   _finalizeLock(calFrame, P, W, H) {
@@ -466,9 +485,18 @@ export class SunCoachEngine {
       this.smoothMask = this.frozenMask;
       this.backContour = traceBackContour(this.smoothMask, W, H);
     } else {
-      this.frozenMask = buildFallbackSilhouette(P, W, H, null);
-      this.smoothMask = this.frozenMask;
-      this.backContour = traceBackContour(this.smoothMask, W, H);
+      try {
+        this.frozenMask = buildFallbackSilhouette(P, W, H, null);
+        this.smoothMask = this.frozenMask;
+        this.backContour = this.smoothMask
+          ? traceBackContour(this.smoothMask, W, H)
+          : null;
+      } catch (err) {
+        console.warn('[SunCoach] fallback silhouette skipped:', err);
+        this.frozenMask = null;
+        this.smoothMask = null;
+        this.backContour = null;
+      }
     }
 
     const ls = P[LM.L_SHOULDER];
@@ -483,14 +511,19 @@ export class SunCoachEngine {
     this._startAdjusting(P, W, H);
   }
 
+  /**
+   * Photo pour l’écran 8 points — coords = vidéo (ancres = pose).
+   * JPEG plus léger pour limiter le pic mémoire iOS.
+   */
   _captureSnapshot() {
     const W = this.video.videoWidth;
     const H = this.video.videoHeight;
+    if (!W || !H) return;
     const c = document.createElement('canvas');
     c.width = W;
     c.height = H;
     c.getContext('2d').drawImage(this.video, 0, 0, W, H);
-    this.snapshotDataUrl = c.toDataURL('image/jpeg', 0.9);
+    this.snapshotDataUrl = c.toDataURL('image/jpeg', 0.55);
     this.snapshotW = W;
     this.snapshotH = H;
   }
@@ -535,11 +568,19 @@ export class SunCoachEngine {
 
   _startAdjusting(P, W, H) {
     // Photo déjà prise au 1er frame « dos » pendant le scan (évite décalage).
-    if (!this.lockSnapshotDone || !this.snapshotDataUrl) this._captureSnapshot();
+    if (!this.lockSnapshotDone || !this.snapshotDataUrl) {
+      try {
+        this._captureSnapshot();
+      } catch (err) {
+        console.warn('[SunCoach] late snapshot failed:', err);
+      }
+    }
     this.state = 'adjusting';
     const pose = this.lockPoseP || P || this.frozenPoseP;
-    this.draftAnchorsPx = defaultAnchorsPx(pose, W, H)
-      ?? defaultAnchorsPx(this.frozenPoseP, W, H)
+    const adjW = this.snapshotW || W;
+    const adjH = this.snapshotH || H;
+    this.draftAnchorsPx = defaultAnchorsPx(pose, adjW, adjH)
+      ?? defaultAnchorsPx(this.frozenPoseP, adjW, adjH)
       ?? {};
     this.calibrationAnchors = {};
     this.onHud(0, 'VIDÉO EN PAUSE — GLISSE LES 8 POINTS SUR LE BORD DU DOS');
