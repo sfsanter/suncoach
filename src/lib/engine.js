@@ -252,16 +252,15 @@ export class SunCoachEngine {
       }
     }
 
-    this._drawOverlay(P, frame, track, ts, W, H);
-    this._drawMinimap(ts);
-
+    // State ticks avant draw : paint + affine à jour pour la projection live.
     if (this.state === 'placement') this._placementTick(P, ts, frame);
     else if (this.state === 'locking') this._lockingTick(P, track, frame, ts, W, H);
-    else if (this.state === 'adjusting') { /* pose en pause visuelle — ajustement écran */ }
+    else if (this.state === 'adjusting') { /* pose en pause — ajustement écran */ }
     else if (this.state === 'reposition') this._repositionTick(P, ts, W);
-    else if (this.state === 'coverage') {
-      this._coverageTick(P, track, frame, ts, dt);
-    }
+    else if (this.state === 'coverage') this._coverageTick(P, track, frame, ts, dt);
+
+    this._drawOverlay(P, frame, track, ts, W, H);
+    this._drawMinimap(ts);
   }
 
   _smoothTorso(frame) {
@@ -802,6 +801,26 @@ export class SunCoachEngine {
 
   // ---------------------------------------------------------------- couverture (stack labo — source de vérité : ?vidhands=1)
 
+  /** Affine lock→live (met à jour torsoLock.lastXf). */
+  _resolveTorsoXf(P) {
+    const lock = this.torsoLock;
+    if (!lock?.corners || !P) return lock?.lastXf || null;
+    const liveCorners = torsoCornersFromPose(P, LM);
+    if (!liveCorners) return lock.lastXf || null;
+    let xf = torsoAttachTransform(lock.corners, liveCorners);
+    if (xf?.ok) {
+      if (xf.kind === 'affine') {
+        xf = blendAffineParams(lock.xfSmooth, xf, 0.25) || xf;
+        if (xf.kind === 'affine') lock.xfSmooth = xf;
+      } else {
+        lock.xfSmooth = null;
+      }
+      lock.lastXf = xf;
+      return xf;
+    }
+    return lock.lastXf || null;
+  }
+
   /**
    * Contacts Hand Landmarker → UV générique via affine inverse (labo).
    * Pas de Holistic / warpToLocked / cascade poignet-coude.
@@ -810,28 +829,8 @@ export class SunCoachEngine {
     const warp = getBackWarp();
     if (!warp || !P) return [];
 
-    let toWarpPixel = (p) => p;
-    const lock = this.torsoLock;
-    if (lock?.corners) {
-      const liveCorners = torsoCornersFromPose(P, LM);
-      if (liveCorners) {
-        let xf = torsoAttachTransform(lock.corners, liveCorners);
-        if (xf?.ok) {
-          if (xf.kind === 'affine') {
-            xf = blendAffineParams(lock.xfSmooth, xf, 0.25) || xf;
-            if (xf.kind === 'affine') lock.xfSmooth = xf;
-          } else {
-            lock.xfSmooth = null;
-          }
-          lock.lastXf = xf;
-        } else if (lock.lastXf) {
-          xf = lock.lastXf;
-        }
-        if (xf) toWarpPixel = (p) => xf.inv(p);
-      } else if (lock.lastXf) {
-        toWarpPixel = (p) => lock.lastXf.inv(p);
-      }
-    }
+    const xf = this._resolveTorsoXf(P);
+    const toWarpPixel = xf?.inv ? (p) => xf.inv(p) : (p) => p;
 
     const out = contactsFromHandLandmarker(
       track.handLandmarkerResult,
@@ -1326,6 +1325,12 @@ export class SunCoachEngine {
 
     if (this.state === 'adjusting') return;
 
+    if (this.state === 'coverage') {
+      this._drawCoverageLiveOverlay(P, W, H);
+      this._drawHandHints(ctx, P, track, W, H);
+      return;
+    }
+
     const paintFrame = this.calibrationFrame || frame;
     const mask = this.frozenMask || this.smoothMask;
 
@@ -1343,23 +1348,96 @@ export class SunCoachEngine {
 
     if (!frame && !mask) return;
 
-    const canShowCoverage = this.state !== 'coverage'
-      || (P && isBackTurned(P, W));
-    // En couverture, le masque est figé au scan et ne suit pas le corps live :
-    // l'afficher sur la vidéo serait trompeur. La couverture vit sur la minimap.
-    if (mask && canShowCoverage && this.state !== 'coverage') {
+    if (mask) {
       drawBackSegmentationOverlay(ctx, mask, W, H, {
         contour: this.backContour,
-        grid: this.state === 'coverage' ? this.grid : null,
+        grid: null,
         frame: paintFrame,
-        showCoverage: this.state === 'coverage',
+        showCoverage: false,
       });
     }
 
+    this._drawHandHints(ctx, P, track, W, H);
+  }
+
+  /**
+   * Projection live (labo ?vidhands=1) : heat + contour accroché au dos via affine.
+   */
+  _drawCoverageLiveOverlay(P, W, H) {
+    const ctx = this.ctx;
+    const warp = getBackWarp();
+    if (!warp?.fromGenericUv || !this.grid) return;
+
+    const xf = P ? this._resolveTorsoXf(P) : this.torsoLock?.lastXf;
+    const mapToLive = xf?.apply ? (p) => xf.apply(p) : (p) => p;
+
+    const srcOutline = warp.pixelOutline;
+    const outline = srcOutline?.length >= 4
+      ? srcOutline.map((p) => mapToLive(p)).filter((p) => p && Number.isFinite(p.x))
+      : null;
+
+    if (outline?.length >= 4) {
+      ctx.save();
+      ctx.beginPath();
+      outline.forEach((p, i) => {
+        if (i === 0) ctx.moveTo(p.x, p.y);
+        else ctx.lineTo(p.x, p.y);
+      });
+      ctx.closePath();
+      ctx.clip();
+    }
+
+    // Sous-échantillon si énorme résolution (tél.) — sinon chaque cellule heat.
+    const step = (W * H > 900_000) ? 2 : 1;
+    for (let y = 0; y < HEAT_H; y += step) {
+      for (let x = 0; x < HEAT_W; x += step) {
+        const i = y * HEAT_W + x;
+        if (!this.grid.isBody(i)) continue;
+        const frac = this.grid.pixelFraction(i);
+        if (frac < 0.05) continue;
+        const u0 = x / HEAT_W;
+        const v0 = y / HEAT_H;
+        const u1 = Math.min(1, (x + step) / HEAT_W);
+        const v1 = Math.min(1, (y + step) / HEAT_H);
+        const corners = [
+          { u: u0, v: v0 },
+          { u: u1, v: v0 },
+          { u: u1, v: v1 },
+          { u: u0, v: v1 },
+        ].map((uv) => {
+          const locked = warp.fromGenericUv(uv);
+          return locked ? mapToLive(locked) : null;
+        });
+        if (corners.some((p) => !p)) continue;
+        const [r, g, b, a] = coverageHeatRGBA(frac);
+        ctx.beginPath();
+        ctx.moveTo(corners[0].x, corners[0].y);
+        for (let k = 1; k < 4; k++) ctx.lineTo(corners[k].x, corners[k].y);
+        ctx.closePath();
+        ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${(a / 255) * 0.7})`;
+        ctx.fill();
+      }
+    }
+
+    if (outline?.length >= 4) {
+      ctx.restore();
+      ctx.beginPath();
+      outline.forEach((p, i) => {
+        if (i === 0) ctx.moveTo(p.x, p.y);
+        else ctx.lineTo(p.x, p.y);
+      });
+      ctx.closePath();
+      ctx.strokeStyle = 'rgba(0, 255, 90, 0.95)';
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+    }
+  }
+
+  _drawHandHints(ctx, P, track, W, H) {
     if (P) {
       for (const idx of [LM.L_WRIST, LM.R_WRIST]) {
         const p = P[idx];
-        if (p.visibility < 0.4) continue;
+        if (!p || p.visibility < 0.4) continue;
         ctx.beginPath();
         ctx.arc(p.x, p.y, 10, 0, Math.PI * 2);
         ctx.fillStyle = 'rgba(0, 255, 255, 0.3)';
@@ -1370,9 +1448,8 @@ export class SunCoachEngine {
       }
     }
 
-    // Paumes Hand Landmarker (stack labo)
-    const hands = track.handLandmarkerResult?.landmarks ?? [];
-    const handed = track.handLandmarkerResult?.handedness ?? [];
+    const hands = track?.handLandmarkerResult?.landmarks ?? [];
+    const handed = track?.handLandmarkerResult?.handedness ?? [];
     for (let i = 0; i < hands.length; i++) {
       const hand = hands[i];
       const label = handed[i]?.[0]?.categoryName?.toLowerCase?.() || '';
