@@ -373,8 +373,10 @@ export class PoseTracker {
     this.video.removeAttribute('src');
 
     const attempts = [
+      // iPhone : rester bas — Pose+Hands saturent déjà la RAM.
+      { video: { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 24 } }, audio: false },
       { video: { facingMode: facing, width: { ideal: 960 }, height: { ideal: 720 } }, audio: false },
-      { video: { width: { ideal: 960 }, height: { ideal: 720 } }, audio: false },
+      { video: { width: { ideal: 640 }, height: { ideal: 480 } }, audio: false },
       { video: true, audio: false },
     ];
 
@@ -418,8 +420,11 @@ export class PoseTracker {
   }
 
   start(onFrame) {
+    this._onFrameCb = onFrame;
+    this._paused = false;
     const loop = () => {
       this._raf = requestAnimationFrame(loop);
+      if (this._paused) return;
       if (!this.landmarker || this.video.readyState < 2) return;
       if (this.video.ended) return;
       const t = this.video.currentTime;
@@ -473,9 +478,21 @@ export class PoseTracker {
     loop();
   }
 
+  /** Stoppe pose/hands sans couper la caméra (écran photo / 8 points). */
+  pause() {
+    this._paused = true;
+  }
+
+  resume() {
+    if (!this._paused) return;
+    this._paused = false;
+    this._lastVideoTime = -1;
+  }
+
   stop() {
     cancelAnimationFrame(this._raf);
     this._raf = 0;
+    this._paused = false;
     this.smoothed = null;
     this.smoothedWorld = null;
     this._lastVideoTime = -1;

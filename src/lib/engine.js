@@ -214,7 +214,7 @@ export class SunCoachEngine {
 
     if (P) {
       const useFrozen = this.frozenMask && this.state !== 'placement';
-      const skipSeg = this.state === 'locking' || useFrozen;
+      const skipSeg = this.state === 'locking' || this.state === 'adjusting' || useFrozen;
       if (!skipSeg) {
         if (track.aiPersonMask) {
           this.smoothMask = buildBackSilhouetteFromBytes(
@@ -222,9 +222,8 @@ export class SunCoachEngine {
           );
         } else if (track.segmentationMask) {
           this.smoothMask = buildBackSilhouette(track.segmentationMask, P, W, H, this.smoothMask);
-        } else {
-          this.smoothMask = buildFallbackSilhouette(P, W, H, this.smoothMask);
         }
+        // Pas de buildFallbackSilhouette chaque frame (W×H) — OOM iPhone.
         this.backContour = this.smoothMask
           ? traceBackContour(this.smoothMask, W, H)
           : null;
@@ -366,27 +365,65 @@ export class SunCoachEngine {
     this.distSamples.push(distM);
     if (this.distSamples.length > 40) this.distSamples.shift();
 
-    this.onHud(0, `CALIBRAGE BIENTÔT… DIST. ${formatDistance(distM)}`);
+    this.onHud(0, `CALIBRAGE… DIST. ${formatDistance(distM)}`);
     if (!this.placementOkSince) this.placementOkSince = ts;
-    if (ts - this.placementOkSince > 1500) this._startLocking(frame);
+    // ~0.4 s suffit — plus besoin de rester figé 1.5 s + scan.
+    if (ts - this.placementOkSince > 400) this._startLocking(frame);
   }
 
+  /**
+   * Plus de phase « scan IA » longue : pause détection → photo légère → 8 points.
+   * (Le scan MediaPipe + buffers full-res plantait Safari iPhone.)
+   */
   _startLocking(frame) {
     this._finalizeCalibration();
     this.state = 'locking';
     this.lockStartedAt = performance.now();
     this.calibrationFrame = frame ? cloneFrame(frame) : null;
-    this.lockPoseP = null;
-    this.lockSnapshotDone = false;
-    // Pas de MaskLockAccumulator full-res (Float32 W×H) ni BodySegmenter :
-    // les deux saturent la RAM iOS. Contour = silhouette pose au finalize.
     this.maskLock = null;
     this.tracker.aiSegEnabled = false;
-    this.onHud(0, 'PHOTO DU DOS… RESTE IMMOBILE');
-    this.voice.say(
-      'Parfait. Reste immobile, je prends une photo et je scanne ton dos.',
-      { interrupt: true },
-    );
+
+    // Pose déjà OK (placement). Figé la pose live avant pause.
+    const P = this._lastP;
+    const W = this.overlay.width;
+    const H = this.overlay.height;
+    if (P) {
+      this.lockPoseP = P.map((p) => ({ x: p.x, y: p.y, visibility: p.visibility }));
+      this.frozenPoseP = this.lockPoseP;
+      const ls = P[LM.L_SHOULDER];
+      const rs = P[LM.R_SHOULDER];
+      if (ls && rs) {
+        this.lockedShoulderW = Math.hypot(rs.x - ls.x, rs.y - ls.y);
+        this.lockedMid = { x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2 };
+      }
+      if (this.calibrationFrame) {
+        this.lockedPoseSignature = capturePoseSignature(P, this.calibrationFrame);
+      }
+    }
+
+    this.tracker.pause();
+    this.onHud(0.5, 'PHOTO…');
+    try {
+      this._captureSnapshot();
+      this.lockSnapshotDone = true;
+    } catch (err) {
+      console.warn('[SunCoach] snapshot failed:', err);
+      this.lockSnapshotDone = false;
+    }
+
+    this.frozenMask = null;
+    this.smoothMask = null;
+    this.backContour = null;
+    this.maskLock = null;
+
+    this.onHud(1, 'AJUSTE LES POINTS');
+    this.voice.say('Parfait. Ajuste les points verts sur la photo.', { interrupt: true });
+    try {
+      this._startAdjusting(P, W, H);
+    } catch (err) {
+      console.error('[SunCoach] adjust start failed:', err);
+      this._emergencyAdjust(P, W, H);
+    }
   }
 
   _holisticMaskBytes(mask, P, W, H) {
@@ -410,48 +447,15 @@ export class SunCoachEngine {
     return out;
   }
 
-  _lockingTick(P, track, frame, ts, W, H) {
-    const calFrame = this.calibrationFrame || frame;
-
-    if (!P || !calFrame) {
-      this.onHud(0, 'SCAN… RESTE DANS LE CADRE');
-      return;
-    }
-
-    // Photo + ancres = dos visible. Sinon on scanne trop tard (face / crème).
-    if (!isBackTurned(P, W)) {
-      this.onHud(0.1, 'SCAN — TOURNE LE DOS, RESTE IMMOBILE');
-      return;
-    }
-
-    if (!this.lockPoseP) {
-      this.lockPoseP = P.map((p) => ({ x: p.x, y: p.y, visibility: p.visibility }));
-      try {
-        this._captureSnapshot();
-      } catch (err) {
-        console.warn('[SunCoach] snapshot failed:', err);
-      }
-      this.lockSnapshotDone = true;
-    }
-
-    const elapsed = performance.now() - this.lockStartedAt;
-    const holdMs = 1100;
-    const pct = Math.min(1, elapsed / holdMs);
-    this.onHud(pct, `SCAN ${Math.round(pct * 100)} %`);
-
-    if (elapsed >= holdMs) {
-      try {
-        this._finalizeLock(calFrame, this.lockPoseP || P, W, H);
-      } catch (err) {
-        console.error('[SunCoach] finalizeLock failed:', err);
-        this._emergencyAdjust(this.lockPoseP || P, W, H);
-      }
-    }
+  /** Phase réservée : le verrouillage est immédiat dans _startLocking. */
+  _lockingTick() {
+    /* no-op */
   }
 
   /** Dernier recours : écran 8 points même si silhouette / masque plante. */
   _emergencyAdjust(P, W, H) {
     this.tracker.aiSegEnabled = false;
+    this.tracker.pause();
     this.maskLock = null;
     this.frozenMask = null;
     this.smoothMask = null;
@@ -472,60 +476,43 @@ export class SunCoachEngine {
   }
 
   _finalizeLock(calFrame, P, W, H) {
+    // Legacy path — unused after instant lock; keep for harness / safety.
     this.tracker.aiSegEnabled = false;
-    const lock = this.maskLock;
-    const averaged = lock?.getAveraged() ?? null;
-    const contour = averaged
-      ? lock.extractContour(calFrame, averaged)
-      : null;
-
-    if (contour) {
-      setTracedContour(contour);
-      this.frozenMask = buildBackSilhouetteFromBytes(averaged, P, W, H, null);
-      this.smoothMask = this.frozenMask;
-      this.backContour = traceBackContour(this.smoothMask, W, H);
-    } else {
-      try {
-        this.frozenMask = buildFallbackSilhouette(P, W, H, null);
-        this.smoothMask = this.frozenMask;
-        this.backContour = this.smoothMask
-          ? traceBackContour(this.smoothMask, W, H)
-          : null;
-      } catch (err) {
-        console.warn('[SunCoach] fallback silhouette skipped:', err);
-        this.frozenMask = null;
-        this.smoothMask = null;
-        this.backContour = null;
+    this.frozenMask = null;
+    this.smoothMask = null;
+    this.backContour = null;
+    if (P) {
+      this.frozenPoseP = P.map((p) => ({ x: p.x, y: p.y, visibility: p.visibility }));
+      const ls = P[LM.L_SHOULDER];
+      const rs = P[LM.R_SHOULDER];
+      if (ls && rs) {
+        this.lockedShoulderW = Math.hypot(rs.x - ls.x, rs.y - ls.y);
+        this.lockedMid = { x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2 };
       }
+      this.lockedPoseSignature = capturePoseSignature(P, calFrame);
     }
-
-    const ls = P[LM.L_SHOULDER];
-    const rs = P[LM.R_SHOULDER];
-    this.lockedShoulderW = Math.hypot(rs.x - ls.x, rs.y - ls.y);
-    this.lockedMid = { x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2 };
-
-    this.frozenPoseP = P.map((p) => ({ x: p.x, y: p.y, visibility: p.visibility }));
-    this.lockedPoseSignature = capturePoseSignature(P, calFrame);
-
     this.maskLock = null;
     this._startAdjusting(P, W, H);
   }
 
   /**
-   * Photo pour l’écran 8 points — coords = vidéo (ancres = pose).
-   * JPEG plus léger pour limiter le pic mémoire iOS.
+   * Photo légère pour l’UI (max ~512 px). Ancres restent en coords vidéo pleine
+   * (même aspect → % sur l’image affichée).
    */
   _captureSnapshot() {
-    const W = this.video.videoWidth;
-    const H = this.video.videoHeight;
-    if (!W || !H) return;
+    const srcW = this.video.videoWidth;
+    const srcH = this.video.videoHeight;
+    if (!srcW || !srcH) return;
+    const maxSide = 512;
+    const scale = Math.min(1, maxSide / Math.max(srcW, srcH));
     const c = document.createElement('canvas');
-    c.width = W;
-    c.height = H;
-    c.getContext('2d').drawImage(this.video, 0, 0, W, H);
-    this.snapshotDataUrl = c.toDataURL('image/jpeg', 0.55);
-    this.snapshotW = W;
-    this.snapshotH = H;
+    c.width = Math.max(1, Math.round(srcW * scale));
+    c.height = Math.max(1, Math.round(srcH * scale));
+    c.getContext('2d').drawImage(this.video, 0, 0, c.width, c.height);
+    this.snapshotDataUrl = c.toDataURL('image/jpeg', 0.48);
+    // Logical size for anchors = live overlay (full), not the JPEG pixels.
+    this.snapshotW = this.overlay.width || srcW;
+    this.snapshotH = this.overlay.height || srcH;
   }
 
   getAdjustmentPayload() {
@@ -567,7 +554,7 @@ export class SunCoachEngine {
   }
 
   _startAdjusting(P, W, H) {
-    // Photo déjà prise au 1er frame « dos » pendant le scan (évite décalage).
+    // Photo déjà prise au lock (évite décalage). Tracker en pause → RAM libre.
     if (!this.lockSnapshotDone || !this.snapshotDataUrl) {
       try {
         this._captureSnapshot();
@@ -575,6 +562,7 @@ export class SunCoachEngine {
         console.warn('[SunCoach] late snapshot failed:', err);
       }
     }
+    this.tracker.pause();
     this.state = 'adjusting';
     const pose = this.lockPoseP || P || this.frozenPoseP;
     const adjW = this.snapshotW || W;
@@ -583,8 +571,7 @@ export class SunCoachEngine {
       ?? defaultAnchorsPx(this.frozenPoseP, adjW, adjH)
       ?? {};
     this.calibrationAnchors = {};
-    this.onHud(0, 'VIDÉO EN PAUSE — GLISSE LES 8 POINTS SUR LE BORD DU DOS');
-    this.voice.say(calibrationVoice('adjust_intro'), { interrupt: true });
+    this.onHud(0, 'GLISSE LES 8 POINTS SUR LE BORD DU DOS');
     this._notifyPhase();
   }
 
@@ -593,6 +580,7 @@ export class SunCoachEngine {
     this.repositionOkSince = 0;
     this.repositionStableFrames = 0;
     this.repositionStartedAt = performance.now();
+    this.tracker.resume();
     this.onHud(0, 'REPLACE-TOI (APPROX. OK)');
     this.voice.say(calibrationVoice('reposition_intro'), { interrupt: true });
     this._notifyPhase();
@@ -658,6 +646,7 @@ export class SunCoachEngine {
 
   _startCoverage() {
     this._finalizeCalibration();
+    this.tracker.resume();
     this.backOrient.reset();
     this.orientWarnTs = 0;
     this.contactGate.reset();
