@@ -38,12 +38,27 @@ import {
   buildBackSilhouette, buildFallbackSilhouette, buildBackSilhouetteFromBytes,
   traceBackContour, drawBackSegmentationOverlay,
 } from './segmentation.js';
+import { updateStandStill, STILL_DURATION_MS, torsoMotionFrac } from './standStill.js';
+import { refineBackAnchorsFromFrame } from './skinEdgeRefine.js';
 import {
   torsoAttachTransform,
   torsoCornersFromPose,
   blendAffineParams,
 } from './torsoAffine.js';
 import { contactsFromHandLandmarker } from './handLandmarker.js';
+
+/** Compte à rebours audible avant photo (ms). */
+const PHOTO_COUNTDOWN_MS = 3000;
+
+/** `?adjust=1` force l’écran 8 points manuel ; sinon auto-calibration. */
+function wantManualAdjust() {
+  if (typeof window === 'undefined') return false;
+  try {
+    return new URLSearchParams(window.location.search).has('adjust');
+  } catch {
+    return false;
+  }
+}
 
 export class SunCoachEngine {
   constructor({ video, overlay, minimap, onHud, onDone, onPhase, replaySource = null }) {
@@ -137,6 +152,10 @@ export class SunCoachEngine {
     this.snapshotH = 0;
     this.lockPoseP = null;
     this.lockSnapshotDone = false;
+    this.lockSub = null;
+    this.stillState = { lastCloud: null, stillSince: null, fired: false };
+    this.countdownEndsAt = 0;
+    this.countdownSaid = null;
     this.coachMode = 'precise';
     this.repositionStableFrames = 0;
     this.lastTs = 0;
@@ -367,42 +386,129 @@ export class SunCoachEngine {
 
     this.onHud(0, `CALIBRAGE… DIST. ${formatDistance(distM)}`);
     if (!this.placementOkSince) this.placementOkSince = ts;
-    // ~0.4 s suffit — plus besoin de rester figé 1.5 s + scan.
-    if (ts - this.placementOkSince > 400) this._startLocking(frame);
+    // Placement OK ~0.4 s → phase « reste immobile » (pas la photo tout de suite).
+    if (ts - this.placementOkSince > 400) this._beginStandStill(frame);
   }
 
-  /**
-   * Plus de phase « scan IA » longue : pause détection → photo légère → 8 points.
-   * (Le scan MediaPipe + buffers full-res plantait Safari iPhone.)
-   */
-  _startLocking(frame) {
+  /** Voix + stand-still + compte à rebours, photo seulement si toujours immobile. */
+  _beginStandStill(frame) {
     this._finalizeCalibration();
     this.state = 'locking';
+    this.lockSub = 'still';
     this.lockStartedAt = performance.now();
     this.calibrationFrame = frame ? cloneFrame(frame) : null;
     this.maskLock = null;
     this.tracker.aiSegEnabled = false;
+    this.stillState = { lastCloud: null, stillSince: null, fired: false };
+    this.countdownEndsAt = 0;
+    this.countdownSaid = null;
+    this.onHud(0, 'RESTE IMMOBILE');
+    this.voice.say(
+      'Parfait. Reste bien droit et immobile, dos à la caméra. '
+      + 'Je compte jusqu’à trois, puis je prends la photo.',
+      { interrupt: true },
+    );
+  }
 
-    // Pose déjà OK (placement). Figé la pose live avant pause.
-    const P = this._lastP;
-    const W = this.overlay.width;
-    const H = this.overlay.height;
-    if (P) {
-      this.lockPoseP = P.map((p) => ({ x: p.x, y: p.y, visibility: p.visibility }));
-      this.frozenPoseP = this.lockPoseP;
-      const ls = P[LM.L_SHOULDER];
-      const rs = P[LM.R_SHOULDER];
-      if (ls && rs) {
-        this.lockedShoulderW = Math.hypot(rs.x - ls.x, rs.y - ls.y);
-        this.lockedMid = { x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2 };
-      }
-      if (this.calibrationFrame) {
-        this.lockedPoseSignature = capturePoseSignature(P, this.calibrationFrame);
-      }
+  _abortStandStill(msg, status) {
+    this.lockSub = 'still';
+    this.stillState = { lastCloud: null, stillSince: null, fired: false };
+    this.countdownEndsAt = 0;
+    this.countdownSaid = null;
+    this.onHud(0, status);
+    this.voice.say(msg, { id: 'still:abort', cooldown: 3500, interrupt: true });
+  }
+
+  _lockingTick(P, track, frame, ts, W, H) {
+    if (this.lockSub === 'done') return;
+
+    if (!P || !isBackTurned(P, W)) {
+      this._abortStandStill(
+        'Je ne te vois plus bien de dos. Remets-toi droit, dos à la caméra.',
+        'DOS REQUIS',
+      );
+      return;
     }
 
-    this.tracker.pause();
-    this.onHud(0.5, 'PHOTO…');
+    const cloud = torsoCornersFromPose(P, LM);
+    if (!cloud) {
+      this.onHud(0, 'ÉPAULES / HANCHES…');
+      return;
+    }
+
+    if (this.lockSub === 'still') {
+      const result = updateStandStill(this.stillState, cloud, ts, {
+        durationMs: STILL_DURATION_MS,
+      });
+      this.onHud(result.progress, `RESTE IMMOBILE ${Math.round(result.progress * 100)} %`);
+      if (result.justFired) {
+        this.lockSub = 'countdown';
+        this.countdownEndsAt = ts + PHOTO_COUNTDOWN_MS;
+        this.countdownSaid = 3;
+        this.onHud(0.2, 'PHOTO DANS 3…');
+        this.voice.say('Trois.', { interrupt: true });
+        this.beeper.beep(660, 0.08, 0.12);
+      }
+      return;
+    }
+
+    if (this.lockSub !== 'countdown') return;
+
+    // Annuler si mouvement trop fort pendant le compte à rebours.
+    const motion = torsoMotionFrac(this.stillState.lastCloud, cloud);
+    this.stillState.lastCloud = cloud.map((p) => ({ x: p.x, y: p.y }));
+    if (Number.isFinite(motion) && motion > 0.045) {
+      this._abortStandStill(
+        'Tu as bougé. Remets-toi droit et reste immobile.',
+        'BOUGÉ — RECOMMENCE',
+      );
+      return;
+    }
+
+    const left = this.countdownEndsAt - ts;
+    const sec = Math.max(1, Math.ceil(left / 1000));
+    if (sec !== this.countdownSaid && sec >= 1 && left > 0) {
+      this.countdownSaid = sec;
+      const words = { 3: 'Trois.', 2: 'Deux.', 1: 'Un.' };
+      this.voice.say(words[sec] || String(sec), { interrupt: true });
+      this.beeper.beep(sec === 1 ? 880 : 660, 0.08, 0.12);
+    }
+    this.onHud(
+      Math.min(1, 1 - left / PHOTO_COUNTDOWN_MS),
+      left > 0 ? `PHOTO DANS ${sec}…` : 'PHOTO…',
+    );
+
+    if (left > 0) return;
+
+    this.lockSub = 'done';
+    try {
+      this._completePhotoLock(P, frame, W, H);
+    } catch (err) {
+      console.error('[SunCoach] photo lock failed:', err);
+      this.lockSub = 'still';
+      this._emergencyAdjust(P, W, H);
+    }
+  }
+
+  /**
+   * Photo + ancres auto (pose + snap peau). Skip 8 points sauf `?adjust=1`.
+   */
+  _completePhotoLock(P, frame, W, H) {
+    const calFrame = this.calibrationFrame || (frame ? cloneFrame(frame) : null);
+    this.calibrationFrame = calFrame;
+
+    this.lockPoseP = P.map((p) => ({ x: p.x, y: p.y, visibility: p.visibility }));
+    this.frozenPoseP = this.lockPoseP;
+    const ls = P[LM.L_SHOULDER];
+    const rs = P[LM.R_SHOULDER];
+    if (ls && rs) {
+      this.lockedShoulderW = Math.hypot(rs.x - ls.x, rs.y - ls.y);
+      this.lockedMid = { x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2 };
+    }
+    if (calFrame) {
+      this.lockedPoseSignature = capturePoseSignature(P, calFrame);
+    }
+
     try {
       this._captureSnapshot();
       this.lockSnapshotDone = true;
@@ -411,45 +517,59 @@ export class SunCoachEngine {
       this.lockSnapshotDone = false;
     }
 
+    let anchors = defaultAnchorsPx(P, W, H) || {};
+    try {
+      const maxSide = 512;
+      const scale = Math.min(1, maxSide / Math.max(W, H));
+      const rw = Math.max(1, Math.round(W * scale));
+      const rh = Math.max(1, Math.round(H * scale));
+      const scaled = {};
+      for (const [id, p] of Object.entries(anchors)) {
+        if (p) scaled[id] = { x: p.x * scale, y: p.y * scale };
+      }
+      const skin = refineBackAnchorsFromFrame(this.video, rw, rh, scaled);
+      if (skin?.ok && skin.anchors) {
+        anchors = {};
+        for (const [id, p] of Object.entries(skin.anchors)) {
+          if (p) anchors[id] = { x: p.x / scale, y: p.y / scale };
+        }
+      }
+    } catch (err) {
+      console.warn('[SunCoach] skin refine skipped:', err);
+    }
+
     this.frozenMask = null;
     this.smoothMask = null;
     this.backContour = null;
     this.maskLock = null;
+    this.tracker.pause();
 
-    this.onHud(1, 'AJUSTE LES POINTS');
-    this.voice.say('Parfait. Ajuste les points verts sur la photo.', { interrupt: true });
-    try {
+    if (wantManualAdjust()) {
+      this.draftAnchorsPx = anchors;
+      this.onHud(1, 'AJUSTE LES POINTS');
+      this.voice.say('Photo prise. Ajuste les points verts si besoin, puis valide.', {
+        interrupt: true,
+      });
       this._startAdjusting(P, W, H);
-    } catch (err) {
-      console.error('[SunCoach] adjust start failed:', err);
-      this._emergencyAdjust(P, W, H);
+      return;
     }
-  }
 
-  _holisticMaskBytes(mask, P, W, H) {
-    if (!mask) return null;
-    let raw;
-    try {
-      raw = mask.getAsFloat32Array();
-    } catch {
-      return null;
+    // Auto : pas d’écran 8 points.
+    this.draftAnchorsPx = anchors;
+    if (calFrame) {
+      const { calibrationAnchors } = applyCalibration(anchors, calFrame);
+      this.calibrationAnchors = calibrationAnchors;
+    } else {
+      this.calibrationAnchors = {};
     }
-    const mw = mask.width;
-    const mh = mask.height;
-    const out = new Uint8ClampedArray(W * H);
-    for (let y = 0; y < H; y++) {
-      const sy = Math.min(mh - 1, Math.round((y / H) * mh));
-      for (let x = 0; x < W; x++) {
-        const sx = Math.min(mw - 1, Math.round((x / W) * mw));
-        out[y * W + x] = raw[sy * mw + sx] > 0.28 ? 255 : 0;
-      }
-    }
-    return out;
-  }
 
-  /** Phase réservée : le verrouillage est immédiat dans _startLocking. */
-  _lockingTick() {
-    /* no-op */
+    this.beeper.beep(1047, 0.12, 0.14);
+    this.onHud(1, 'PHOTO OK');
+    this.voice.say(
+      'Photo prise. Tourne-toi vers l’écran et replace-toi approximativement.',
+      { interrupt: true },
+    );
+    this._startReposition();
   }
 
   /** Dernier recours : écran 8 points même si silhouette / masque plante. */
@@ -554,7 +674,6 @@ export class SunCoachEngine {
   }
 
   _startAdjusting(P, W, H) {
-    // Photo déjà prise au lock (évite décalage). Tracker en pause → RAM libre.
     if (!this.lockSnapshotDone || !this.snapshotDataUrl) {
       try {
         this._captureSnapshot();
@@ -567,9 +686,11 @@ export class SunCoachEngine {
     const pose = this.lockPoseP || P || this.frozenPoseP;
     const adjW = this.snapshotW || W;
     const adjH = this.snapshotH || H;
-    this.draftAnchorsPx = defaultAnchorsPx(pose, adjW, adjH)
-      ?? defaultAnchorsPx(this.frozenPoseP, adjW, adjH)
-      ?? {};
+    if (!this.draftAnchorsPx || !Object.keys(this.draftAnchorsPx).length) {
+      this.draftAnchorsPx = defaultAnchorsPx(pose, adjW, adjH)
+        ?? defaultAnchorsPx(this.frozenPoseP, adjW, adjH)
+        ?? {};
+    }
     this.calibrationAnchors = {};
     this.onHud(0, 'GLISSE LES 8 POINTS SUR LE BORD DU DOS');
     this._notifyPhase();
