@@ -1,9 +1,10 @@
 /**
- * Caméra + MediaPipe HolisticLandmarker : pose + mains dédiées (21 pts/main)
- * + masque de segmentation léger pour ajuster la morphologie du dos.
+ * Caméra + pose (MediaPipe).
+ * Session produit : PoseLandmarker + HandLandmarker (stack labo validé).
+ * Holistic reste dispo pour labs frames (IMAGE) uniquement.
  */
 import { FilesetResolver, HolisticLandmarker } from '@mediapipe/tasks-vision';
-import { BodySegmenter } from './bodySegmenter.js';
+import { BodySegmenter, preloadBodySegmenter } from './bodySegmenter.js';
 
 export const LM = {
   NOSE: 0,
@@ -61,6 +62,7 @@ async function createLandmarker() {
 }
 
 export function preloadPose() {
+  // Holistic IMAGE — labs frames uniquement (?frames=1)
   if (!landmarkerPromise) {
     landmarkerPromise = createLandmarker().catch((err) => {
       landmarkerPromise = null;
@@ -68,6 +70,19 @@ export function preloadPose() {
     });
   }
   return landmarkerPromise;
+}
+
+/** Précharge modèles session live (Pose + Hands + segmenter) — plus Holistic. */
+export async function preloadSessionVision() {
+  const [{ preloadVideoPose }, { preloadVideoHandLandmarker }] = await Promise.all([
+    import('./poseVideo.js'),
+    import('./handLandmarker.js'),
+  ]);
+  return Promise.all([
+    preloadVideoPose(),
+    preloadVideoHandLandmarker(),
+    preloadBodySegmenter().catch(() => null),
+  ]);
 }
 
 let imageLandmarkerPromise = null;
@@ -194,7 +209,10 @@ export class BackOrientation {
 export class PoseTracker {
   constructor(video) {
     this.video = video;
+    /** @type {import('@mediapipe/tasks-vision').PoseLandmarker|null} */
     this.landmarker = null;
+    /** @type {import('@mediapipe/tasks-vision').HandLandmarker|null} */
+    this.handLm = null;
     this.bodySegmenter = new BodySegmenter();
     this.aiSegEnabled = false;
     this.stream = null;
@@ -206,12 +224,15 @@ export class PoseTracker {
   }
 
   async init() {
+    const { preloadVideoPose } = await import('./poseVideo.js');
+    this.landmarker = await preloadVideoPose();
     try {
-      this.landmarker = await preloadPose();
-    } catch {
-      this.landmarker = await preloadPose();
+      const { preloadVideoHandLandmarker } = await import('./handLandmarker.js');
+      this.handLm = await preloadVideoHandLandmarker();
+    } catch (err) {
+      console.warn('[SunCoach] Hand Landmarker init failed:', err);
+      this.handLm = null;
     }
-    // Optionnel : le masque Holistic sert de repli, donc ne pas bloquer la session.
     this.bodySegmenter.init().catch((err) => {
       console.warn('[SunCoach] Body segmenter init failed (non-fatal):', err);
     });
@@ -395,7 +416,6 @@ export class PoseTracker {
       if (!this.landmarker || this.video.readyState < 2) return;
       if (this.video.ended) return;
       const t = this.video.currentTime;
-      // Saut arrière (loop / seek) : ignorer la frame pour ne pas casser la session.
       if (this._lastVideoTime >= 0 && t < this._lastVideoTime - 0.35) {
         this._lastVideoTime = t;
         return;
@@ -410,30 +430,38 @@ export class PoseTracker {
         return;
       }
 
-      const raw = result.poseLandmarks?.[0];
-      const world = result.poseWorldLandmarks?.[0];
-      const mask = result.poseSegmentationMasks?.[0] ?? null;
+      // PoseLandmarker VIDEO (plus Holistic) — landmarks = BlazePose 33 pts
+      const raw = result.landmarks?.[0] ?? result.poseLandmarks?.[0];
+      const world = result.worldLandmarks?.[0] ?? result.poseWorldLandmarks?.[0];
       const W = this.video.videoWidth;
       const H = this.video.videoHeight;
       const aiPersonMask = this.aiSegEnabled
         ? this.bodySegmenter.segmentPersonMask(this.video, ts, W, H)
         : null;
 
+      let handResult = null;
+      if (this.handLm) {
+        try {
+          handResult = this.handLm.detectForVideo(this.video, ts + 0.5);
+        } catch {
+          handResult = null;
+        }
+      }
+
       onFrame(
         {
           pose2D: raw ? this._smooth(raw) : null,
           poseWorld: world ? this._smoothWorld(world) : null,
-          leftHandWorld: result.leftHandWorldLandmarks?.[0] ?? null,
-          rightHandWorld: result.rightHandWorldLandmarks?.[0] ?? null,
-          leftHand2D: result.leftHandLandmarks?.[0] ?? null,
-          rightHand2D: result.rightHandLandmarks?.[0] ?? null,
-          segmentationMask: mask,
+          leftHandWorld: null,
+          rightHandWorld: null,
+          leftHand2D: null,
+          rightHand2D: null,
+          handLandmarkerResult: handResult,
+          segmentationMask: null,
           aiPersonMask,
         },
         ts
       );
-
-      mask?.close();
     };
     loop();
   }

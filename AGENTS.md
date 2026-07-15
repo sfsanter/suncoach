@@ -15,19 +15,21 @@ Guide pour agents Cursor travaillant sur ce dépôt.
 
 ```
 App.jsx
-  └── engine.js          ← point d'entrée session
-        ├── pose.js      HolisticLandmarker
+  └── engine.js          ← point d’entrée session
+        ├── pose.js      PoseTracker = PoseLandmarker + HandLandmarker (+ BodySegmenter lock)
+        ├── poseVideo.js / handLandmarker.js / torsoAffine.js  ← stack labo couverture
         ├── segmentation.js + bodySegmenter.js
         ├── sessionCore.js   applyCalibration (partagé harness)
         │     ├── anchorShape.js
         │     ├── backWarp.js
         │     └── coverage.js
-        ├── handGate.js
-        ├── backCalibration.js  (gestes anchor-assist, pas calibrage live 8 étapes)
+        ├── handGate.js      ContactVelocityGate seulement (plus de cascade Holistic paint)
+        ├── backCalibration.js
         └── minimapCanvas.js
 ```
 
-**Règle de dépendance** : `sessionCore` et `backWarp` ne doivent pas importer `engine` ni `pose` MediaPipe.
+**Couverture (source de vérité)** = `?vidhands=1` : affine `xf.inv` + `contactsFromHandLandmarker` + `nearBackShape`.  
+**Interdit en paint** : Holistic hands, `warpToLocked`, cascade poignet/coude.
 
 ## Vagues de travail (nettoyage V3)
 
@@ -73,10 +75,13 @@ Voir section **phase0-tel-validate** dans le résumé de livraison agent :
 ## Prochaine session — attaque directe
 
 **État validé (labo `?vidhands=1`) — ne pas casser :**
-- Play/Pause · Tracer 8 points · Start tracking (lock une fois)
+- Play · **stand-still** (~1,5 s) → pause + tracer · Start tracking (lock peau)
 - Suivi dos : `torsoAffine.js` (similarité d’abord, garde anti-tube vertical)
 - Hands : `handLandmarker.js` (VIDEO) + UV via `toWarpPixel = xf.inv`
-- Couverture : `CoverageGrid(THOROUGH_PIXEL_NEED)` · heat live + minimap · % touché / validé
+- Couverture : `CoverageGrid(THOROUGH_PIXEL_NEED=0.42)` · heat live + minimap · % touché / validé · sévérité centre
+- Contour haut : `buildDensifiedPolygon` dans `backWarp.js` (arcs nuque↔épaules, tip générique y=0)
+- Bords peau : `skinEdgeRefine.js` au START TRACKING (échantillon Lab + snap ancres, une fois)
+- Stand-still : `standStill.js` pendant PLAY avant les 8 points
 
 **Entrée de travail :**
 ```
@@ -86,31 +91,32 @@ npm run build && npm run preview
 Vidéo test locale : `public/IMG_3805.mp4` (gitignorée — H.264). Sinon bouton VIDÉO.
 Accueil : bouton labo vidéo / `?frames=1` / `?lab=1`.
 
-**Prochaine brique (demandée, pas encore faite) :**
-> Contour **progressif** assez **haut** sur le **haut du dos** (nuque / trapèzes) —
-> aujourd’hui le polygone / masque coupe trop bas ou trop plat en haut.
-> Valider dans `VideoHandLab` (overlay + minimap) avant de porter dans `engine.js`.
+**Prochaine brique :**
+> Soak téléphone / replay session. Stand-still + peauxnap dans le flux produit si besoin.
+> Voix coach v2 (note ci-dessous).
 
-### Notes design (session 2026-07-14 — à retester, pas encore implémenté)
+### Notes design
 
-**Couverture trop stricte (feedback Laurent)**  
-- `THOROUGH_PIXEL_NEED` (~×3,5 vs défaut) : le % **validé** reste à **0 %** longtemps alors que visuellement c’est déjà bien frotté.  
-- Le % **touché** est plus fidèle à ce qu’on voit ; le validé est un filtre dur (« mieux trop que pas »).  
-- **Action prochaine** : recalibrer aux tests (baisser un peu le seuil / pondérer touché vs validé / entre-deux). Ne pas toucher au produit Holistic tant que le labo n’a pas un réglage OK.
+**Couverture session** — portée depuis le labo (2026-07-15) : Pose+Hands+affine. `?vidhands=1` = non-régression.
 
-**Segmentation dos**  
-- Segmenter **la personne** (MediaPipe-style) : possible, déjà exploré côté produit (`bodySegmenter`).  
-- Segmenter **uniquement la surface crème du dos** : pas de modèle léger fiable en navigateur → toujours **heuristique** (pose ∩ masque ∩ 8 points).  
-- Rôle utile : cadre / silhouette, pas remplacement des 8 points ni de la carte UV.
+**Couleur bords** — lock une fois (`refineBackAnchorsFromFrame`).
 
-**Couleur similaire pour les bords (piste retenue à mix)**  
-- Objectif : **affiner les bords** (nuque, flancs, haut du dos), pas remplacer le tracking.  
-- Mix : 8 points + warp = forme globale → bande de bord → pixels **proches en couleur** de la peau (échantillon figé au **lock**, Lab/HSV).  
-- Region growing / flood borné par polygone élargi, ou correcteur local sur le contour.  
-- Pièges : ombre, crème blanche, main qui passe, lumière qui change → **échantillon lock**, pas tracking couleur 60 fps.  
-- Bon combo cible pour la brique haut-du-dos : warp/8 pts + (option) mask personne + **couleur en correcteur de bord**.
+**Stand-still** — validé labo (~1,5 s → pause + tracer). Clic manuel = backup.
 
-**Hors scope immédiat :** brancher Hands+affine+couverture dans la session produit (`engine.js` Holistic) — uniquement après OK labo haut du dos + seuil couverture.
+**Voix coach v2 (à faire plus tard — brief Laurent 2026-07-15)**  
+Aujourd’hui : `voice.js` = Web Speech API, phrases figées / un peu robotiques.  
+Objectif : plus **fluide** et **joli à l’oreille** que la version produit actuelle.
+
+Piste retenue (hybride) :
+1. Le moteur décide l’**intention** (ex. `gap:colonne`, `standstill`, `reposition`) — règles, pas LLM.
+2. Un **petit reformulateur** (templates riches OU petit LLM) produit 1 phrase naturelle FR, avec cooldown / anti-répétition.
+3. Synthèse : monter en gamme TTS (**voix neurales** navigateur si dispo, ou TTS cloud optionnel) — c’est souvent **plus audible** qu’un LLM seul sur du vieux `speechSynthesis`.
+
+Contraintes SunCoach : aujourd’hui « 100 % local » (AGENTS) → LLM/TTS cloud = option explicite / mode connecté, ou rester local (templates + meilleure voix système). Latence coach : reformulation doit rester < ~300–500 ms ou phrases pré-générées / cache par intention.
+
+Ne pas brancher ça avant port moteur labo → session.
+
+**Hors scope immédiat :** anti-phone-shake fin + voix v2 tant que port `engine.js` pas cadré.
 
 **Fichiers clés labo :**
 | Fichier | Rôle |
@@ -120,5 +126,7 @@ Accueil : bouton labo vidéo / `?frames=1` / `?lab=1`.
 | `src/lib/handLandmarker.js` | Hands VIDEO |
 | `src/lib/coverage.js` | heat, `THOROUGH_PIXEL_NEED` |
 | `src/lib/poseVideo.js` | PoseLandmarker VIDEO |
-| `src/lib/backWarp.js` | UV ↔ pixels (contour) |
+| `src/lib/backWarp.js` | UV ↔ pixels (contour densifié) |
+| `src/lib/skinEdgeRefine.js` | snap couleur bords au lock |
+| `src/lib/standStill.js` | dos immobile → pause + prompt tracer |
 | `src/lib/bodySegmenter.js` | mask personne (piste, pas labo vidhands) |

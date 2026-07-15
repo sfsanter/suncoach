@@ -18,7 +18,7 @@ import {
   strokeMappedPath,
   strokeMappedZone,
 } from './lib/minimapRender.js';
-import { preloadPose } from './lib/pose.js';
+import { preloadSessionVision } from './lib/pose.js';
 import { isTestMode } from './lib/testMode.js';
 import {
   isReplayMode,
@@ -108,7 +108,7 @@ export default function App() {
   useEffect(() => {
     if (minimapLabMode) return undefined;
     let cancelled = false;
-    preloadPose()
+    preloadSessionVision()
       .then(() => { if (!cancelled) setModelStatus('ok'); })
       .catch(() => { if (!cancelled) setModelStatus('fail'); });
     return () => { cancelled = true; };

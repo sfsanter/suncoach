@@ -14,7 +14,7 @@ export const BACK_ANCHOR_ORDER = [
 ];
 
 export const GENERIC_UV_ANCHORS = {
-  nuque: { x: 0.50, y: 0.04 },
+  nuque: { x: 0.50, y: 0.00 },
   epaule_g: { x: 0.14, y: 0.14 },
   epaule_d: { x: 0.86, y: 0.14 },
   milieu_g: { x: 0.08, y: 0.50 },
@@ -24,19 +24,62 @@ export const GENERIC_UV_ANCHORS = {
   bas: { x: 0.50, y: 0.96 },
 };
 
+/** Points intermédiaires nuque↔épaules (contour progressif trapèzes). */
+const UPPER_STEPS = 4;
+const OUTWARD_FRAC = 0.07;
+const LIFT_FRAC = 0.06;
+
+function dist2(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function enrichUpperArc(from, to, steps, scale, sideSign) {
+  const pts = [];
+  const outward = scale * OUTWARD_FRAC;
+  const lift = scale * LIFT_FRAC;
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const nx = (-dy / len) * sideSign;
+  const ny = (dx / len) * sideSign;
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    const s = Math.sin(t * Math.PI);
+    pts.push({
+      x: from.x + t * dx + nx * outward * s,
+      y: from.y + t * dy + ny * outward * s - lift * s,
+    });
+  }
+  return pts;
+}
+
+/** Polyligne fermée densifiée (8 ancres utilisateur + arcs haut). */
+export function buildDensifiedPolygon(anchorsByName) {
+  const nuque = anchorsByName?.nuque;
+  const epaule_g = anchorsByName?.epaule_g;
+  const epaule_d = anchorsByName?.epaule_d;
+  if (!nuque || !epaule_g || !epaule_d) return null;
+  const scale = dist2(epaule_g, epaule_d);
+  const leftArc = enrichUpperArc(nuque, epaule_g, UPPER_STEPS, scale, -1);
+  const rightArc = enrichUpperArc(epaule_d, nuque, UPPER_STEPS, scale, 1);
+  const body = BACK_ANCHOR_ORDER.slice(1).map((id) => anchorsByName[id]);
+  if (body.some((p) => !p || !Number.isFinite(p.x))) return null;
+  return [nuque, ...leftArc, ...body, ...rightArc];
+}
+
 function centroid(points) {
   const n = points.length;
   const s = points.reduce((a, p) => ({ x: a.x + p.x, y: a.y + p.y }), { x: 0, y: 0 });
   return { x: s.x / n, y: s.y / n };
 }
 
-function buildFanTriangles(anchorsByName) {
-  const ordered = BACK_ANCHOR_ORDER.map((name) => anchorsByName?.[name]);
-  if (ordered.some((p) => !p || !Number.isFinite(p.x) || !Number.isFinite(p.y))) return [];
-  const c = centroid(ordered);
+function buildFanTriangles(orderedPoints) {
+  if (!orderedPoints?.length || orderedPoints.length < 3) return [];
+  if (orderedPoints.some((p) => !p || !Number.isFinite(p.x) || !Number.isFinite(p.y))) return [];
+  const c = centroid(orderedPoints);
   const triangles = [];
-  for (let i = 0; i < ordered.length; i++) {
-    triangles.push([c, ordered[i], ordered[(i + 1) % ordered.length]]);
+  for (let i = 0; i < orderedPoints.length; i++) {
+    triangles.push([c, orderedPoints[i], orderedPoints[(i + 1) % orderedPoints.length]]);
   }
   return triangles;
 }
@@ -101,12 +144,16 @@ function bounds(points) {
 
 /** Pixels photo → UV générique (0–1, même espace que ANATOMICAL_ZONES). */
 export function buildBackWarp(pxAnchorsByName, genericAnchorsByName = GENERIC_UV_ANCHORS) {
-  const customTris = buildFanTriangles(pxAnchorsByName);
-  const genericTris = buildFanTriangles(genericAnchorsByName);
+  const customOrdered = buildDensifiedPolygon(pxAnchorsByName);
+  const genericOrdered = buildDensifiedPolygon(genericAnchorsByName);
+  if (!customOrdered || !genericOrdered) return null;
+
+  const customTris = buildFanTriangles(customOrdered);
+  const genericTris = buildFanTriangles(genericOrdered);
   if (!customTris.length || customTris.length !== genericTris.length) return null;
 
-  const customOrdered = BACK_ANCHOR_ORDER.map((id) => pxAnchorsByName[id]);
-  const customBounds = bounds(customOrdered);
+  const anchorPixels = BACK_ANCHOR_ORDER.map((id) => pxAnchorsByName[id]);
+  const customBounds = bounds(anchorPixels);
   const customToGeneric = buildMappers(customTris, genericTris);
   const genericToCustom = buildMappers(genericTris, customTris);
   const pixelToDisplayUv = (point) => ({
@@ -118,17 +165,15 @@ export function buildBackWarp(pxAnchorsByName, genericAnchorsByName = GENERIC_UV
     y: customBounds.minY + point.v * customBounds.height,
   });
 
+  const pixelOutline = customOrdered.map((p) => ({ x: p.x, y: p.y }));
   const outline = customOrdered.map(pixelToDisplayUv);
   const displayAnchors = Object.fromEntries(
     BACK_ANCHOR_ORDER.map((id, index) => [id, {
-      x: outline[index].u,
-      y: outline[index].v,
+      x: pixelToDisplayUv(pxAnchorsByName[id]).u,
+      y: pixelToDisplayUv(pxAnchorsByName[id]).v,
     }]),
   );
-  const genericOutline = BACK_ANCHOR_ORDER.map((id) => {
-    const p = genericAnchorsByName[id];
-    return { u: p.x, v: p.y };
-  });
+  const genericOutline = genericOrdered.map((p) => ({ u: p.x, v: p.y }));
 
   return {
     toGenericUv: (pixelPoint) => {
@@ -151,6 +196,7 @@ export function buildBackWarp(pxAnchorsByName, genericAnchorsByName = GENERIC_UV
     displayAspect: customBounds.width / customBounds.height,
     displayAnchors,
     outline,
+    pixelOutline,
     genericOutline,
     insideGeneric(u, v) {
       const p = { x: u, y: v };

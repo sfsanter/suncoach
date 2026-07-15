@@ -1,7 +1,8 @@
 /**
  * MediaPipe Hand Landmarker (standalone) — labo frames.
  * Cherche les paumes dans toute l’image, sans Holistic / sans pose.
- * Session produit inchangée tant que le labo n’a pas validé.
+ * Session produit : Hand Landmarker VIDEO (stack labo) via PoseTracker.
+ * Labs frames : IMAGE mode reste dispo.
  */
 import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
 import { palmFromHand, HM, lmScore } from './pose.js';

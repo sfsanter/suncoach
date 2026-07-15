@@ -29,6 +29,7 @@ const nuque = calibrationAnchors.nuque;
 console.log('nuque generic UV:', nuque ? `${nuque.u.toFixed(2)},${nuque.v.toFixed(2)}` : 'missing');
 console.log('layout aspect:', layout?.aspect?.toFixed(3) ?? 'n/a');
 console.log('warp outline pts:', warp?.outline?.length ?? 0);
+console.log('warp pixelOutline pts:', warp?.pixelOutline?.length ?? 0);
 console.log('display aspect:', warp?.displayAspect?.toFixed(3) ?? 'n/a');
 console.log('customBackOutlineUV pts:', outline?.length ?? 0);
 console.log('getBackWarp:', getBackWarp() ? 'active' : 'null');
@@ -45,8 +46,9 @@ const assertClose = (actual, expected, label, epsilon = 1e-5) => {
   }
 };
 
-assertClose(warp.outline[0].v, 0, 'display nuque top');
-assertClose(warp.outline[4].v, 1, 'display lower back bottom');
+assertClose(warp.displayAnchors.nuque.y, 0, 'display nuque top');
+assertClose(warp.displayAnchors.bas.y, 1, 'display lower back bottom');
+if ((warp.outline?.length ?? 0) < 12) throw new Error('expected densified outline (>=12 pts)');
 
 for (const uv of [{ u: 0.5, v: 0.5 }, { u: 0.5, v: 0.04 }, { u: 0.18, v: 0.82 }]) {
   const pixel = warp.fromGenericUv(uv);

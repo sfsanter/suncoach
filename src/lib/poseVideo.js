@@ -1,6 +1,6 @@
 /**
- * PoseLandmarker VIDEO — labo accroche dos (brique B).
- * Léger, séparé de Holistic session.
+ * PoseLandmarker VIDEO — session + labo accroche dos.
+ * Remplace Holistic pour la pose live.
  */
 import { FilesetResolver, PoseLandmarker } from '@mediapipe/tasks-vision';
 import { LM } from './pose.js';

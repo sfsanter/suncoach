@@ -16,8 +16,13 @@ export const HEAT_H = 48;
 
 /** Seuil « pixel validé / vert » — plus haut = plusieurs passages requis. */
 export const DEFAULT_PIXEL_NEED = 0.2;
-/** Labo / mode exigeant : ~3–4× plus de frottement avant validation. */
-export const THOROUGH_PIXEL_NEED = 0.7;
+/** Labo / mode exigeant : plusieurs frottements avant validation (recalibré 0.42). */
+export const THOROUGH_PIXEL_NEED = 0.42;
+/**
+ * Multiplicateur max au centre du dos (colonne / entre omoplates) —
+ * zones difficiles d’accès = plus de frottements pour valider.
+ */
+export const CENTER_NEED_BOOST = 0.9;
 const ZONE_RATIO = 0.58;
 /** Pinceau : une paume couvre une zone visible sur la minimap. */
 const SIGMA = 0.085;
@@ -318,8 +323,25 @@ export class CoverageGrid {
     return bodyMask[i] === 1;
   }
 
+  /**
+   * Seuil local : plus sévère au milieu du dos (u~0.5, v~0.35).
+   * Bords / flancs restent proches de this.need.
+   */
+  needAt(u, v) {
+    const du = (u - 0.5) / 0.20;
+    const dv = (v - 0.35) / 0.24;
+    const center = Math.exp(-(du * du + dv * dv));
+    return this.need * (1 + CENTER_NEED_BOOST * center);
+  }
+
+  needAtIndex(i) {
+    const x = i % HEAT_W;
+    const y = (i / HEAT_W) | 0;
+    return this.needAt((x + 0.5) / HEAT_W, (y + 0.5) / HEAT_H);
+  }
+
   pixelFraction(i) {
-    return Math.min(1, this.heat[i] / this.need);
+    return Math.min(1, this.heat[i] / this.needAtIndex(i));
   }
 
   /** Interpolation bilinéaire — entrée en repère dos, stockage canonique si 8 points. */
@@ -391,10 +413,11 @@ export class CoverageGrid {
         const i = y * HEAT_W + x;
         if (bodyMask[i] === 0) continue;
         const before = this.heat[i];
-        if (before < this.need) {
+        const need = this.needAt(u, v);
+        if (before < need) {
           this.heat[i] = before + step;
           added += step;
-          if (this.heat[i] >= this.need) crossed++;
+          if (this.heat[i] >= need) crossed++;
         }
       }
     }
@@ -428,11 +451,12 @@ export class CoverageGrid {
           const wgt = Math.exp(-(du * du + dv * dv) / (2 * SIGMA * SIGMA));
           if (wgt <= 0.03) continue;
           const before = this.heat[i];
-          if (before < this.need) {
+          const need = this.needAt(pu, pv);
+          if (before < need) {
             const step = Math.min(dt, 0.035) * wgt;
             this.heat[i] = before + step;
             added += step;
-            if (this.heat[i] >= this.need) crossed++;
+            if (this.heat[i] >= need) crossed++;
           }
         }
       }
@@ -452,7 +476,7 @@ export class CoverageGrid {
         const i = y * HEAT_W + x;
         if (bodyMask[i] === 0) continue;
         body++;
-        if (this.heat[i] >= this.need) painted++;
+        if (this.heat[i] >= this.needAt(u, v)) painted++;
       }
     }
     if (body === 0) return 1;
@@ -476,22 +500,22 @@ export class CoverageGrid {
   /** % pixels « touchés » (un passage léger) — pas encore validés. */
   get touchedRatio() {
     let touched = 0, body = 0;
-    const tip = this.need * 0.08;
     for (let i = 0; i < this.heat.length; i++) {
       if (bodyMask[i] === 0) continue;
       body++;
+      const tip = this.needAtIndex(i) * 0.08;
       if (this.heat[i] >= tip) touched++;
     }
     return body ? touched / body : 0;
   }
 
-  /** % pixels validés (plusieurs passages / seuil need). */
+  /** % pixels validés (plusieurs passages / seuil need local). */
   get paintedRatio() {
     let painted = 0, body = 0;
     for (let i = 0; i < this.heat.length; i++) {
       if (bodyMask[i] === 0) continue;
       body++;
-      if (this.heat[i] >= this.need) painted++;
+      if (this.heat[i] >= this.needAtIndex(i)) painted++;
     }
     return body ? painted / body : 0;
   }

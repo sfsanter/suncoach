@@ -1,7 +1,7 @@
 /**
  * Labo vidéo :
- * - PLAY / PAUSE · TRACER POINTS · START TRACKING
- * - Peinture couverture + % surface (CoverageGrid produit)
+ * - PLAY pour trouver un dos · pause auto dès le 1er point / TRACER
+ * - START TRACKING (lock peau + couverture)
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button, Card, EmergencyBanner } from '@mdrbx/nerv-ui';
@@ -35,6 +35,8 @@ import {
   blendAffineParams,
   smoothTorsoCloud,
 } from './lib/torsoAffine.js';
+import { refineBackAnchorsFromFrame } from './lib/skinEdgeRefine.js';
+import { updateStandStill } from './lib/standStill.js';
 
 const LABELS = Object.fromEntries(CALIBRATION_STEPS.map((step) => [step.id, step.label]));
 const ANCHOR_KEY = 'suncoach-frame-lab-anchors';
@@ -57,6 +59,13 @@ const DOT = {
   'hand-lm-hors': '#FFFF00',
 };
 
+/** Contour densifié (pixel lock) → live via affine. */
+function liveOutlineFromWarp(activeWarp, xf = null) {
+  const pts = activeWarp?.pixelOutline;
+  if (!pts?.length) return null;
+  return xf ? pts.map((p) => xf.apply(p)) : pts.map((p) => ({ x: p.x, y: p.y }));
+}
+
 export default function VideoHandLab() {
   const videoRef = useRef(null);
   const overlayRef = useRef(null);
@@ -64,6 +73,7 @@ export default function VideoHandLab() {
   const fileRef = useRef(null);
   const dragRef = useRef(null);
   const rafRef = useRef(0);
+  const stillRafRef = useRef(0);
   const lastVideoTimeRef = useRef(-1);
   const blobRef = useRef(null);
   const lockRef = useRef(null); // { corners, anchors, warp, lastXf }
@@ -72,6 +82,8 @@ export default function VideoHandLab() {
   const gridRef = useRef(null);
   const paintClockRef = useRef(0);
   const tsCounterRef = useRef(0);
+  const stillStateRef = useRef({ lastCloud: null, stillSince: null, fired: false });
+  const lastStillTsRef = useRef(-1);
 
   const [videoUrl, setVideoUrl] = useState('');
   const [videoLabel, setVideoLabel] = useState('');
@@ -82,11 +94,12 @@ export default function VideoHandLab() {
   const [placing, setPlacing] = useState(true);
   const [tracking, setTracking] = useState(false);
   const [videoSize, setVideoSize] = useState({ w: 0, h: 0 });
-  const [status, setStatus] = useState('1) Play/Pause · 2) Tracer points · 3) Start tracking');
+  const [status, setStatus] = useState('1) PLAY · 2) dos immobile → pause · 3) tracer · 4) START');
   const [contacts, setContacts] = useState([]);
   const [backFollow, setBackFollow] = useState(false);
   const [coverPct, setCoverPct] = useState(0);
   const [touchedPct, setTouchedPct] = useState(0);
+  const [stillProgress, setStillProgress] = useState(0);
 
   const warp = useMemo(
     () => (ANCHOR_ORDER.every((id) => anchors[id]) ? buildBackWarp(anchors) : null),
@@ -105,6 +118,7 @@ export default function VideoHandLab() {
     return () => {
       if (blobRef.current) URL.revokeObjectURL(blobRef.current);
       cancelAnimationFrame(rafRef.current);
+      cancelAnimationFrame(stillRafRef.current);
     };
   }, []);
 
@@ -216,7 +230,8 @@ export default function VideoHandLab() {
 
     const outline = liveOutline?.length >= 4
       ? liveOutline
-      : ANCHOR_ORDER.map((id) => anchors[id]).filter(Boolean);
+      : (activeWarp?.pixelOutline
+        || ANCHOR_ORDER.map((id) => anchors[id]).filter(Boolean));
 
     // Peinture sur le corps live (sous le contour)
     if (activeWarp) {
@@ -316,10 +331,7 @@ export default function VideoHandLab() {
         if (xf) {
           follow = true;
           mode = held ? 'hold+mp' : (xf.kind === 'similarity' ? 'sim+mp' : 'affine+mp');
-          liveOutline = ANCHOR_ORDER.map((id) => {
-            const a = lock.anchors[id];
-            return a ? xf.apply(a) : null;
-          }).filter(Boolean);
+          liveOutline = liveOutlineFromWarp(lock.warp, xf);
           toWarpPixel = (p) => xf.inv(p);
         }
       }
@@ -390,18 +402,11 @@ export default function VideoHandLab() {
     };
   };
 
-  const addPoint = (event) => {
-    if (!placing || tracking || !nextId || dragRef.current) return;
-    const point = pointFromEvent(event);
-    if (point) setAnchors((current) => ({ ...current, [nextId]: point }));
-  };
-
-  const movePoint = (event) => {
-    const id = dragRef.current;
-    if (!id || !placing) return;
-    const point = pointFromEvent(event);
-    if (point) setAnchors((current) => ({ ...current, [id]: point }));
-  };
+  const onPause = useCallback(() => {
+    const video = videoRef.current;
+    if (video && !video.paused) video.pause();
+    setPlaying(false);
+  }, []);
 
   const onPlay = async () => {
     const video = videoRef.current;
@@ -409,15 +414,33 @@ export default function VideoHandLab() {
     try {
       await video.play();
       setPlaying(true);
+      // Nouveau cycle stand-still
+      stillStateRef.current = { lastCloud: null, stillSince: null, fired: false };
+      lastStillTsRef.current = -1;
+      setStillProgress(0);
+      if (placing && !tracking) {
+        setStatus(nextId
+          ? 'Cherche un dos stable… (~1,5 s immobile → pause auto)'
+          : '8 points OK — START TRACKING');
+      }
     } catch (err) {
       setStatus(`Lecture : ${String(err?.message || err)}`);
     }
   };
 
-  const onPause = () => {
-    const video = videoRef.current;
-    if (video) video.pause();
-    setPlaying(false);
+  const addPoint = (event) => {
+    if (!placing || tracking || !nextId || dragRef.current) return;
+    onPause(); // pause auto dès le 1er clic de tracé
+    const point = pointFromEvent(event);
+    if (point) setAnchors((current) => ({ ...current, [nextId]: point }));
+  };
+
+  const movePoint = (event) => {
+    const id = dragRef.current;
+    if (!id || !placing) return;
+    onPause();
+    const point = pointFromEvent(event);
+    if (point) setAnchors((current) => ({ ...current, [id]: point }));
   };
 
   const clearPaint = () => {
@@ -440,10 +463,69 @@ export default function VideoHandLab() {
     setBackFollow(false);
     setContacts([]);
     setStatus(nextId
-      ? `Mode tracer — clique : ${LABELS[nextId]}`
-      : 'Mode tracer — glisse les points, puis START TRACKING');
+      ? `Pause auto · clique : ${LABELS[nextId]}`
+      : 'Pause auto · glisse les points, puis START TRACKING');
     drawOverlay([], null);
   };
+
+  // 8 points complets → pause + invitation START
+  useEffect(() => {
+    if (!placing || tracking || !anchorsReady) return;
+    onPause();
+    setStatus('8 points OK (pause auto) → START TRACKING');
+  }, [anchorsReady, placing, tracking, onPause]);
+
+  // PLAY + mode tracer : surveille dos immobile → pause + invite à placer
+  useEffect(() => {
+    cancelAnimationFrame(stillRafRef.current);
+    if (!placing || tracking || !playing || !poseReady || !videoUrl || anchorsReady) {
+      setStillProgress(0);
+      return undefined;
+    }
+
+    let cancelled = false;
+    const watch = async () => {
+      if (cancelled) return;
+      const video = videoRef.current;
+      if (!video || video.paused || !video.videoWidth) {
+        stillRafRef.current = requestAnimationFrame(() => { watch(); });
+        return;
+      }
+
+      const frameChanged = video.currentTime !== lastStillTsRef.current;
+      if (frameChanged) {
+        lastStillTsRef.current = video.currentTime;
+        try {
+          const poseRes = await detectPoseForVideo(video, nextTs());
+          if (cancelled) return;
+          const { P } = posePixelsAndFrame(poseRes, video.videoWidth, video.videoHeight);
+          const cloud = torsoCornersFromPose(P, LM);
+          const result = updateStandStill(stillStateRef.current, cloud, performance.now());
+          setStillProgress(result.progress);
+          if (result.progress > 0.05 && result.progress < 1 && !stillStateRef.current.fired) {
+            setStatus(`Dos en vue… stabilité ${Math.round(result.progress * 100)}%`);
+          }
+          if (result.justFired) {
+            onPause();
+            setStillProgress(1);
+            setStatus(nextId
+              ? `Dos immobile — pause auto · clique : ${LABELS[nextId]}`
+              : 'Dos immobile — glisse les points, puis START TRACKING');
+            return;
+          }
+        } catch {
+          /* ignore frame errors */
+        }
+      }
+      stillRafRef.current = requestAnimationFrame(() => { watch(); });
+    };
+
+    stillRafRef.current = requestAnimationFrame(() => { watch(); });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(stillRafRef.current);
+    };
+  }, [placing, tracking, playing, poseReady, videoUrl, anchorsReady, nextId, onPause]);
 
   const onStartTracking = async () => {
     const video = videoRef.current;
@@ -465,15 +547,27 @@ export default function VideoHandLab() {
         return;
       }
 
+      // Correcteur couleur bords (une fois au lock)
+      const skinResult = refineBackAnchorsFromFrame(
+        video,
+        video.videoWidth,
+        video.videoHeight,
+        anchors,
+      );
+      const lockAnchors = skinResult.ok ? skinResult.anchors : anchors;
+      const skinTag = skinResult.ok
+        ? 'lock peau OK'
+        : `lock sans couleur (${skinResult.reason})`;
+
       // Calibration produit + seuil exigeant (plusieurs passages → vert)
-      const cal = applyCalibration(anchors);
+      const cal = applyCalibration(lockAnchors);
       const grid = new CoverageGrid(THOROUGH_PIXEL_NEED);
       gridRef.current = grid;
       clearPaint();
 
       lockRef.current = {
         corners,
-        anchors: { ...anchors },
+        anchors: { ...lockAnchors },
         warp: cal.warp || warp,
         lastXf: null,
       };
@@ -485,8 +579,8 @@ export default function VideoHandLab() {
       setTracking(true);
       setCoverPct(0);
       setTouchedPct(0);
-      setStatus('Tracking + peinture multi-pass. Orangé = touché, vert = validé (plusieurs frottements).');
-      drawOverlay([], ANCHOR_ORDER.map((id) => anchors[id]).filter(Boolean), null, cal.warp || warp);
+      setStatus(`${skinTag} · tracking + peinture multi-pass.`);
+      drawOverlay([], liveOutlineFromWarp(cal.warp || warp), null, cal.warp || warp);
       drawMinimap([], cal.warp || warp);
     } catch (err) {
       setStatus(`Start tracking : ${String(err?.message || err)}`);
@@ -516,8 +610,8 @@ export default function VideoHandLab() {
     <div className="min-h-screen bg-nerv-black px-4 py-5 text-nerv-white">
       <div className="mx-auto flex max-w-5xl flex-col gap-4">
         <EmergencyBanner
-          text="LABO VIDÉO — SUIVI + COUVERTURE LIVE"
-          subtext="Heat sur le corps · validé = plusieurs passages. Session produit inchangée."
+          text="LABO VIDÉO — STAND-STILL + COUVERTURE"
+          subtext="PLAY → dos immobile ~1,5 s → pause + tracer → START. Session produit inchangée."
           severity="info"
           visible
         />
@@ -570,6 +664,8 @@ export default function VideoHandLab() {
               gridRef.current = null;
               clearPaint();
               setBackFollow(false);
+              onPause();
+              setStatus('Points effacés · PLAY puis clic = pause auto + tracer');
             }}
           >
             EFFACER POINTS
@@ -581,6 +677,7 @@ export default function VideoHandLab() {
 
         <p className="text-xs text-nerv-cyan" style={{ fontFamily: 'var(--font-nerv-mono)' }}>
           {videoLabel || 'pas de vidéo'}
+          {placing && !tracking && playing ? ` · stabilité ${Math.round(stillProgress * 100)}%` : ''}
           {placing ? ' · TRACER' : ''}
           {tracking ? (backFollow ? ' · TRACK dos+mains' : ' · TRACK (pose faible)') : ''}
           {tracking ? ` · validé ${coverPct}% · touché ${touchedPct}%` : ''}
@@ -612,7 +709,7 @@ export default function VideoHandLab() {
                     const v = event.currentTarget;
                     setVideoSize({ w: v.videoWidth, h: v.videoHeight });
                     syncOverlaySize();
-                    setStatus('PLAY pour trouver un dos stable → PAUSE → TRACER POINTS → START TRACKING');
+                    setStatus('1) PLAY · 2) dos immobile ~1,5 s → pause · 3) tracer · 4) START');
                   }}
                 />
                 <canvas ref={overlayRef} className="pointer-events-none absolute left-0 top-0 h-full w-full" />
@@ -655,7 +752,7 @@ export default function VideoHandLab() {
           >
             <canvas ref={minimapRef} width="240" height="320" className="mx-auto block max-w-full border border-nerv-green/30" />
             <p className="mt-3 text-xs text-nerv-white/60">
-              Orange = touché · vert = validé (×{Math.round(THOROUGH_PIXEL_NEED / 0.2)} frottements)
+              Orange = touché · vert = validé · centre dos + sévère
               {tracking ? ` · touché ${touchedPct}%` : ''}
             </p>
           </Card>

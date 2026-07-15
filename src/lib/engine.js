@@ -1,12 +1,14 @@
 /**
- * Moteur de session : HolisticLandmarker (pose + mains), calibration distance,
- * silhouette morphologique, zones anatomiques avec gestes animés.
+ * Moteur de session.
+ * Couverture = stack labo validé (?vidhands=1) :
+ * PoseLandmarker + HandLandmarker + torsoAffine → warp.toGenericUv.
+ * Ancien chemin Holistic / warpToLocked / handGate cascade : retiré de la peinture.
  */
 import { Voice, Beeper } from './voice.js';
 import { PoseTracker, LM, isBackTurned, OneEuro, BackOrientation, palmFromHand } from './pose.js';
 import {
   CoverageGrid, torsoFrame, backHalfWidth,
-  toBack, nearBackShape, coverageHeatRGBA, setShapeScale,
+  nearBackShape, coverageHeatRGBA, setShapeScale,
   setTracedContour, customBackOutlineUV, setCustomBackAnchors,
   setMinimapLayout, getMinimapLayout, paintUvFromWarpedPixel,
   getBackWarp,
@@ -17,14 +19,14 @@ import {
 } from './calibration.js';
 import { gapMessage, gapShort, calibrationVoice } from './tips.js';
 import { MaskLockAccumulator, LOCK_FRAMES } from './maskLock.js';
-import { warpToLocked, cloneFrame } from './backTemplate.js';
+import { cloneFrame } from './backTemplate.js';
 import {
   defaultAnchorsPx,
   capturePoseSignature, comparePoseSignature, shouldEnterCoverage,
 } from './anchorShape.js';
 import { applyCalibration } from './sessionCore.js';
 import { isDebugMinimap, minimapDebugInfo, setupMinimapCanvas, MINIMAP_CSS_W, MINIMAP_CSS_H } from './minimapCanvas.js';
-import { credibleBackHand, crediblePoseWrist, elbowBackContact, handContactPixels, ContactVelocityGate, handConfidence, updateCoachMode } from './handGate.js';
+import { ContactVelocityGate } from './handGate.js';
 import { BACK_ANCHOR_ORDER } from './backWarp.js';
 import {
   drawMinimapScene,
@@ -36,6 +38,12 @@ import {
   buildBackSilhouette, buildFallbackSilhouette, buildBackSilhouetteFromBytes,
   traceBackContour, drawBackSegmentationOverlay,
 } from './segmentation.js';
+import {
+  torsoAttachTransform,
+  torsoCornersFromPose,
+  blendAffineParams,
+} from './torsoAffine.js';
+import { contactsFromHandLandmarker } from './handLandmarker.js';
 
 export class SunCoachEngine {
   constructor({ video, overlay, minimap, onHud, onDone, onPhase, replaySource = null }) {
@@ -147,6 +155,8 @@ export class SunCoachEngine {
       droite: { u: new OneEuro(), v: new OneEuro() },
     };
     this.contactGate = new ContactVelocityGate();
+    /** @type {{ corners: any, lastXf: any, xfSmooth: any }|null} */
+    this.torsoLock = null;
 
     this.state = 'placement';
     this.onHud(0, 'PLACEMENT…');
@@ -197,6 +207,7 @@ export class SunCoachEngine {
     const W = this.overlay.width, H = this.overlay.height;
     const lm = track.pose2D;
     const P = lm ? lm.map((p) => ({ x: p.x * W, y: p.y * H, visibility: p.visibility })) : null;
+    this._lastP = P;
     const frame = this._smoothTorso(P ? torsoFrame(P) : null);
 
     if (P) {
@@ -596,7 +607,7 @@ export class SunCoachEngine {
     }
   }
 
-  /** Contact → UV peinture (warp générique si actif). null = hors silhouette. */
+  /** Contact → UV peinture (legacy helper — paint path labo n’utilise plus ceci). */
   _toPaintUv(warpedPx, backU, backV) {
     return paintUvFromWarpedPixel(warpedPx, backU, backV, getMinimapLayout());
   }
@@ -611,6 +622,16 @@ export class SunCoachEngine {
     this.filters.gauche.v.reset();
     this.filters.droite.u.reset();
     this.filters.droite.v.reset();
+
+    // Lock torse sur la pose LIVE (après reposition), pas la photo figée
+    const pose = this._lastP || this.lockPoseP || this.frozenPoseP;
+    const corners = pose ? torsoCornersFromPose(pose, LM) : null;
+    this.torsoLock = {
+      corners,
+      lastXf: null,
+      xfSmooth: null,
+    };
+
     this.state = 'coverage';
     this.coverageStartedAt = performance.now();
     this.lastCaptureHintTs = this.coverageStartedAt + 6000;
@@ -625,67 +646,68 @@ export class SunCoachEngine {
     );
   }
 
-  // ---------------------------------------------------------------- couverture
+  // ---------------------------------------------------------------- couverture (stack labo — source de vérité : ?vidhands=1)
 
-  /** Zone torse + nuque (main qui monte au-dessus des épaules). */
-  _pointNearTorso(p, frame) {
-    const dx = p.x - frame.origin.x;
-    const dy = p.y - frame.origin.y;
-    const localX = dx * frame.ex.x + dy * frame.ex.y;
-    const localY = dx * frame.ey.x + dy * frame.ey.y;
-    return (
-      Math.abs(localX) <= frame.width * 0.65 &&
-      localY >= -frame.height * 0.38 &&
-      localY <= frame.height * 1.08
-    );
-  }
+  /**
+   * Contacts Hand Landmarker → UV générique via affine inverse (labo).
+   * Pas de Holistic / warpToLocked / cascade poignet-coude.
+   */
+  _getCoverageContactsLab(track, P, W, H, ts) {
+    const warp = getBackWarp();
+    if (!warp || !P) return [];
 
-  /** Contacts live projetés dans le repère figé du scan. */
-  _getCoverageContacts(track, P, liveFrame, lockedFrame, W, H, ts) {
-    if (!lockedFrame || !P) return [];
-    const out = [];
-
-    const defs = [
-      { hand: track.leftHand2D, poseWrist: LM.L_WRIST, name: 'gauche' },
-      { hand: track.rightHand2D, poseWrist: LM.R_WRIST, name: 'droite' },
-    ];
-
-    for (const d of defs) {
-      let rawPoints = [];
-
-      if (d.hand?.length >= 21 && credibleBackHand(d.hand, P[d.poseWrist], P, W, H)) {
-        rawPoints = handContactPixels(d.hand, W, H);
-      }
-
-      if (!rawPoints.length) {
-        const w = P[d.poseWrist];
-        if (crediblePoseWrist(w, P)) rawPoints = [w];
-      }
-
-      if (!rawPoints.length) {
-        const est = elbowBackContact(P, d.name);
-        if (est) rawPoints = [est];
-      }
-
-      const f = this.filters[d.name];
-      for (const p of rawPoints) {
-        const warped = liveFrame ? warpToLocked(p, liveFrame, lockedFrame) : p;
-        if (!this._pointNearTorso(warped, lockedFrame)) continue;
-        const raw = toBack(warped, lockedFrame);
-        const layoutUv = this._toPaintUv(warped, raw.u, raw.v);
-        if (!layoutUv) continue;
-        const sm = this.contactGate.clamp(d.name, f.u.filter(layoutUv.u, ts), f.v.filter(layoutUv.v, ts));
-        out.push({ name: d.name, u: sm.u, v: sm.v });
+    let toWarpPixel = (p) => p;
+    const lock = this.torsoLock;
+    if (lock?.corners) {
+      const liveCorners = torsoCornersFromPose(P, LM);
+      if (liveCorners) {
+        let xf = torsoAttachTransform(lock.corners, liveCorners);
+        if (xf?.ok) {
+          if (xf.kind === 'affine') {
+            xf = blendAffineParams(lock.xfSmooth, xf, 0.25) || xf;
+            if (xf.kind === 'affine') lock.xfSmooth = xf;
+          } else {
+            lock.xfSmooth = null;
+          }
+          lock.lastXf = xf;
+        } else if (lock.lastXf) {
+          xf = lock.lastXf;
+        }
+        if (xf) toWarpPixel = (p) => xf.inv(p);
+      } else if (lock.lastXf) {
+        toWarpPixel = (p) => lock.lastXf.inv(p);
       }
     }
-    return out;
+
+    const out = contactsFromHandLandmarker(
+      track.handLandmarkerResult,
+      W,
+      H,
+      warp,
+      'session-lab',
+      { toWarpPixel },
+    );
+
+    const painting = [];
+    for (const c of out.contacts) {
+      if (!c.uv) continue;
+      const name = c.name === 'gauche' || c.name === 'droite' ? c.name : 'droite';
+      const f = this.filters[name] || this.filters.droite;
+      const sm = this.contactGate.clamp(
+        name,
+        f.u.filter(c.uv.u, ts),
+        f.v.filter(c.uv.v, ts),
+      );
+      painting.push({ name, u: sm.u, v: sm.v });
+    }
+    return painting;
   }
 
   _coverageTick(P, track, frame, ts, dt) {
     const W = this.overlay.width;
     const H = this.overlay.height;
 
-    if (!P || !frame) {
+    if (!P) {
       this.beeper.setPaintActivity('off');
       this.onHud(this.grid.paintedRatio, 'RECHERCHE DU TORSE…');
       return;
@@ -706,19 +728,16 @@ export class SunCoachEngine {
       return;
     }
 
-    const paintFrame = this.calibrationFrame || frame;
-    const contacts = this._getCoverageContacts(
-      track, P, frame, paintFrame, W, H, ts
-    );
+    // Si pas de corners au start, tente un lock tardif (reposture)
+    if (this.torsoLock && !this.torsoLock.corners) {
+      const late = torsoCornersFromPose(P, LM);
+      if (late) this.torsoLock.corners = late;
+    }
 
-    const confL = handConfidence(track.leftHand2D, P, LM.L_WRIST, LM.L_ELBOW);
-    const confR = handConfidence(track.rightHand2D, P, LM.R_WRIST, LM.R_ELBOW);
-    this.coachMode = updateCoachMode(Math.max(confL, confR), this.coachMode);
+    const contacts = this._getCoverageContactsLab(track, P, W, H, ts);
+    this.coachMode = contacts.length ? 'precise' : 'precise';
 
     const painting = contacts.filter((h) => nearBackShape(h.u, h.v));
-
-    // Même avec une confiance faible, ne jamais colorier une zone anatomique
-    // entière : seule la position estimée de la main alimente le pinceau.
     const { added, crossed } = this.grid.update(painting, dt);
 
     if (crossed > 0 || added > dt * 0.25) this.lastPaintTs.new = ts;
@@ -729,14 +748,14 @@ export class SunCoachEngine {
     this.beeper.tick(ts);
 
     if (
-      contacts.length > 0 &&
+      (track.handLandmarkerResult?.landmarks?.length > 0) &&
       painting.length === 0 &&
       (this.lastPaintTs.new === 0 || ts - this.lastPaintTs.new > 8000) &&
       ts - this.lastCaptureHintTs > 12000
     ) {
       this.lastCaptureHintTs = ts;
       this.voice.say(
-        'Je vois ton bras mais pas sur le dos enregistré. Reste dos à la caméra, frotte lentement.',
+        'Je vois une main mais pas sur le dos enregistré. Reste dos à la caméra, frotte lentement.',
         { queue: true }
       );
     } else if (
@@ -761,7 +780,6 @@ export class SunCoachEngine {
     const painted = this.grid.paintedRatio;
     const pct = Math.round(painted * 100);
     const gap = this.grid.biggestGap();
-    const modeLabel = this.coachMode === 'degraded' ? ' · MAIN ESTIMÉE' : '';
 
     if (pct >= 0.5 && this.lastMilestone < 0.5) {
       this.lastMilestone = 0.5;
@@ -773,7 +791,7 @@ export class SunCoachEngine {
       if (elapsedSec >= MIN_COVERAGE_SEC) return this._finish();
     }
 
-    this.onHud(painted, (gap ? gapShort(gap) : `${pct} % COUVERT`) + modeLabel);
+    this.onHud(painted, gap ? gapShort(gap) : `${pct} % COUVERT`);
 
     const elapsed = ts - this.freePaintSince;
     if (
@@ -1198,14 +1216,20 @@ export class SunCoachEngine {
       }
     }
 
-    // Paumes Holistic (plus précises).
-    const drawHand2D = (hand, color) => {
-      if (!hand || !hand.length) return;
+    // Paumes Hand Landmarker (stack labo)
+    const hands = track.handLandmarkerResult?.landmarks ?? [];
+    const handed = track.handLandmarkerResult?.handedness ?? [];
+    for (let i = 0; i < hands.length; i++) {
+      const hand = hands[i];
+      const label = handed[i]?.[0]?.categoryName?.toLowerCase?.() || '';
+      const color = label.includes('left')
+        ? 'rgba(0, 255, 255, 0.45)'
+        : 'rgba(255, 0, 255, 0.45)';
       const palm = palmFromHand(hand.map((p) => ({
         x: p.x * W, y: p.y * H, z: p.z ?? 0,
-        visibility: p.visibility ?? p.presence ?? 0,
+        visibility: p.visibility ?? p.presence ?? 1,
       })));
-      if (!palm) return;
+      if (!palm) continue;
       ctx.beginPath();
       ctx.arc(palm.x, palm.y, 14, 0, Math.PI * 2);
       ctx.fillStyle = color;
@@ -1213,12 +1237,6 @@ export class SunCoachEngine {
       ctx.strokeStyle = '#FFFFFF';
       ctx.lineWidth = 2;
       ctx.stroke();
-    };
-    if (track.leftHand2D) {
-      drawHand2D(track.leftHand2D, 'rgba(0, 255, 255, 0.45)');
-    }
-    if (track.rightHand2D) {
-      drawHand2D(track.rightHand2D, 'rgba(255, 0, 255, 0.45)');
     }
   }
 }
