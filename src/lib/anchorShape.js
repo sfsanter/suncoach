@@ -4,7 +4,7 @@
 import { LM } from './pose.js';
 import { BACK_ANCHOR_ORDER as ANCHOR_ORDER } from './backWarp.js';
 
-/** Positions initiales sur la photo : proches des landmarks, sans deltoïde « gonflé ». */
+/** Positions initiales sur la photo : silhouette dos naturelle (trapèze → taille). */
 export function defaultAnchorsPx(P, W, H) {
   const ls = P[LM.L_SHOULDER];
   const rs = P[LM.R_SHOULDER];
@@ -13,24 +13,38 @@ export function defaultAnchorsPx(P, W, H) {
   if (!ls || !rs || !lh || !rh) return null;
 
   const sw = Math.hypot(rs.x - ls.x, rs.y - ls.y);
-  const midX = (ls.x + rs.x) / 2;
+  const midShoulderX = (ls.x + rs.x) / 2;
+  const midHipX = (lh.x + rh.x) / 2;
   const topY = Math.min(ls.y, rs.y);
+  const out = sw * 0.02;
+
+  // Côtés = interpolaison épaule→hanche (rétrécit sans piquer au centre).
+  const sideAt = (t, outward) => {
+    const lx = ls.x + (lh.x - ls.x) * t;
+    const ly = ls.y + (lh.y - ls.y) * t;
+    const rx = rs.x + (rh.x - rs.x) * t;
+    const ry = rs.y + (rh.y - rs.y) * t;
+    return {
+      g: { x: lx - outward, y: ly },
+      d: { x: rx + outward, y: ry },
+    };
+  };
+  const mid = sideAt(0.38, out * 1.1);
+  const rein = sideAt(0.72, out * 0.35);
   const botY = Math.max(lh.y, rh.y);
-  const th = Math.max(sw, botY - topY);
-  // Légère inset vers la colonne : le bord du dos est souvent un peu
-  // à l’intérieur du landmark épaule MediaPipe (tête humérale).
-  const inset = sw * 0.02;
-  const out = sw * 0.015;
 
   return {
-    nuque: { x: midX, y: topY - sw * 0.08 },
-    epaule_g: { x: ls.x - out, y: ls.y + inset },
-    epaule_d: { x: rs.x + out, y: rs.y + inset },
-    milieu_g: { x: ls.x - sw * 0.03, y: topY + th * 0.38 },
-    milieu_d: { x: rs.x + sw * 0.03, y: topY + th * 0.38 },
-    rein_g: { x: ls.x + sw * 0.04, y: topY + th * 0.68 },
-    rein_d: { x: rs.x - sw * 0.04, y: topY + th * 0.68 },
-    bas: { x: midX, y: botY + sw * 0.02 },
+    nuque: { x: midShoulderX, y: topY - sw * 0.08 },
+    epaule_g: { x: ls.x - out, y: ls.y + sw * 0.02 },
+    epaule_d: { x: rs.x + out, y: rs.y + sw * 0.02 },
+    milieu_g: mid.g,
+    milieu_d: mid.d,
+    rein_g: rein.g,
+    rein_d: rein.d,
+    bas: {
+      x: midHipX * 0.65 + midShoulderX * 0.35,
+      y: botY + sw * 0.015,
+    },
   };
 }
 

@@ -212,14 +212,30 @@ export function refineAnchorsBySkin(anchors, imageData, W, H, skin) {
 
   // Soft blend (évite gros sauts)
   const blended = {};
+  const midX = ((anchors.epaule_g?.x ?? 0) + (anchors.epaule_d?.x ?? 0)) / 2;
   for (const id of BACK_ANCHOR_ORDER) {
     const a = anchors[id];
     const b = out[id];
     if (!a || !b) return null;
-    blended[id] = {
-      x: a.x * 0.35 + b.x * 0.65,
-      y: a.y * 0.35 + b.y * 0.65,
-    };
+    let x = a.x * 0.35 + b.x * 0.65;
+    let y = a.y * 0.35 + b.y * 0.65;
+
+    // Reins / milieux : interdire un snap vers la colonne (crée une pique bas-dos).
+    if (id === 'rein_g' || id === 'milieu_g') {
+      x = Math.min(x, a.x); // rester à gauche (ou égal)
+      const minOut = midX - sw * 0.16;
+      x = Math.min(x, minOut);
+    } else if (id === 'rein_d' || id === 'milieu_d') {
+      x = Math.max(x, a.x);
+      const maxOut = midX + sw * 0.16;
+      x = Math.max(x, maxOut);
+    } else if (id === 'bas') {
+      // Garder le bas centré ; limiter tirage vertical bizarre.
+      x = midX * 0.5 + x * 0.5;
+      y = Math.max(y, a.y - sw * 0.04);
+    }
+
+    blended[id] = { x, y };
   }
   return blended;
 }
