@@ -55,7 +55,7 @@ function formatSessionStartError(err, isReplay) {
       return 'VIDÉO ILLISIBLE — ESSAIE UN FICHIER .MP4 H.264 (PAS .MOV HEVC IPHONE).';
     }
     if (/fetch|network|Failed to load|Load failed|wasm|model/i.test(msg)) {
-      return 'MODÈLE IA NON TÉLÉCHARGÉ — VÉRIFIE LA CONNEXION (1ère fois ~15 Mo).';
+      return 'MODÈLE IA NON TÉLÉCHARGÉ — VÉRIFIE LA CONNEXION (1ère fois ~13 Mo).';
     }
     return 'REPLAY IMPOSSIBLE — VÉRIFIE LE FICHIER VIDÉO.';
   }
@@ -63,7 +63,7 @@ function formatSessionStartError(err, isReplay) {
     return 'ACCÈS CAMÉRA REFUSÉ — AUTORISE LA CAMÉRA POUR SAFARI/CHROME (Réglages système sur Mac).';
   }
   if (/fetch|network|Failed to load|Load failed|wasm|model/i.test(msg)) {
-    return 'MODÈLE IA NON TÉLÉCHARGÉ — VÉRIFIE LA 4G/WIFI (besoin internet 1ère fois, ~15 Mo).';
+    return 'MODÈLE IA NON TÉLÉCHARGÉ — VÉRIFIE LA 4G/WIFI (besoin internet 1ère fois, ~13 Mo).';
   }
   if (
     name === 'CameraTimeoutError' ||
@@ -107,6 +107,12 @@ export default function App() {
 
   useEffect(() => {
     if (minimapLabMode) return undefined;
+    // Accueil caméra : pas de téléchargement IA (~40 Mo) — charge au Start.
+    // Mode test / replay / vidéo : précharge pour débloquer les boutons.
+    if (!(testMode || replayMode)) {
+      setModelStatus('ok');
+      return undefined;
+    }
     let cancelled = false;
     preloadSessionVision()
       .then(() => { if (!cancelled) setModelStatus('ok'); })

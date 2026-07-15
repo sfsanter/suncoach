@@ -2,11 +2,11 @@
  * PoseLandmarker VIDEO — session + labo accroche dos.
  * Remplace Holistic pour la pose live.
  */
-import { FilesetResolver, PoseLandmarker } from '@mediapipe/tasks-vision';
+import { PoseLandmarker } from '@mediapipe/tasks-vision';
 import { LM } from './pose.js';
 import { torsoFrame } from './coverage.js';
+import { getVisionFileset } from './visionFileset.js';
 
-const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
 const POSE_MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
 
@@ -22,7 +22,7 @@ function preferCpuDelegate() {
 }
 
 async function createVideoPose() {
-  const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
+  const fileset = await getVisionFileset();
   const options = (delegate) => ({
     baseOptions: { modelAssetPath: POSE_MODEL_URL, delegate },
     runningMode: 'VIDEO',

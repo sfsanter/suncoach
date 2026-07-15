@@ -98,7 +98,7 @@ export class SunCoachEngine {
     this._released = false;
     this.voice.unlock();
     this.beeper.unlock();
-    this.onHud(0, 'TÉLÉCHARGEMENT DU MODÈLE…');
+    this.onHud(0, 'TÉLÉCHARGEMENT IA (~13 Mo, 1re fois)…');
     if (!this.tracker.landmarker) await this.tracker.init();
     if (this.replaySource) {
       this.onHud(0, 'CHARGEMENT DE LA VIDÉO…');
@@ -107,6 +107,8 @@ export class SunCoachEngine {
       this.onHud(0, 'DÉMARRAGE DE LA CAMÉRA…');
       await this.tracker.startCamera();
     }
+    // Segmenter lock (~16 Mo) en arrière-plan pendant le placement
+    this.tracker.prefetchSegmenter();
 
     if (this.minimap) {
       const setup = setupMinimapCanvas(this.minimap);
@@ -380,6 +382,7 @@ export class SunCoachEngine {
     const H = this.overlay.height;
     this.maskLock = new MaskLockAccumulator(W, H);
     this.tracker.aiSegEnabled = true;
+    this.tracker.prefetchSegmenter();
     this.onHud(0, 'SCAN IA DU DOS… RESTE IMMOBILE');
     this.voice.say(
       'Parfait. Reste immobile, je prends une photo et je scanne ton dos.',

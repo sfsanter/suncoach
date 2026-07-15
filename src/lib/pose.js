@@ -3,8 +3,9 @@
  * Session produit : PoseLandmarker + HandLandmarker (stack labo validé).
  * Holistic reste dispo pour labs frames (IMAGE) uniquement.
  */
-import { FilesetResolver, HolisticLandmarker } from '@mediapipe/tasks-vision';
-import { BodySegmenter, preloadBodySegmenter } from './bodySegmenter.js';
+import { HolisticLandmarker } from '@mediapipe/tasks-vision';
+import { BodySegmenter } from './bodySegmenter.js';
+import { getVisionFileset } from './visionFileset.js';
 
 export const LM = {
   NOSE: 0,
@@ -26,7 +27,6 @@ export const HM = {
   MIDDLE_TIP: 12,
 };
 
-const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
 const MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/1/holistic_landmarker.task';
 
@@ -43,7 +43,7 @@ function preferCpuDelegate() {
 }
 
 async function createLandmarker() {
-  const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
+  const fileset = await getVisionFileset();
   const options = (delegate) => ({
     baseOptions: { modelAssetPath: MODEL_URL, delegate },
     runningMode: 'VIDEO',
@@ -72,7 +72,10 @@ export function preloadPose() {
   return landmarkerPromise;
 }
 
-/** Précharge modèles session live (Pose + Hands + segmenter) — plus Holistic. */
+/**
+ * Précharge Pose + Hands (~13 Mo modèles + WASM partagé).
+ * Pas de BodySegmenter ici — trop lourd (~16 Mo), chargé pendant le placement.
+ */
 export async function preloadSessionVision() {
   const [{ preloadVideoPose }, { preloadVideoHandLandmarker }] = await Promise.all([
     import('./poseVideo.js'),
@@ -81,14 +84,13 @@ export async function preloadSessionVision() {
   return Promise.all([
     preloadVideoPose(),
     preloadVideoHandLandmarker(),
-    preloadBodySegmenter().catch(() => null),
   ]);
 }
 
 let imageLandmarkerPromise = null;
 
 async function createImageLandmarker() {
-  const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
+  const fileset = await getVisionFileset();
   const options = (delegate) => ({
     baseOptions: { modelAssetPath: MODEL_URL, delegate },
     runningMode: 'IMAGE',
@@ -233,7 +235,12 @@ export class PoseTracker {
       console.warn('[SunCoach] Hand Landmarker init failed:', err);
       this.handLm = null;
     }
-    this.bodySegmenter.init().catch((err) => {
+    // BodySegmenter (~16 Mo) : prefetchSegmenter() pendant le placement, pas ici.
+  }
+
+  /** Télécharge le segmenter en fond pendant le placement (avant le lock IA). */
+  prefetchSegmenter() {
+    return this.bodySegmenter.init().catch((err) => {
       console.warn('[SunCoach] Body segmenter init failed (non-fatal):', err);
     });
   }

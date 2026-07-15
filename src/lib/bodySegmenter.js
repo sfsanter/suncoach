@@ -2,9 +2,9 @@
  * MediaPipe Image Segmenter (selfie_multiclass) — segmentation IA dédiée,
  * plus récente que le masque Holistic. Gratuit, local, même package npm.
  */
-import { FilesetResolver, ImageSegmenter } from '@mediapipe/tasks-vision';
+import { ImageSegmenter } from '@mediapipe/tasks-vision';
+import { getVisionFileset } from './visionFileset.js';
 
-const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
 const MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite';
 
@@ -24,7 +24,7 @@ export function preloadBodySegmenter() {
 }
 
 async function createSegmenter() {
-  const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
+  const fileset = await getVisionFileset();
   const opts = (delegate) => ({
     baseOptions: { modelAssetPath: MODEL_URL, delegate },
     runningMode: 'VIDEO',
