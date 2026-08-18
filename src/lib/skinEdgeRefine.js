@@ -1,18 +1,17 @@
 /**
  * Correcteur bords par couleur peau — une fois au lock (pas 60 fps).
- * Les 8 ancres restent la structure ; on les snappe le long de la normale sortante
- * tant que la couleur reste proche de l’échantillon intérieur.
+ * Marche depuis l’intérieur (peau connue) vers l’extérieur jusqu’à la
+ * rupture de couleur = silhouette réelle. Les joints MediaPipe sont trop
+ * « dedans » : on autorise une poussée large.
  */
 import { BACK_ANCHOR_ORDER } from './backWarp.js';
 
-/** Max push / pull as fraction of shoulder width. */
-const MAX_PUSH_FRAC = 0.07;
-/** Lab distance threshold (~10–18 = peau vs tissu/cheveux). */
-const LAB_THRESH = 14;
-/** Patch radius (px) for averaging. */
-const SAMPLE_R = 4;
-/** Steps along each normal. */
-const NORMAL_STEPS = 12;
+/** Recherche max le long de la normale (fraction largeur d’épaules). */
+const MAX_PUSH_FRAC = 0.32;
+/** Lab : peau vs fond / vêtement. Un peu large (lumière téléphone). */
+const LAB_THRESH = 18;
+const SAMPLE_R = 3;
+const NORMAL_STEPS = 28;
 
 function srgbToLinear(c) {
   const x = c / 255;
@@ -37,7 +36,6 @@ function fLab(t) {
 /** RGB 0–255 → Lab (D65). */
 export function rgbToLab(r, g, b) {
   const { x, y, z } = rgbToXyz(r, g, b);
-  // D65 white
   const fx = fLab(x / 0.95047);
   const fy = fLab(y / 1);
   const fz = fLab(z / 1.08883);
@@ -81,20 +79,6 @@ function sampleLabAt(data, W, H, x, y, r = SAMPLE_R) {
   return { L: L / n, a: a / n, b: b / n };
 }
 
-function pointInPoly(px, py, poly) {
-  let inside = false;
-  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-    const xi = poly[i].x;
-    const yi = poly[i].y;
-    const xj = poly[j].x;
-    const yj = poly[j].y;
-    const intersect = ((yi > py) !== (yj > py))
-      && (px < ((xj - xi) * (py - yi)) / (yj - yi + 1e-9) + xi);
-    if (intersect) inside = !inside;
-  }
-  return inside;
-}
-
 function orderedAnchors(anchors) {
   return BACK_ANCHOR_ORDER.map((id) => ({ id, ...(anchors[id] || {}) }))
     .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
@@ -131,7 +115,7 @@ export function sampleSkinFromPolygon(imageData, W, H, anchors) {
       : null,
     anchors.rein_g && anchors.rein_d
       ? {
-        x: (anchors.rein_g.x + anchors.rein_d.x) * 0.5 * 0.7 + cx * 0.3,
+        x: (anchors.rein_g.x + anchors.rein_d.x) / 2,
         y: (anchors.rein_g.y + anchors.rein_d.y) / 2,
       }
       : null,
@@ -139,7 +123,7 @@ export function sampleSkinFromPolygon(imageData, W, H, anchors) {
 
   const labs = [];
   for (const s of samples) {
-    if (!pointInPoly(s.x, s.y, poly)) continue;
+    // Centre-dos : toujours échantillonner, même si le poly de départ est petit.
     const lab = sampleLabAt(imageData.data, W, H, s.x, s.y, SAMPLE_R + 2);
     if (lab) labs.push(lab);
   }
@@ -151,9 +135,6 @@ export function sampleSkinFromPolygon(imageData, W, H, anchors) {
   };
 }
 
-/**
- * Normale sortante en ancre i (polygone CCW/CW — on oriente vers l’extérieur via centroïde).
- */
 function outwardNormal(poly, index, centroid) {
   const n = poly.length;
   const prev = poly[(index - 1 + n) % n];
@@ -161,7 +142,6 @@ function outwardNormal(poly, index, centroid) {
   const tx = next.x - prev.x;
   const ty = next.y - prev.y;
   const len = Math.hypot(tx, ty) || 1;
-  // Deux perpendiculaires ; garder celle qui s’éloigne du centre
   let nx = -ty / len;
   let ny = tx / len;
   const p = poly[index];
@@ -174,7 +154,32 @@ function outwardNormal(poly, index, centroid) {
 }
 
 /**
- * Snap chaque ancre le long de la normale : point le plus loin encore « peau ».
+ * Depuis un point intérieur, avance le long de la normale jusqu’à la
+ * dernière position encore « peau ».
+ */
+function walkOutToSkinEdge(data, W, H, start, normal, maxPush, skin) {
+  const step = maxPush / NORMAL_STEPS;
+  let lastSkin = { x: start.x, y: start.y };
+  let seenSkin = false;
+  for (let s = 0; s <= NORMAL_STEPS; s++) {
+    const t = s * step;
+    const x = clamp(start.x + normal.x * t, 0, W - 1);
+    const y = clamp(start.y + normal.y * t, 0, H - 1);
+    const lab = sampleLabAt(data, W, H, x, y);
+    if (!lab) break;
+    if (labDist(lab, skin) <= LAB_THRESH) {
+      lastSkin = { x, y };
+      seenSkin = true;
+      continue;
+    }
+    if (seenSkin) break;
+  }
+  return seenSkin ? lastSkin : null;
+}
+
+/**
+ * Snap chaque ancre : intérieur → bord peau. Ne jamais rentrer vers la colonne
+ * par rapport au départ (filet « trop petit »).
  */
 export function refineAnchorsBySkin(anchors, imageData, W, H, skin) {
   if (!skin || !imageData?.data) return null;
@@ -187,58 +192,47 @@ export function refineAnchorsBySkin(anchors, imageData, W, H, skin) {
   const cy = ordered.reduce((s, p) => s + p.y, 0) / ordered.length;
   const centroid = { x: cx, y: cy };
 
-  const out = {};
+  const snapped = {};
   for (let i = 0; i < ordered.length; i++) {
     const p = ordered[i];
     const n = outwardNormal(ordered, i, centroid);
-    let best = { x: p.x, y: p.y };
-    // Du plus extérieur → intérieur : dernier match = le plus loin encore peau
-    let found = false;
-    for (let s = NORMAL_STEPS; s >= -Math.floor(NORMAL_STEPS * 0.35); s--) {
-      const t = (s / NORMAL_STEPS) * maxPush;
-      const x = clamp(p.x + n.x * t, 0, W - 1);
-      const y = clamp(p.y + n.y * t, 0, H - 1);
-      const lab = sampleLabAt(imageData.data, W, H, x, y);
-      if (!lab) continue;
-      if (labDist(lab, skin) <= LAB_THRESH) {
-        best = { x, y };
-        found = true;
-        break;
-      }
-    }
-    if (!found) best = { x: p.x, y: p.y };
-    out[p.id] = best;
+    // Recule un peu vers le centre pour partir de peau sûre, puis marche dehors.
+    const start = {
+      x: p.x - n.x * sw * 0.08,
+      y: p.y - n.y * sw * 0.08,
+    };
+    const edge = walkOutToSkinEdge(imageData.data, W, H, start, n, maxPush, skin);
+    snapped[p.id] = edge || { x: p.x, y: p.y };
   }
 
-  // Soft blend — côtés : ne garder que le snap PLUS extérieur (vers le bord peau).
-  const blended = {};
   const midX = ((anchors.epaule_g?.x ?? 0) + (anchors.epaule_d?.x ?? 0)) / 2;
+  const out = {};
+  const leftIds = new Set(['epaule_g', 'milieu_g', 'rein_g']);
+  const rightIds = new Set(['epaule_d', 'milieu_d', 'rein_d']);
+
   for (const id of BACK_ANCHOR_ORDER) {
     const a = anchors[id];
-    const b = out[id];
+    const b = snapped[id];
     if (!a || !b) return null;
-    let x = a.x * 0.25 + b.x * 0.75;
-    let y = a.y * 0.25 + b.y * 0.75;
+    let x = b.x;
+    let y = b.y;
 
-    if (id === 'rein_g' || id === 'milieu_g' || id === 'epaule_g') {
-      // Gauche = x plus petit = plus dehors
+    if (leftIds.has(id)) {
       x = Math.min(a.x, b.x);
-      x = Math.min(x, midX - sw * 0.14);
-    } else if (id === 'rein_d' || id === 'milieu_d' || id === 'epaule_d') {
+    } else if (rightIds.has(id)) {
       x = Math.max(a.x, b.x);
-      x = Math.max(x, midX + sw * 0.14);
     } else if (id === 'bas') {
-      x = midX * 0.7 + x * 0.3;
-      // Ne pas allonger le triangle vers le bas.
+      x = midX;
       const reinY = Math.max(anchors.rein_g?.y ?? a.y, anchors.rein_d?.y ?? a.y);
-      y = Math.min(Math.max(y, a.y), reinY + sw * 0.14);
+      y = clamp(Math.max(a.y, b.y), reinY, reinY + sw * 0.12);
     } else if (id === 'nuque') {
+      x = midX * 0.35 + ((a.x + b.x) / 2) * 0.65;
       y = Math.min(a.y, b.y);
     }
 
-    blended[id] = { x, y };
+    out[id] = { x, y };
   }
-  return blended;
+  return out;
 }
 
 /**

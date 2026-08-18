@@ -19,10 +19,12 @@ export function defaultAnchorsPx(P, W, H) {
   const topY = Math.min(ls.y, rs.y);
   const botY = Math.max(lh.y, rh.y);
 
-  // Sortie peau (fraction largeur épaules) — volontairement généreux vs jointures.
-  const outSh = sw * 0.09;
-  const outMid = sw * 0.13;
-  const outRein = sw * 0.10;
+  // MediaPipe = centres d’articulation. Le bord peau du dos est nettement
+  // plus large (deltoïdes, lats, flancs). Ces offsets sont le filet si le
+  // snap couleur échoue — mieux trop large que trop petit.
+  const outSh = sw * 0.20;
+  const outMid = sw * 0.24;
+  const outRein = sw * 0.18;
 
   const sideAt = (t, outward) => {
     const lx = ls.x + (lh.x - ls.x) * t;
@@ -35,22 +37,20 @@ export function defaultAnchorsPx(P, W, H) {
     };
   };
 
-  const mid = sideAt(0.40, outMid);
-  // Reins près des hanches, larges (pas vers la colonne) → bas moins « en pointe ».
-  const rein = sideAt(0.82, outRein);
+  const mid = sideAt(0.42, outMid);
+  const rein = sideAt(0.88, outRein);
   const reinY = (rein.g.y + rein.d.y) / 2;
-  // Bas juste sous les reins (plat), pas un triangle long jusqu’aux hanches.
-  const basY = Math.min(botY + sw * 0.02, reinY + sw * 0.12);
+  const basY = reinY + sw * 0.08;
 
   return {
-    nuque: { x: midShoulderX, y: topY - sw * 0.06 },
-    epaule_g: { x: ls.x - outSh, y: ls.y + sw * 0.03 },
-    epaule_d: { x: rs.x + outSh, y: rs.y + sw * 0.03 },
+    nuque: { x: midShoulderX, y: topY - sw * 0.10 },
+    epaule_g: { x: ls.x - outSh, y: ls.y + sw * 0.04 },
+    epaule_d: { x: rs.x + outSh, y: rs.y + sw * 0.04 },
     milieu_g: mid.g,
     milieu_d: mid.d,
     rein_g: rein.g,
     rein_d: rein.d,
-    bas: { x: midHipX * 0.55 + midShoulderX * 0.45, y: basY },
+    bas: { x: midHipX * 0.5 + midShoulderX * 0.5, y: Math.min(botY + sw * 0.04, basY) },
   };
 }
 

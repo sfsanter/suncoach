@@ -15,14 +15,13 @@ export const BACK_ANCHOR_ORDER = [
 
 export const GENERIC_UV_ANCHORS = {
   nuque: { x: 0.50, y: 0.00 },
-  epaule_g: { x: 0.12, y: 0.14 },
-  epaule_d: { x: 0.88, y: 0.14 },
-  milieu_g: { x: 0.07, y: 0.48 },
-  milieu_d: { x: 0.93, y: 0.48 },
-  // Taille large (pas 0.18→pointe) ; bas proche des reins → trapèze plat.
-  rein_g: { x: 0.12, y: 0.84 },
-  rein_d: { x: 0.88, y: 0.84 },
-  bas: { x: 0.50, y: 0.94 },
+  epaule_g: { x: 0.08, y: 0.12 },
+  epaule_d: { x: 0.92, y: 0.12 },
+  milieu_g: { x: 0.04, y: 0.46 },
+  milieu_d: { x: 0.96, y: 0.46 },
+  rein_g: { x: 0.08, y: 0.86 },
+  rein_d: { x: 0.92, y: 0.86 },
+  bas: { x: 0.50, y: 0.95 },
 };
 
 /** Points intermédiaires nuque↔épaules — lissage léger, sans « bosse » deltoïde. */
