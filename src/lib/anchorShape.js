@@ -19,12 +19,10 @@ export function defaultAnchorsPx(P, W, H) {
   const topY = Math.min(ls.y, rs.y);
   const botY = Math.max(lh.y, rh.y);
 
-  // MediaPipe = centres d’articulation. Le bord peau du dos est nettement
-  // plus large (deltoïdes, lats, flancs). Ces offsets sont le filet si le
-  // snap couleur échoue — mieux trop large que trop petit.
-  const outSh = sw * 0.20;
-  const outMid = sw * 0.24;
-  const outRein = sw * 0.18;
+  // Entre joints (trop petit) et 20 %+ (trop grand).
+  const outSh = sw * 0.13;
+  const outMid = sw * 0.15;
+  const outRein = sw * 0.11;
 
   const sideAt = (t, outward) => {
     const lx = ls.x + (lh.x - ls.x) * t;

@@ -7,9 +7,9 @@
 import { BACK_ANCHOR_ORDER } from './backWarp.js';
 
 /** Recherche max le long de la normale (fraction largeur d’épaules). */
-const MAX_PUSH_FRAC = 0.32;
-/** Lab : peau vs fond / vêtement. Un peu large (lumière téléphone). */
-const LAB_THRESH = 18;
+const MAX_PUSH_FRAC = 0.22;
+/** Lab : peau vs fond / vêtement. */
+const LAB_THRESH = 16;
 const SAMPLE_R = 3;
 const NORMAL_STEPS = 28;
 
@@ -178,8 +178,8 @@ function walkOutToSkinEdge(data, W, H, start, normal, maxPush, skin) {
 }
 
 /**
- * Snap chaque ancre : intérieur → bord peau. Ne jamais rentrer vers la colonne
- * par rapport au départ (filet « trop petit »).
+ * Snap chaque ancre : depuis le centre-dos, marche jusqu’au bord peau.
+ * On fait confiance au snap (le filet « garder le défaut trop large » gonflait tout).
  */
 export function refineAnchorsBySkin(anchors, imageData, W, H, skin) {
   if (!skin || !imageData?.data) return null;
@@ -196,10 +196,9 @@ export function refineAnchorsBySkin(anchors, imageData, W, H, skin) {
   for (let i = 0; i < ordered.length; i++) {
     const p = ordered[i];
     const n = outwardNormal(ordered, i, centroid);
-    // Recule un peu vers le centre pour partir de peau sûre, puis marche dehors.
     const start = {
-      x: p.x - n.x * sw * 0.08,
-      y: p.y - n.y * sw * 0.08,
+      x: p.x - n.x * sw * 0.12,
+      y: p.y - n.y * sw * 0.12,
     };
     const edge = walkOutToSkinEdge(imageData.data, W, H, start, n, maxPush, skin);
     snapped[p.id] = edge || { x: p.x, y: p.y };
@@ -217,17 +216,16 @@ export function refineAnchorsBySkin(anchors, imageData, W, H, skin) {
     let x = b.x;
     let y = b.y;
 
-    if (leftIds.has(id)) {
-      x = Math.min(a.x, b.x);
-    } else if (rightIds.has(id)) {
-      x = Math.max(a.x, b.x);
+    if (leftIds.has(id) || rightIds.has(id)) {
+      x = a.x * 0.25 + b.x * 0.75;
+      y = a.y * 0.25 + b.y * 0.75;
     } else if (id === 'bas') {
       x = midX;
       const reinY = Math.max(anchors.rein_g?.y ?? a.y, anchors.rein_d?.y ?? a.y);
-      y = clamp(Math.max(a.y, b.y), reinY, reinY + sw * 0.12);
+      y = clamp(a.y * 0.4 + b.y * 0.6, reinY, reinY + sw * 0.10);
     } else if (id === 'nuque') {
-      x = midX * 0.35 + ((a.x + b.x) / 2) * 0.65;
-      y = Math.min(a.y, b.y);
+      x = midX * 0.4 + b.x * 0.6;
+      y = a.y * 0.35 + b.y * 0.65;
     }
 
     out[id] = { x, y };
