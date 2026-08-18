@@ -60,6 +60,17 @@ function wantManualAdjust() {
   }
 }
 
+/** Snap couleur peau : instable (fond mur/bois ≈ peau → contour qui gonfle).
+ *  Le contour auto est géométrique ; ce snap reste dispo pour tests. */
+function wantSkinSnap() {
+  if (typeof window === 'undefined') return false;
+  try {
+    return new URLSearchParams(window.location.search).has('skinsnap');
+  } catch {
+    return false;
+  }
+}
+
 /** Overlay heat live = trop lourd sur Safari/Chrome mobile. */
 function preferLiteLiveOverlay() {
   if (typeof window === 'undefined') return false;
@@ -529,24 +540,26 @@ export class SunCoachEngine {
     }
 
     let anchors = defaultAnchorsPx(P, W, H) || {};
-    try {
-      const maxSide = 512;
-      const scale = Math.min(1, maxSide / Math.max(W, H));
-      const rw = Math.max(1, Math.round(W * scale));
-      const rh = Math.max(1, Math.round(H * scale));
-      const scaled = {};
-      for (const [id, p] of Object.entries(anchors)) {
-        if (p) scaled[id] = { x: p.x * scale, y: p.y * scale };
-      }
-      const skin = refineBackAnchorsFromFrame(this.video, rw, rh, scaled);
-      if (skin?.ok && skin.anchors) {
-        anchors = {};
-        for (const [id, p] of Object.entries(skin.anchors)) {
-          if (p) anchors[id] = { x: p.x / scale, y: p.y / scale };
+    if (wantSkinSnap()) {
+      try {
+        const maxSide = 512;
+        const scale = Math.min(1, maxSide / Math.max(W, H));
+        const rw = Math.max(1, Math.round(W * scale));
+        const rh = Math.max(1, Math.round(H * scale));
+        const scaled = {};
+        for (const [id, p] of Object.entries(anchors)) {
+          if (p) scaled[id] = { x: p.x * scale, y: p.y * scale };
         }
+        const skin = refineBackAnchorsFromFrame(this.video, rw, rh, scaled);
+        if (skin?.ok && skin.anchors) {
+          anchors = {};
+          for (const [id, p] of Object.entries(skin.anchors)) {
+            if (p) anchors[id] = { x: p.x / scale, y: p.y / scale };
+          }
+        }
+      } catch (err) {
+        console.warn('[SunCoach] skin refine skipped:', err);
       }
-    } catch (err) {
-      console.warn('[SunCoach] skin refine skipped:', err);
     }
 
     this.frozenMask = null;

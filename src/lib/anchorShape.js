@@ -3,10 +3,14 @@
  */
 import { LM } from './pose.js';
 import { BACK_ANCHOR_ORDER as ANCHOR_ORDER } from './backWarp.js';
+import { getContourScale, scaleAnchors } from './contourScale.js';
 
-/** Positions initiales : landmarks MediaPipe = centres d’articulation (trop « dedans »).
- *  On pousse les côtés vers le bord peau, et on évite un bas en pointe. */
-export function defaultAnchorsPx(P, W, H) {
+/**
+ * Contour dos déterministe : axe rachidien (milieu épaules → milieu hanches) et
+ * demi-largeurs prises sur les landmarks eux-mêmes. Aucune mesure couleur, donc
+ * insensible au fond et à la lumière : à pose égale, contour égal.
+ */
+export function defaultAnchorsPx(P, W, H, scale = getContourScale()) {
   const ls = P[LM.L_SHOULDER];
   const rs = P[LM.R_SHOULDER];
   const lh = P[LM.L_HIP];
@@ -14,42 +18,62 @@ export function defaultAnchorsPx(P, W, H) {
   if (!ls || !rs || !lh || !rh) return null;
 
   const sw = Math.hypot(rs.x - ls.x, rs.y - ls.y);
-  const midShoulderX = (ls.x + rs.x) / 2;
-  const midHipX = (lh.x + rh.x) / 2;
-  const topY = Math.min(ls.y, rs.y);
-  const botY = Math.max(lh.y, rh.y);
+  if (!(sw > 1)) return null;
 
-  // Entre joints (trop petit) et 20 %+ (trop grand).
-  const outSh = sw * 0.13;
-  const outMid = sw * 0.15;
-  const outRein = sw * 0.11;
+  // Largeurs mesurées sur la pose : acromions en haut, hanches en bas.
+  // Le haut du dos s’arrête quasiment aux acromions ; le bas suit l’écart
+  // des hanches (silhouette en V ou droite, selon la morphologie).
+  const shoulderHalf = (sw / 2) * 1.02;
+  const hipDist = Math.hypot(rh.x - lh.x, rh.y - lh.y);
+  const hipHalf = Math.min(
+    shoulderHalf,
+    Math.max(shoulderHalf * 0.68, (hipDist / 2) * 1.1),
+  );
+  const midHalf = (shoulderHalf * 0.45 + hipHalf * 0.55) * 0.97;
 
-  const sideAt = (t, outward) => {
-    const lx = ls.x + (lh.x - ls.x) * t;
-    const ly = ls.y + (lh.y - ls.y) * t;
-    const rx = rs.x + (rh.x - rs.x) * t;
-    const ry = rs.y + (rh.y - rs.y) * t;
+  const top = { x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2 };
+  const bot = { x: (lh.x + rh.x) / 2, y: (lh.y + rh.y) / 2 };
+  const spineLen = Math.hypot(bot.x - top.x, bot.y - top.y) || sw;
+  const axis = { x: (bot.x - top.x) / spineLen, y: (bot.y - top.y) / spineLen };
+  // Normale au rachis : suit l’inclinaison du buste.
+  const nx = -axis.y;
+  const ny = axis.x;
+
+  const at = (t) => ({ x: top.x + (bot.x - top.x) * t, y: top.y + (bot.y - top.y) * t });
+  const sideAt = (t, d) => {
+    const c = at(t);
     return {
-      g: { x: lx - outward, y: ly },
-      d: { x: rx + outward, y: ry },
+      g: { x: c.x - nx * d, y: c.y - ny * d },
+      d: { x: c.x + nx * d, y: c.y + ny * d },
     };
   };
 
-  const mid = sideAt(0.42, outMid);
-  const rein = sideAt(0.88, outRein);
-  const reinY = (rein.g.y + rein.d.y) / 2;
-  const basY = reinY + sw * 0.08;
+  const sh = sideAt(0.06, shoulderHalf);
+  const mid = sideAt(0.46, midHalf);
+  const rein = sideAt(0.9, hipHalf);
+  const basC = at(1);
 
-  return {
-    nuque: { x: midShoulderX, y: topY - sw * 0.10 },
-    epaule_g: { x: ls.x - outSh, y: ls.y + sw * 0.04 },
-    epaule_d: { x: rs.x + outSh, y: rs.y + sw * 0.04 },
-    milieu_g: mid.g,
-    milieu_d: mid.d,
-    rein_g: rein.g,
-    rein_d: rein.d,
-    bas: { x: midHipX * 0.5 + midShoulderX * 0.5, y: Math.min(botY + sw * 0.04, basY) },
+  // Le côté gauche image doit rester celui de l’épaule gauche détectée.
+  const flip = ls.x > rs.x;
+  const pick = (s) => (flip ? { g: s.d, d: s.g } : s);
+
+  const shp = pick(sh);
+  const midp = pick(mid);
+  const reinp = pick(rein);
+
+  const anchors = {
+    nuque: { x: top.x - axis.x * sw * 0.1, y: top.y - axis.y * sw * 0.1 },
+    epaule_g: shp.g,
+    epaule_d: shp.d,
+    milieu_g: midp.g,
+    milieu_d: midp.d,
+    rein_g: reinp.g,
+    rein_d: reinp.d,
+    // Proche du niveau des reins : évite le bas de dos « en pointe ».
+    bas: { x: basC.x + axis.x * sw * 0.02, y: basC.y + axis.y * sw * 0.02 },
   };
+
+  return scale === 1 ? anchors : scaleAnchors(anchors, scale);
 }
 
 /** Schéma minimap = proportions exactes des 8 points en pixels photo. */

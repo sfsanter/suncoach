@@ -107,8 +107,7 @@ export default function App() {
 
   useEffect(() => {
     if (minimapLabMode) return undefined;
-    // Accueil caméra : pas de téléchargement IA (~40 Mo) — charge au Start.
-    // Mode test / replay / vidéo : précharge pour débloquer les boutons.
+    // Accueil : modèles au Start (caméra ou vidéo). Ne pas bloquer le CTA vidéo.
     if (!(testMode || replayMode)) {
       setModelStatus('ok');
       return undefined;
@@ -119,6 +118,16 @@ export default function App() {
       .catch(() => { if (!cancelled) setModelStatus('fail'); });
     return () => { cancelled = true; };
   }, []);
+
+  const startVideoSession = () => {
+    if (!replaySource) {
+      setError('CHOISIS D’ABORD UNE VIDÉO (.MOV ou .MP4).');
+      return;
+    }
+    setError(null);
+    setSessionRunning(true);
+    setScreen('session');
+  };
 
   if (videoHandLabMode) return <VideoHandLab />;
   if (frameLabMode) return <FrameLab />;
@@ -144,19 +153,7 @@ export default function App() {
             setSessionRunning(true);
             setScreen('session');
           }}
-          onStartVideo={() => {
-            if (!replaySource) {
-              setError('CHOISIS D’ABORD UNE VIDÉO (.MOV ou .MP4).');
-              return;
-            }
-            if (modelStatus !== 'ok') {
-              setError('MODÈLE IA PAS ENCORE CHARGÉ — ATTENDS OU VÉRIFIE LA CONNEXION.');
-              return;
-            }
-            setError(null);
-            setSessionRunning(true);
-            setScreen('session');
-          }}
+          onStartVideo={startVideoSession}
           onOpenTest={() => { setError(null); setScreen('test'); }}
         />
       )}
@@ -172,19 +169,7 @@ export default function App() {
             setReplayLabel(label);
             setError(null);
           }}
-          onStart={() => {
-            if (!replaySource) {
-              setError('CHOISIS D’ABORD UNE VIDÉO (.MOV ou .MP4).');
-              return;
-            }
-            if (modelStatus !== 'ok') {
-              setError('MODÈLE IA PAS ENCORE CHARGÉ — ATTENDS OU VÉRIFIE LA CONNEXION.');
-              return;
-            }
-            setError(null);
-            setSessionRunning(true);
-            setScreen('session');
-          }}
+          onStart={startVideoSession}
         />
       )}
       {screen === 'test' && testMode && (
@@ -511,10 +496,10 @@ function HomeScreen({
             className="text-center text-[10px] tracking-[0.3em] text-nerv-cyan/70"
             style={{ fontFamily: 'var(--font-nerv-mono)' }}
           >
-            — OU TESTER AVEC UNE VIDÉO (MAC) —
+            — OU TESTER AVEC UNE VIDÉO —
           </div>
           <p className="text-center text-[9px] text-nerv-orange/80" style={{ fontFamily: 'var(--font-nerv-mono)' }}>
-            Firefox : préfère .mp4 H.264 (pas .MOV iPhone). Fichier prêt : IMG_3783.mp4
+            Préfère .mp4 H.264 (pas .MOV HEVC iPhone). Sur téléphone : Photos → fichier.
           </p>
           <input
             ref={fileRef}
@@ -536,9 +521,9 @@ function HomeScreen({
             size="lg"
             fullWidth
             onClick={onStartVideo}
-            disabled={!replayLabel || modelStatus !== 'ok'}
+            disabled={!replayLabel}
           >
-            {modelStatus === 'ok' ? 'LANCER AVEC VIDÉO' : modelStatus === 'fail' ? 'MODÈLE IA INDISPONIBLE' : 'CHARGEMENT MODÈLE…'}
+            {replayLabel ? 'LANCER AVEC VIDÉO' : 'CHOISIS UNE VIDÉO D’ABORD'}
           </Button>
           <Button
             variant="ghost"
